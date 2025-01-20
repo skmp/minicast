@@ -630,12 +630,12 @@ void libswirl_init() {
     InitSettings();
     LoadSettings(false);
 }
-void libswirl_loop() {
+void libswirl_loop(const char* game) {
     virtualDreamcast.reset(VirtualDreamcast::Create());
 
     virtualDreamcast->Init();
 
-    int rc = virtualDreamcast->StartGame("");
+    int rc = virtualDreamcast->StartGame(game);
     if (rc >= 0)
         virtualDreamcast->MainLoop();
 }

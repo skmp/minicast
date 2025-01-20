@@ -38,4 +38,4 @@ void reicast_ui_loop();
 void reicast_term();
 
 void libswirl_init();
-void libswirl_loop();
+void libswirl_loop(const char* game);
