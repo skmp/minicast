@@ -48,9 +48,9 @@ void x11_window_create()
         return;
     }
     x11Screen = XDefaultScreen(x11Display);
-    float xdpi = (float)DisplayWidth(x11Display, x11Screen) / DisplayWidthMM(x11Display, x11Screen) * 25.4;
-    float ydpi = (float)DisplayHeight(x11Display, x11Screen) / DisplayHeightMM(x11Display, x11Screen) * 25.4;
-    auto screen_dpi = fmax(xdpi, ydpi);
+    // float xdpi = (float)DisplayWidth(x11Display, x11Screen) / DisplayWidthMM(x11Display, x11Screen) * 25.4;
+    // float ydpi = (float)DisplayHeight(x11Display, x11Screen) / DisplayHeightMM(x11Display, x11Screen) * 25.4;
+    // auto screen_dpi = fmax(xdpi, ydpi);
 
     // Gets the window parameters
     sRootWindow = RootWindow(x11Display, x11Screen);
