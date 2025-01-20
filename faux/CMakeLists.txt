@@ -40,10 +40,10 @@ list(APPEND _sources
     # ${swrl}/oslib/audiobackend_omx.cpp
     ${swrl}/hw/arm7/virt_arm.cpp
     ${swrl}/hw/arm7/arm7.cpp
-    ${swrl}/hw/arm7/arm7_jit_virt_arm64.cpp
+    # ${swrl}/hw/arm7/arm7_jit_virt_arm64.cpp
     # ${swrl}/hw/arm7/arm7_jit_virt_x86.cpp
     ${swrl}/hw/arm7/arm7_jit_virt.cpp
-    # ${swrl}/hw/arm7/arm7_jit_virt_arm32.cpp
+    ${swrl}/hw/arm7/arm7_jit_virt_arm32.cpp
     ${swrl}/hw/arm7/SoundCPU.cpp
     ${swrl}/hw/arm7/arm7_interpreter.cpp
     # ${swrl}/hw/modem/modem.cpp
@@ -66,7 +66,7 @@ list(APPEND _sources
     # ${swrl}/hw/naomi/awcartridge.cpp
     # ${swrl}/hw/naomi/naomi.cpp
     ${swrl}/hw/aica/dsp.cpp
-    ${swrl}/hw/aica/dsp_arm64.cpp
+    # ${swrl}/hw/aica/dsp_arm64.cpp
     ${swrl}/hw/aica/sgc_if.cpp
     ${swrl}/hw/aica/aica_mmio.cpp
     ${swrl}/hw/aica/aica.cpp
@@ -131,7 +131,7 @@ list(APPEND _sources
     # ${swrl}/input/keyboard_device.cpp
     # ${swrl}/input/mapping.cpp
     ${swrl}/gpl/lxdream/tacore.cpp
-    ${swrl}/jit/backend/arm64/rec_arm64.cpp
+    # ${swrl}/jit/backend/arm64/rec_arm64.cpp
     ${swrl}/imgread/cdi.cpp
     ${swrl}/imgread/imgread_common.cpp
     ${swrl}/imgread/gdi.cpp
@@ -259,7 +259,7 @@ list(APPEND _sources
 )
 
 # find X11
-find_package(X11 REQUIRED)
+find_package(X11)
 if (X11_FOUND)
     list(APPEND _sources
         ${swrl}/rend/refsw/refsw_lists.cpp
@@ -270,16 +270,35 @@ if (X11_FOUND)
 else()
     list(APPEND _sources
         ${swrl}/rend/mister_rend/mister_if.cpp
+        ${swrl}/jit/backend/arm32/rec_arm.cpp
+        ${swrl}/jit/backend/arm32/ngen_arm.S
+        
+        ${swrl}/deps/vixl/aarch32/instructions-aarch32.cc
+        ${swrl}/deps/vixl/aarch32/constants-aarch32.cc
+        ${swrl}/deps/vixl/aarch32/disasm-aarch32.cc
+        ${swrl}/deps/vixl/aarch32/assembler-aarch32.cc
+        ${swrl}/deps/vixl/aarch32/location-aarch32.cc
+        ${swrl}/deps/vixl/aarch32/operands-aarch32.cc
+        ${swrl}/deps/vixl/aarch32/macro-assembler-aarch32.cc
+
+        ${swrl}/deps/vixl/cpu-features.cc
+        ${swrl}/deps/vixl/code-buffer-vixl.cc
+        ${swrl}/deps/vixl/utils-vixl.cc
+        ${swrl}/deps/vixl/compiler-intrinsics-vixl.cc
     )
 endif()
 
 add_executable(${APP_NAME}.elf ${_sources})
 set_property(TARGET ${APP_NAME}.elf PROPERTY CXX_STANDARD 17)
-target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_ULTRA96 TARGET_NO_REC TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP TARGET_NO_EXCEPTIONS HOST_NO_THREADS FAUX96)
+target_compile_definitions(${APP_NAME}.elf PRIVATE  TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP TARGET_NO_EXCEPTIONS HOST_NO_THREADS FAUX96 FEAT_HAS_SERIAL_TTY=0)
 target_include_directories(${APP_NAME}.elf PRIVATE ${swrl} ${swrl}/deps ${swrl}/deps/vixl)
 target_link_libraries(${APP_NAME}.elf PRIVATE stdc++)
-
 if (X11_FOUND)
     target_include_directories(${APP_NAME}.elf PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(${APP_NAME}.elf PRIVATE ${X11_LIBRARIES})
+    target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_NO_REC TARGET_ULTRA96)
+else()
+    target_link_libraries(${APP_NAME}.elf PRIVATE -static)
+    target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_MISTER)
+    target_compile_options(${APP_NAME}.elf PRIVATE -mcpu=cortex-a9 -mfpu=neon-vfpv4 -mfloat-abi=hard -marm)
 endif()

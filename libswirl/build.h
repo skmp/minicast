@@ -248,6 +248,9 @@
 #elif defined(TARGET_ULTRA96)
     #define HOST_OS OS_XIL_BARE
     #define HOST_CPU CPU_ARM64
+#elif defined(TARGET_MISTER)
+    #define HOST_OS OS_LINUX
+    #define HOST_CPU CPU_ARM
 #else
 	#error Invalid Target: TARGET_* not defined
 #endif

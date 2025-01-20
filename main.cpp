@@ -7,10 +7,18 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#include "cfg/cfg.h"
+
 int main(int argc, char* argv[])
 {
-	printf("fpgadc: main\n");
-	
+	set_user_config_dir(".");
+	set_user_data_dir(".");
+	add_system_config_dir(".");
+	add_system_data_dir(".");
+
+	ParseCommandLine(argc, argv);
+	cfgOpen();
+
 	libswirl_init();
 	libswirl_loop(argc == 1 ? "": argv[1]);
 	return 0;
@@ -286,9 +294,11 @@ void UpdateVibration(u32 port, float power, float inclination, u32 duration_ms) 
 
 }
 
+#if HOST_OS == OS_XIL_BARE
 void bm_vmem_pagefill(void**, unsigned int) {
 
 }
+#endif
 
 void vmem_platform_ondemand_page(void*, unsigned int) {
 
@@ -309,4 +319,23 @@ void vmem_platform_create_mappings(vmem_mapping const*, unsigned int) {
 
 extern "C" void _gettimeofday() {
     die("gettimeofday()");
+}
+
+#include <sys/mman.h>
+// Prepares the code region for JIT operations, thus marking it as RWX
+bool vmem_platform_prepare_jit_block(void *code_area, unsigned size, void **code_area_rwx) {
+	// Try to map is as RWX, this fails apparently on OSX (and perhaps other systems?)
+	if (mprotect(code_area, size, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+		// Well it failed, use another approach, unmap the memory area and remap it back.
+		// Seems it works well on Darwin according to reicast code :P
+		munmap(code_area, size);
+		void *ret_ptr = mmap(code_area, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_PRIVATE | MAP_ANON, 0, 0);
+		// Ensure it's the area we requested
+		if (ret_ptr != code_area)
+			return false;   // Couldn't remap it? Perhaps RWX is disabled? This should never happen in any supported Unix platform.
+	}
+
+	// Pointer location should be same:
+	*code_area_rwx = code_area;
+	return true;
 }

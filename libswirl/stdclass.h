@@ -169,7 +169,7 @@ public:
 };
 
 #if HOST_OS != OS_DARWIN
-	#define DATA_PATH "./data/"
+	#define DATA_PATH "/data/"
 #else
 	#define DATA_PATH "/"
 #endif

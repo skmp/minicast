@@ -764,6 +764,11 @@ struct Dreamcast_impl : VirtualDreamcast {
             printf("Using DSP Interpreter\n");
         }
 
+        if (!settings.aica.DSPEnabled)
+        {
+            printf("DSP is disabled\n");
+        }
+
         sh4_cpu->Start();
 
 
