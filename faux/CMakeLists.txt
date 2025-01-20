@@ -13,7 +13,6 @@ set(_sources
 set(swrl ${CMAKE_SOURCE_DIR}/../libswirl)
 list(APPEND _sources
     ${swrl}/stdclass.cpp
-    ${swrl}/rend/norend/norend.cpp
     ${swrl}/reios/reios.cpp
     ${swrl}/reios/descrambl.cpp
     ${swrl}/reios/reios_elf.cpp
@@ -52,13 +51,13 @@ list(APPEND _sources
     # ${swrl}/hw/modem/picoppp.cpp
     ${swrl}/hw/pvr/spg.cpp
     ${swrl}/hw/pvr/pvr_sb_regs.cpp
-    ${swrl}/hw/pvr/Renderer_if.cpp
+    # ${swrl}/hw/pvr/Renderer_if.cpp
     ${swrl}/hw/pvr/pvr_mem.cpp
     ${swrl}/hw/pvr/pvr_yuv.cpp
     ${swrl}/hw/pvr/pvr_regs.cpp
-    ${swrl}/hw/pvr/ta_ctx.cpp
-    ${swrl}/hw/pvr/ta_vtx.cpp
-    ${swrl}/hw/pvr/ta.cpp
+    # ${swrl}/hw/pvr/ta_ctx.cpp
+    # ${swrl}/hw/pvr/ta_vtx.cpp
+    # ${swrl}/hw/pvr/ta.cpp
     # ${swrl}/hw/naomi/m4cartridge.cpp
     # ${swrl}/hw/naomi/decrypt.cpp
     # ${swrl}/hw/naomi/naomi_cart.cpp
@@ -259,7 +258,28 @@ list(APPEND _sources
     # ${swrl}/deps/flac/src/libFLAC/cpu.c
 )
 
+# find X11
+find_package(X11 REQUIRED)
+if (X11_FOUND)
+    list(APPEND _sources
+        ${swrl}/rend/refsw/refsw_lists.cpp
+        ${swrl}/rend/refsw/refsw_tile.cpp
+        ${swrl}/rend/refsw/TexUtils.cpp
+        ${swrl}/rend/refsw/refsw_if.cpp
+    )
+else()
+    list(APPEND _sources
+        ${swrl}/rend/mister_rend/mister_if.cpp
+    )
+endif()
+
 add_executable(${APP_NAME}.elf ${_sources})
+set_property(TARGET ${APP_NAME}.elf PROPERTY CXX_STANDARD 17)
 target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_ULTRA96 TARGET_NO_REC TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP TARGET_NO_EXCEPTIONS HOST_NO_THREADS FAUX96)
 target_include_directories(${APP_NAME}.elf PRIVATE ${swrl} ${swrl}/deps ${swrl}/deps/vixl)
 target_link_libraries(${APP_NAME}.elf PRIVATE stdc++)
+
+if (X11_FOUND)
+    target_include_directories(${APP_NAME}.elf PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(${APP_NAME}.elf PRIVATE ${X11_LIBRARIES})
+endif()

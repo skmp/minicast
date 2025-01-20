@@ -1,6 +1,15 @@
 {
     "files.associations": {
         "string": "cpp",
-        "random": "cpp"
+        "random": "cpp",
+        "typeindex": "cpp",
+        "typeinfo": "cpp",
+        "chrono": "cpp",
+        "text_encoding": "cpp",
+        "array": "cpp",
+        "span": "cpp",
+        "string_view": "cpp",
+        "vector": "cpp",
+        "__config": "cpp"
     }
 }

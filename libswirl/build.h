@@ -184,7 +184,7 @@
 #endif
 
 #if !defined(FEAT_TA)
-#define FEAT_TA TA_HLE
+#define FEAT_TA TA_LLE	// default to LLE TA
 #endif
 
 #ifndef CMAKE_BUILD

@@ -167,7 +167,7 @@ extern bool maple_ddt_pending_reset;
 //./core/hw/pvr/Renderer_if.o
 //only written - not read
 //extern u32 VertexCount;
-extern u32 FrameCount;
+// extern u32 FrameCount;
 //one-time init
 //extern Renderer* renderer;
 //these are just mutexes used during rendering

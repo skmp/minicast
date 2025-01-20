@@ -48,22 +48,9 @@ u32 fskip = 0;
 
 extern u32 PVR_VTXC;
 
-void SetREP(TA_context* cntx)
+void SetREP(u32 render_end_pending_cycles)
 {
-    if (cntx && !cntx->rend.Overrun)
-    {
-        VertexCount += cntx->rend.verts.used();
-        PVR_VTXC += cntx->rend.verts.used();
-        int render_end_pending_cycles = cntx->rend.verts.used() * 60;
-        //if (render_end_pending_cycles<500000)
-        render_end_pending_cycles += 500000 * 3;
-
-        sh4_sched_request(render_end_schid, render_end_pending_cycles);
-    }
-    else
-    {
-        sh4_sched_request(render_end_schid, 500000 * 3);
-    }
+    sh4_sched_request(render_end_schid, render_end_pending_cycles);
 }
 
 struct SPG_impl final : SPG {
@@ -107,8 +94,6 @@ struct SPG_impl final : SPG {
                 scale_y = 0.5f;//non interlaced modes have half resolution
             }
         }
-
-        rend_set_fb_scale(scale_x, scale_y);
 
         //Frame_Cycles=(u64)DCclock*(u64)sync_cycles/(u64)pixel_clock;
 
@@ -177,7 +162,7 @@ struct SPG_impl final : SPG {
                     double spd_cpu = spd_vbs * Frame_Cycles;
                     spd_cpu /= 1000000;	//mrhz kthx
                     double fullvbs = (spd_vbs / spd_cpu) * 200;
-                    double mv = VertexCount / ts / (spd_cpu / 200);
+                    double mv = 0 / ts / (spd_cpu / 200);
                     char mv_c = ' ';
 
                     Last_FC = FrameCount;
@@ -192,7 +177,6 @@ struct SPG_impl final : SPG {
                         mv /= 1000;	//
                         mv_c = 'M';
                     }
-                    VertexCount = 0;
                     vblk_cnt = 0;
 
                     const char* mode = 0;
