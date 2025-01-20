@@ -209,8 +209,77 @@ void VLockedMemory::UnLockRegion(unsigned offset, unsigned size_bytes) {
 	#endif
 }
 
+#include <stdio.h>
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+int kbhit(void) {
+    struct termios oldt, newt;
+    int ch;
+    int oldf;
+
+    // Get current terminal settings
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    // Disable canonical mode and echo
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    // Remember old file status flags, then set non-blocking
+    oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
+
+    // Try to read
+    ch = getchar();
+
+    // Restore old settings
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    fcntl(STDIN_FILENO, F_SETFL, oldf);
+
+    if (ch != EOF) {
+        // If we got a character, push it back so we can read it later
+        ungetc(ch, stdin);
+        return 1;
+    }
+
+    return 0;
+}
+
+#include "input/gamepad.h"
+
 void UpdateInputState(u32 port) {
 
+	kcode[port] = 0xFFFF;
+	rt[port] = 0;
+	lt[port] = 0;
+	joyx[port] = 0;
+	joyy[port] = 0;
+
+	while(kbhit()) {
+		int ch = getchar();
+		switch(ch) {
+			case 'a': lt[port] = 255; break;
+			case 's': rt[port] = 255; break;
+
+			case 'z': kcode[port] &= ~DC_BTN_Y; break;
+			case 'x': kcode[port] &= ~DC_BTN_X; break;
+			case 'c': kcode[port] &= ~DC_BTN_B; break;
+			case 'v': kcode[port] &= ~DC_BTN_A; break;
+			
+			case '\r': kcode[port] &= ~DC_BTN_START; break;
+
+			case 'i': kcode[port] &= ~DC_DPAD_UP; break;
+			case 'k': kcode[port] &= ~DC_DPAD_DOWN; break;
+			case 'j': kcode[port] &= ~DC_DPAD_LEFT; break;
+			case 'l': kcode[port] &= ~DC_DPAD_RIGHT; break;
+
+			case 't': joyy[port] = -128; break;
+			case 'g': joyy[port] = 127; break;
+			case 'f': joyx[port] = -128; break;
+			case 'h': joyx[port] = 127; break;
+		}
+	}
 }
 
 void UpdateVibration(u32 port, float power, float inclination, u32 duration_ms) {
