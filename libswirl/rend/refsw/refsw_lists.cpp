@@ -161,13 +161,13 @@ u32 ReadRegionArrayEntry(u32 base, RegionArrayEntry* entry)
 	}
 
 ISP_BACKGND_T_type CoreTagFromDesc(u32 cache_bypass, u32 shadow, u32 skip, u32 param_offs_in_words, u32 tag_offset) {
-    ISP_BACKGND_T_type rv {
-        .tag_offset = tag_offset,
-        .param_offs_in_words = param_offs_in_words,
-        .skip = skip,
-        .shadow = shadow,
-        .cache_bypass = cache_bypass 
-    };
+    ISP_BACKGND_T_type rv;
+    rv.full = 0;
+    rv.tag_offset = tag_offset;
+    rv.param_offs_in_words = param_offs_in_words;
+    rv.skip = skip;
+    rv.shadow = shadow;
+    rv.cache_bypass = cache_bypass;
 
     return rv;
 }
