@@ -203,21 +203,21 @@ typedef int sigaction_fn(int signum, const struct sigaction *act,
 static sigaction_fn* get_sigaction()
 {
 
-	void* libc;
-	sigaction_fn* rv = nullptr;
+	// void* libc;
+	// sigaction_fn* rv = nullptr;
 
-	libc = dlopen("libc.so", RTLD_NOLOAD);
+	// libc = dlopen("libc.so", RTLD_NOLOAD);
 	
-	if (libc)
-	{
-		printf("get_sigaction: found libc.so\n");
-		*(void**) (&rv) = dlsym(libc, "sigaction");
+	// if (libc)
+	// {
+	// 	printf("get_sigaction: found libc.so\n");
+	// 	*(void**) (&rv) = dlsym(libc, "sigaction");
 
-		if (rv && rv != sigaction) {
-			printf("get_sigaction: libc override detected, working around...\n");
-			return rv;
-		}
-	}
+	// 	if (rv && rv != sigaction) {
+	// 		printf("get_sigaction: libc override detected, working around...\n");
+	// 		return rv;
+	// 	}
+	// }
 
 	return &sigaction;
 }
@@ -326,7 +326,7 @@ void common_linux_setup()
 
 	enable_runfast();
 	install_fault_handler();
-	signal(SIGINT, exit);
+	// signal(SIGINT, exit);
 	
 	settings.profile.run_counts=0;
 	

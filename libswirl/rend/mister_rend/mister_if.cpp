@@ -22,8 +22,8 @@ void rend_vblank() {
 
 void rend_start_render(u8* vram) {
     // kick off render
-    printf("rend_start_render\n");
-    SetREP(20 * 1000 * 1000); // in 20 mhz = 10 ms at 200 mhz
+    // printf("rend_start_render\n");
+    SetREP(2 * 1000 * 1000); // in 2 mhz = 10 ms at 200 mhz
 
     // flush vram contents here from cache
     // call out to hw to render
@@ -33,5 +33,5 @@ void rend_end_render() {
     // wait for render to end
     // interrupts get fired automatically
     FrameCount++;
-    printf("rend_end_render\n");
+    // printf("rend_end_render\n");
 }

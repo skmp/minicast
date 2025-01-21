@@ -136,7 +136,7 @@ void rend_term_renderer() {
 void rend_start_render(u8* vram) {
     // kick off render
     printf("rend_start_render\n");
-    SetREP(20 * 1000 * 1000); // in 20 mhz = 10 ms at 200 mhz
+    SetREP(2 * 1000 * 1000); // in 2 mhz = 10 ms at 200 mhz
     RenderCORE();
 }
 

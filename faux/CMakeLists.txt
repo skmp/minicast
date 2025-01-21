@@ -119,7 +119,6 @@ list(APPEND _sources
     # ${swrl}/linux/nixprof/nixprof.cpp
     # ${swrl}/linux/common.cpp
     # ${swrl}/linux/context.cpp
-    # ${swrl}/linux/posix_vmem.cpp
     ${swrl}/libswirl.cpp
 
     # ${swrl}/utils/http.cpp
@@ -285,18 +284,22 @@ else()
         ${swrl}/deps/vixl/code-buffer-vixl.cc
         ${swrl}/deps/vixl/utils-vixl.cc
         ${swrl}/deps/vixl/compiler-intrinsics-vixl.cc
+
+        ${swrl}/linux/posix_vmem.cpp
+        ${swrl}/linux/common.cpp
+        ${swrl}/linux/context.cpp
     )
 endif()
 
 add_executable(${APP_NAME}.elf ${_sources})
 set_property(TARGET ${APP_NAME}.elf PROPERTY CXX_STANDARD 17)
-target_compile_definitions(${APP_NAME}.elf PRIVATE  TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP TARGET_NO_EXCEPTIONS HOST_NO_THREADS FAUX96 FEAT_HAS_SERIAL_TTY=0)
+target_compile_definitions(${APP_NAME}.elf PRIVATE  TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP HOST_NO_THREADS FAUX96 FEAT_HAS_SERIAL_TTY=0)
 target_include_directories(${APP_NAME}.elf PRIVATE ${swrl} ${swrl}/deps ${swrl}/deps/vixl)
 target_link_libraries(${APP_NAME}.elf PRIVATE stdc++)
 if (X11_FOUND)
     target_include_directories(${APP_NAME}.elf PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(${APP_NAME}.elf PRIVATE ${X11_LIBRARIES})
-    target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_NO_REC TARGET_ULTRA96)
+    target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_NO_REC TARGET_ULTRA96 TARGET_NO_EXCEPTIONS)
 else()
     target_link_libraries(${APP_NAME}.elf PRIVATE -static)
     target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_MISTER)

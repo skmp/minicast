@@ -1208,13 +1208,15 @@ struct Dreamcast_impl : VirtualDreamcast {
 
         u8* address = (u8*)addr;
 
+        /*
+        // no texcache -> no vram locks
         if (VramLockedWrite(sh4_cpu->vram.data, address))
         {
             fault_printf("VramLockedWrite!\n");
 
             return true;
         }
-        else if (_vmem_bm_LockedWrite(address))
+        else */ if (_vmem_bm_LockedWrite(address))
         {
             fault_printf("dc_handle_fault: _vmem_bm_LockedWrite!\n");
 
