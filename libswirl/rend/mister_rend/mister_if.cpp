@@ -12,12 +12,12 @@
 
 #include <time.h>
 
+#define offs_8meg (1024*1024*8)
+#define __ARM_NR_cacheflush 0x0f0002
 
 u32 FrameCount;
-
-#define offs_8meg (1024*1024*8)
-
-#define __ARM_NR_cacheflush 0x0f0002
+static uint64_t RenderTime = 0;
+static uint64_t DelayTime = 0;
 
 static inline void arm_cache_flush(void* start, void* end)
 {
@@ -73,9 +73,6 @@ void rend_vblank() {
     // printf("rend_vblank\n");
 }
 
-static uint64_t RenderTime = 0;
-static uint64_t DelayTime = 0;
-
 void rend_start_render(u8* vram) {
     //SetREP(20 * 1000 * 1000); // in 20 mhz = 10 ms at 200 mhz
     //SetREP(2 * 1000 * 1000); // in 2 mhz = 10 ms at 200 mhz
@@ -130,9 +127,9 @@ void rend_end_render() {
 	
     FrameCount++;
         
-
 	if ( (FrameCount&0xf) == 0x0) {
-		printf("Total Render: %1.1fms, Wait: %1.1fms, Frame to Frame: %1.1fms\n", f32(now_ns() - RenderTime)/1e6f, f32(now_ns() - WaitTime)/1e6f, f32(RenderTime - DelayTime)/1e6f);
+		uint64_t DoneTime = now_ns();
+		printf("GPU: %1.1fms, Wait: %1.1fms, Frame to Frame: %1.1fms, Frame Slack: %1.1fms\n", (DoneTime - RenderTime)/1e6, (DoneTime - WaitTime)/1e6, (RenderTime - DelayTime)/1e6, int64_t(RenderTime - DelayTime - (DoneTime - RenderTime))/1e6);
 	}
 	
 }
