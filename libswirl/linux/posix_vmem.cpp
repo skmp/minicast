@@ -22,10 +22,6 @@
 #include "hw/mem/_vmem.h"
 #include "stdclass.h"
 
-#ifndef MAP_NOSYNC
-#define MAP_NOSYNC       0 //missing from linux :/ -- could be the cause of android slowness ?
-#endif
-
 #ifdef _ANDROID
 	#include <linux/ashmem.h>
 	#ifndef ASHMEM_DEVICE
@@ -72,34 +68,22 @@ void VLockedMemory::UnLockRegion(unsigned offset, unsigned size_bytes) {
 }
 
 // Allocates memory via a fd on shmem/ahmem or even a file on disk
-static int allocate_shared_filemem(unsigned size) {
-	int fd = -1;
-	#if defined(_ANDROID)
-	// Use Android's specific shmem stuff.
-	fd = ashmem_create_region(0, size);
-	#else
-		#if HOST_OS != OS_DARWIN
-		fd = shm_open("/dcnzorz_mem", O_CREAT | O_EXCL | O_RDWR, S_IREAD | S_IWRITE);
-		shm_unlink("/dcnzorz_mem");
-		#endif
+int allocate_shared_filemem(unsigned size) {
+	int fd = memfd_create("dcnzorz_mem", 0);
 
-		// if shmem does not work (or using OSX) fallback to a regular file on disk
-		if (fd < 0) {
-			string path = get_writable_data_path("/dcnzorz_mem");
-			fd = open(path.c_str(), O_CREAT|O_RDWR|O_TRUNC, S_IRWXU|S_IRWXG|S_IRWXO);
-			unlink(path.c_str());
-		}
-		// If we can't open the file, fallback to slow mem.
-		if (fd < 0)
-			return -1;
+    // If we can't open the file, fallback to slow mem.
+    if (fd < 0) {
+        printf("memfd_create failed, unable to use nvmem: %d %s\n", errno, strerror(errno));
+        return -1;
+    }
 
-		// Finally make the file as big as we need!
-		if (ftruncate(fd, size)) {
-			// Can't get as much memory as needed, fallback.
-			close(fd);
-			return -1;
-		}
-	#endif
+    // Finally make the file as big as we need!
+    if (ftruncate(fd, size)) {
+        printf("memfd resize failed, unable to use nvmem: %d %s\n", errno, strerror(errno));
+        // Can't get as much memory as needed, fallback.
+        close(fd);
+        return -1;
+    }
 
 	return fd;
 }
@@ -107,25 +91,16 @@ static int allocate_shared_filemem(unsigned size) {
 // Implement vmem initialization for RAM, ARAM, VRAM and SH4 context, fpcb etc.
 // The function supports allocating 512MB or 4GB addr spaces.
 
-static int shmem_fd = -1, shmem_fd2 = -1;
-
 // vmem_base_addr points to an address space of 512MB (or 4GB) that can be used for fast memory ops.
 // In negative offsets of the pointer (up to FPCB size, usually 65/129MB) the context and jump table
 // can be found. If the platform init returns error, the user is responsible for initializing the
 // memory using a fallback (that is, regular mallocs and falling back to slow memory JIT).
 VMemType vmem_platform_init(void **vmem_base_addr, void **sh4rcb_addr) {
 	// Firt let's try to allocate the shm-backed memory
-	shmem_fd = allocate_shared_filemem(RAM_SIZE_MAX + VRAM_SIZE_MAX + ARAM_SIZE_MAX);
-	if (shmem_fd < 0)
-		return MemTypeError;
 
 	// Now try to allocate a contiguous piece of memory.
 	unsigned memsize = 512*1024*1024 + sizeof(Sh4RCB) + ARAM_SIZE_MAX + 0x10000;
 	void *first_ptr = mmap(0, memsize, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	if (first_ptr == MAP_FAILED) {
-		close(shmem_fd);
-		return MemTypeError;
-	}
 
 	// Align pointer to 64KB too, some Linaro bug (no idea but let's just be safe I guess).
 	uintptr_t ptrint = (uintptr_t)first_ptr;
@@ -180,7 +155,7 @@ void vmem_platform_create_mappings(const vmem_mapping *vmem_maps, unsigned numma
 			unsigned offset = vmem_maps[i].start_address + j * vmem_maps[i].memsize;
 			verify(!munmap(&virt_ram_base[offset], vmem_maps[i].memsize));
 			verify(MAP_FAILED != mmap(&virt_ram_base[offset], vmem_maps[i].memsize, protection,
-			                          MAP_SHARED | MAP_NOSYNC | MAP_FIXED, shmem_fd, vmem_maps[i].memoffset));
+			                          MAP_SHARED | MAP_FIXED, vmem_maps[i].fd, vmem_maps[i].memoffset));
 			// ??? (mprotect(rv,size,prot)!=0)
 		}
 	}
@@ -202,32 +177,6 @@ bool vmem_platform_prepare_jit_block(void *code_area, unsigned size, void **code
 	// Pointer location should be same:
 	*code_area_rwx = code_area;
 	return true;
-}
-
-// Use two addr spaces: need to remap something twice, therefore use allocate_shared_filemem()
-bool vmem_platform_prepare_jit_block(void *code_area, unsigned size, void **code_area_rw, uintptr_t *rx_offset) {
-	shmem_fd2 = allocate_shared_filemem(size);
-	if (shmem_fd2 < 0)
-		return false;
-
-	// Need to unmap the section we are about to use (it might be already unmapped but nevertheless...)
-	munmap(code_area, size);
-
-	// Map the RX bits on the code_area, for proximity, as usual.
-	void *ptr_rx = mmap(code_area, size, PROT_READ | PROT_EXEC,
-	                    MAP_SHARED | MAP_NOSYNC | MAP_FIXED, shmem_fd2, 0);
-	if (ptr_rx != code_area)
-		return false;
-
-	// Now remap the same memory as RW in some location we don't really care at all.
-	void *ptr_rw = mmap(NULL, size, PROT_READ | PROT_WRITE,
-	                    MAP_SHARED | MAP_NOSYNC, shmem_fd2, 0);
-
-	*code_area_rw = ptr_rw;
-	*rx_offset = (char*)ptr_rx - (char*)ptr_rw;
-	printf("Info: Using NO_RWX mode, rx ptr: %p, rw ptr: %p, offset: %lu\n", ptr_rx, ptr_rw, (unsigned long)*rx_offset);
-
-	return (ptr_rw != MAP_FAILED);
 }
 
 // Some OSes restrict cache flushing, cause why not right? :D

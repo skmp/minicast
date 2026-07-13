@@ -60,14 +60,8 @@
 // the RW pointer. However the fpcb table and other pointers during execution
 // (ie. exceptions) are RX pointers. These two macros convert between them by
 // sub/add the pointer offset. CodeCache will point to the RW pointer for simplicity.
-#ifdef FEAT_NO_RWX_PAGES
-	extern uintptr_t cc_rx_offset;
-	#define CC_RW2RX(ptr) (void*)(((uintptr_t)(ptr)) + cc_rx_offset)
-	#define CC_RX2RW(ptr) (void*)(((uintptr_t)(ptr)) - cc_rx_offset)
-#else
-	#define CC_RW2RX(ptr) (ptr)
-	#define CC_RX2RW(ptr) (ptr)
-#endif
+#define CC_RW2RX(ptr) (ptr)
+#define CC_RX2RW(ptr) (ptr)
 
 //alternative emit ptr, set to 0 to use the main buffer
 extern u32* emit_ptr;

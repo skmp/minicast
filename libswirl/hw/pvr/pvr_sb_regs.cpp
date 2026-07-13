@@ -313,6 +313,10 @@ struct PVRDevice : MMIODevice {
             return;
         }
 
+        if (addr == FB_R_SOF1_addr) {
+            *(volatile uint32_t*)(FPGA_REGS_BASE + addr) = data;
+        }
+
         if (addr == TA_LIST_INIT_addr)
         {
             // FIXME: Fuller TA implementation
@@ -349,7 +353,7 @@ struct PVRDevice : MMIODevice {
             #if FEAT_TA == TA_HLE
             ta_vtx_ListCont();
             #else
-            verify(false);
+            //verify(false);
             #endif
         }
 

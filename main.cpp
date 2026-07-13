@@ -276,15 +276,15 @@ void UpdateInputState(u32 port) {
 	while(kbhit()) {
 		int ch = getchar();
 		switch(ch) {
-			case 'a': lt[port] = 255; break;
-			case 's': rt[port] = 255; break;
+			case 'e': lt[port] = 255; break;
+			case 'r': rt[port] = 255; break;
 
-			case 'z': kcode[port] &= ~DC_BTN_Y; break;
-			case 'x': kcode[port] &= ~DC_BTN_X; break;
-			case 'c': kcode[port] &= ~DC_BTN_B; break;
-			case 'v': kcode[port] &= ~DC_BTN_A; break;
+			case 'v': kcode[port] &= ~DC_BTN_Y; break;
+			case 'c': kcode[port] &= ~DC_BTN_X; break;
+			case 'x': kcode[port] &= ~DC_BTN_B; break;
+			case 'a': kcode[port] &= ~DC_BTN_A; break;
 			
-			case '\r': kcode[port] &= ~DC_BTN_START; break;
+			case 's': kcode[port] &= ~DC_BTN_START; break;
 
 			case 'i': kcode[port] &= ~DC_DPAD_UP; break;
 			case 'k': kcode[port] &= ~DC_DPAD_DOWN; break;

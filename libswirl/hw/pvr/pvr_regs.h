@@ -7,7 +7,7 @@
 #pragma once
 #include "types.h"
 
-#define pvr_RegSize (0x8000)
+#define pvr_RegSize (8192)
 #define pvr_RegMask (pvr_RegSize-1)
 
 #define PvrReg(x,t) (*(t*)&pvr_regs[(x) & pvr_RegMask])

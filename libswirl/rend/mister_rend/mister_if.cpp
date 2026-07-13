@@ -1,4 +1,3 @@
-
 #include "types.h"
 
 #include <unistd.h>
@@ -11,11 +10,9 @@
 #include "../../hw/pvr/pvr_regs.h"
 #include "../../hw/mem/_vmem.h"
 
-extern volatile u8* VRAM_BASE;
-extern volatile u8* FPGA_SHARED_BASE;
-extern volatile u8* FPGA_REGS_BASE;
+#include <time.h>
 
-//volatile u8* emu_vram = (volatile u8*)VRAM_BASE;
+
 u32 FrameCount;
 
 #define offs_8meg (1024*1024*8)
@@ -25,6 +22,12 @@ u32 FrameCount;
 static inline void arm_cache_flush(void* start, void* end)
 {
     syscall(__ARM_NR_cacheflush, start, end, 0);
+}
+
+static inline uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
 void memcpy_neon(void *dst, const void *src, size_t n)
@@ -70,116 +73,66 @@ void rend_vblank() {
     // printf("rend_vblank\n");
 }
 
-void debug_dump_vram_frames() {
-	if (FrameCount == 20 || FrameCount == 120) {
-		printf("FPGA VRAM dump...\n");
-		FILE* dumpfile = fopen("vram_dump.bin", "wb");
-		if (!dumpfile) {
-			perror("fopen"); return;
-		}
-		fwrite((const void*)VRAM_BASE, 1, offs_8meg + 0x80, dumpfile);
-		fclose(dumpfile);
-	}	
-}
-
-#define HW_FPGA_VRAM_OFST (0x32000000)		// 800MB. (DDRAM_BASE address in the core).
-#define HW_FPGA_VRAM_SPAN (0x01000000) 		// Span of 16MB
-#define HW_FPGA_VRAM_MASK ( HW_FPGA_VRAM_SPAN - 1 )
+static uint64_t RenderTime = 0;
+static uint64_t DelayTime = 0;
 
 void rend_start_render(u8* vram) {
     //SetREP(20 * 1000 * 1000); // in 20 mhz = 10 ms at 200 mhz
-    SetREP(2 * 1000 * 1000); // in 2 mhz = 10 ms at 200 mhz
-
-    // vram == emu_vram (Fastmem VRAM)
-    //emu_vram = vram;
-	//volatile u8* emu_vram = vram;
+    //SetREP(2 * 1000 * 1000); // in 2 mhz = 10 ms at 200 mhz
+    SetREP(200000000/70); // in 2 mhz = 10 ms at 200 mhz
 	
-	volatile uint8_t* ddr_vram = (volatile uint8_t*)FPGA_SHARED_BASE;
-	volatile uint8_t* ddr_regs = (volatile uint8_t*)FPGA_REGS_BASE;
-	const bool vram_already_shared = (vram == (u8*)VRAM_BASE);
-	static bool reported_self_copy = false;
-	static bool reported_layout = false;
 
-	if (!reported_layout) {
-		printf("MiSTer renderer: vram=%p VRAM_BASE=%p FPGA_SHARED_BASE=%p FPGA_REGS_BASE=%p frame_flag=%p\n",
-			vram,
-			(void*)VRAM_BASE,
-			(void*)FPGA_SHARED_BASE,
-			(void*)FPGA_REGS_BASE,
-			(void*)(FPGA_SHARED_BASE + offs_8meg - 8));
-		reported_layout = true;
-	}
-	
-	// Write two arbitrary words, at the end of VRAM.
-	// The core should clear these after rendering a frame, so we can check in
-	// rend_end_render(), to tell the frame has finished rendering.
-	*(volatile uint32_t*)(FPGA_SHARED_BASE + offs_8meg - 8) = 0xCAFEBABE;
-	*(volatile uint32_t*)(FPGA_SHARED_BASE + offs_8meg - 4) = 0xCAFEBABE;
-
-	// Copy the 8MB of VRAM into shared DDR.
-	//memcpy((void*)ddr_vram, (const void*)vram, offs_8meg);
-	if (!vram_already_shared) {
-		memcpy_neon((void*)ddr_vram, (const void*)vram, offs_8meg);
-	}
-	else if (!reported_self_copy) {
-		printf("MiSTer renderer: VRAM already mapped to FPGA DDR; skipping 8MB self-copy.\n");
-		reported_self_copy = true;
-	}
-	
-	// Copy regs into the FPGA-visible register/control mapping.
-	//memcpy((void*)ddr_regs, pvr_regs, pvr_RegSize);
-	memcpy_neon((void*)ddr_regs, pvr_regs, pvr_RegSize);
-
-	// Now flush everything the FPGA consumes before issuing the render trigger.
-	if (vram_already_shared)
-		arm_cache_flush((void*)VRAM_BASE, (void*)(VRAM_BASE + offs_8meg));
-	else
-		arm_cache_flush((void*)FPGA_SHARED_BASE, (void*)(FPGA_SHARED_BASE + offs_8meg));
-	arm_cache_flush((void*)FPGA_REGS_BASE, (void*)(FPGA_REGS_BASE + pvr_RegSize));
-
+	memcpy_neon((void*)FPGA_REGS_BASE, pvr_regs, pvr_RegSize);
+	__asm__ volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t*)(FPGA_REGS_BASE + TEST_SELECT_addr) = 0xCAFEBABE;    // Start Rendering
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	// Trigger last, after VRAM and regs are visible to the FPGA.
-	*(volatile uint32_t*)(FPGA_REGS_BASE + TEST_SELECT_addr) = 0xBEBAFECA;
-	arm_cache_flush((void*)(FPGA_REGS_BASE + TEST_SELECT_addr),
-		(void*)(FPGA_REGS_BASE + TEST_SELECT_addr + sizeof(uint32_t)));
-	__asm__ volatile("dsb sy" ::: "memory");
+	DelayTime = RenderTime;
+	RenderTime = now_ns();
+}
 
-	if (FrameCount == 0) {
-		printf("MiSTer renderer: trigger magic at FPGA regs is %02X %02X %02X %02X\n",
-			ddr_regs[0x18],
-			ddr_regs[0x19],
-			ddr_regs[0x1A],
-			ddr_regs[0x1B]);
-	}
-	
-	//debug_dump_vram_frames()
+static inline uint32_t mmio_read32(volatile uint32_t* p)
+{
+    __asm__ volatile("" ::: "memory");
+    uint32_t v = *p;
+    __asm__ volatile("" ::: "memory");
+    return v;
 }
 
 void rend_end_render() {
-    volatile uint32_t* frame_flag = (volatile uint32_t*)(FPGA_SHARED_BASE + offs_8meg - 8);
-	u32 wait_log_count = 0;
-    /*
-    while (1)
-    {
-        // Invalidate that cache line so we see FPGA writes.
-        arm_cache_flush((void*)frame_flag, (void*)((uintptr_t)frame_flag + 32));
+    // "Wait for FPGA frame done" flag...
+    uint64_t WaitTime = now_ns();
 
-        __asm__ volatile("dmb ish" ::: "memory");
+    int timeout = 0;
+    while (true)
+    {        
+        uint32_t mem = *(volatile uint32_t*)(FPGA_VRAM_BASE + offs_8meg - 4);
+        //printf("VRAM -4: %08X\n", mem);
+        if (mem == 0xDEADDEAD) {
+            *(volatile uint32_t*)(FPGA_VRAM_BASE + offs_8meg - 4)  = 0x00000000;    // Clear the mailbox words in VRAM.
+            *(volatile uint32_t*)(FPGA_VRAM_BASE + offs_8meg - 8)  = 0x00000000;    // Clear the mailbox words in VRAM.
+			*(volatile uint32_t*)(FPGA_REGS_BASE + TEST_SELECT_addr) = 0x00000000;
+            break;
+        }
 
-        if (*frame_flag == 0x00000000) break;
+        // 0.1 ms delay
+        uint64_t start = now_ns();
+        while ((now_ns() - start) < 100000ULL) { }
 
-		if (FrameCount == 0 && ++wait_log_count == 10000000) {
-			volatile uint8_t* ddr_regs = (volatile uint8_t*)FPGA_REGS_BASE;
-			printf("MiSTer renderer: still waiting, frame_flag=%08X trigger=%02X %02X %02X %02X\n",
-				*frame_flag,
-				ddr_regs[0x18],
-				ddr_regs[0x19],
-				ddr_regs[0x1A],
-				ddr_regs[0x1B]);
-			wait_log_count = 0;
-		}
+        timeout++;
+        if (timeout>=5000) {
+            timeout = 0;
+            printf("Timeout waiting for FPGA Frame Done! Writing 'Start frame' again...\n");
+            *(volatile uint32_t*)(FPGA_REGS_BASE + TEST_SELECT_addr) = 0xCAFEBABE;    // FPGA is probably stuck, re-trigger the current frame.
+            __asm__ volatile("dsb sy" ::: "memory");
+        }
     }
-	*/
+	
     FrameCount++;
+        
+
+	if ( (FrameCount&0xf) == 0x0) {
+		printf("Total Render: %1.1fms, Wait: %1.1fms, Frame to Frame: %1.1fms\n", f32(now_ns() - RenderTime)/1e6f, f32(now_ns() - WaitTime)/1e6f, f32(RenderTime - DelayTime)/1e6f);
+	}
+	
 }

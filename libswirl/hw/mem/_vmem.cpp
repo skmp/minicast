@@ -16,12 +16,30 @@
 #define HW_FPGA_VRAM_SPAN (0x01000000) 		// Span of 16MB
 #define HW_FPGA_VRAM_MASK ( HW_FPGA_VRAM_SPAN - 1 )
 
-void *vram_virt_addr;
-volatile u8* VRAM_BASE;
-volatile u8* FPGA_SHARED_BASE;
+volatile u8* FPGA_VRAM_BASE;
 volatile u8* FPGA_REGS_BASE;
 
 uint32_t offs_8mb = 1024*1024*8;
+int fd_ram_aram;
+int fd_dev_mem;
+
+static int opem_dev_mem() {
+	printf("Trying /dev/mem_wc, for vram mapping...\n");
+	int fd = open( "/dev/mem_wc", ( O_RDWR | O_SYNC ) );
+
+	if ( fd != -1) {
+		return fd;
+	}
+
+	printf( "ERROR: could not open \"/dev/mem_wc\", trying \"/dev/mem\"...\n\n" );
+
+	fd = open( "/dev/mem", ( O_RDWR | O_SYNC ) );
+
+	if (fd == -1) {
+		printf( "ERROR: could not open \"/dev/mem\"...\n\n" );
+	}
+	return fd;
+}
 
 static int mmap_fpga_region(void* fixed_addr, uintptr_t fpga_offset, size_t span, volatile u8** mapped_base) {
 	printf("DC VRAM (DDR3) sharing setup. ElectronAsh 2025\n\n");
@@ -30,14 +48,14 @@ static int mmap_fpga_region(void* fixed_addr, uintptr_t fpga_offset, size_t span
 
 	int fd;
 
-	printf("Opening /dev/mem, for mmap...\n");
-	if ( ( fd = open( "/dev/mem", ( O_RDWR | O_SYNC ) ) ) == -1 ) {
-	//if ( ( fd = open( "/dev/mem", ( O_RDWR ) ) ) == -1 ) {
-		printf( "ERROR: could not open \"/dev/mem\"...\n\n" );
+	printf("Opening /dev/mem_wc, for mmap...\n");
+	if ( ( fd = open( "/dev/mem_wc", ( O_RDWR | O_SYNC ) ) ) == -1 ) {
+	//if ( ( fd = open( "/dev/mem_wc", ( O_RDWR ) ) ) == -1 ) {
+		printf( "ERROR: could not open \"/dev/mem_wc\"...\n\n" );
 		return( 1 );
 	}
 	else {
-		printf("/dev/mem opened OK...\n\n");
+		printf("/dev/mem_wc opened OK...\n\n");
 	}
 
 	int mmap_flags = MAP_SHARED | MAP_SYNC;
@@ -60,31 +78,14 @@ static int mmap_fpga_region(void* fixed_addr, uintptr_t fpga_offset, size_t span
 	
 	printf("DC VRAM Addr: 0x%08X\n\n", (unsigned int)mapped_addr );
 
-	printf("Closing /dev/mem...\n\n");
+	printf("Closing /dev/mem_wc...\n\n");
 	close( fd );
 
 	if (mapped_base)
 		*mapped_base = mapped_addr;
 	
-	/*
-	for (int i=0; i<(1024*1024*8); i++) {
-		VRAM_BASE[ FB_R_SOF1+i ] = 0xffaabbcc;
-	}
-	*/
-	
 	return 0;
 }
-
-int mmap_setup() {
-	if (mmap_fpga_region(nullptr, HW_FPGA_VRAM_OFST, HW_FPGA_VRAM_SPAN, &FPGA_SHARED_BASE) != 0)
-		return 1;
-
-	vram_virt_addr = (void*)FPGA_SHARED_BASE;
-	VRAM_BASE = FPGA_SHARED_BASE;
-	FPGA_REGS_BASE = FPGA_SHARED_BASE + offs_8mb;
-	return 0;
-}
-
 
 //top registered handler
 _vmem_handler       _vmem_lrp;
@@ -427,10 +428,27 @@ bool _vmem_bm_LockedWrite(u8* address) {
 	}
 	return false;
 }
+static_assert((sizeof(Sh4RCB)%PAGE_SIZE)==0);
 
 bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica_ram, u32 aram_size) {
-	// TODO: Static assert?
-	verify((sizeof(Sh4RCB)%PAGE_SIZE)==0);
+
+	fd_dev_mem = opem_dev_mem();
+	if (fd_dev_mem == -1) {
+		return false;
+	}
+
+	FPGA_REGS_BASE = (u8*) mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd_dev_mem, HW_FPGA_VRAM_OFST + offs_8mb);
+
+	if (FPGA_REGS_BASE == (u8*)MAP_FAILED) {
+		die("mapping FPGA_REGS_BASE failed");
+	}
+
+	fd_ram_aram = allocate_shared_filemem(RAM_SIZE + aram_size);
+	if (fd_ram_aram == -1) {
+		close(fd_dev_mem);
+		return false;
+	}
+			
 
 	VMemType vmemstatus = MemTypeError;
 
@@ -443,6 +461,7 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 	// Fallback to statically allocated buffers, this results in slow-ops being generated.
 	if (vmemstatus == MemTypeError) {
 		printf("Warning! nvmem is DISABLED (due to failure or not being built-in\n");
+		die("Vmem is required in this emulator variant\n");
 		virt_ram_base = 0;
 
 		// Allocate it all and initialize it.
@@ -452,11 +471,8 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		mram->size = RAM_SIZE;
 		mram->data = (u8*)malloc_pages(RAM_SIZE);
 		
-		mmap_setup();
-
 		vram->size = VRAM_SIZE;
-		//vram->data = (u8*)malloc_pages(VRAM_SIZE);
-		vram->data = (u8*)VRAM_BASE; // Points to FPGA-visible DDR3,
+		vram->data = (u8*)malloc_pages(VRAM_SIZE);
 
 		aica_ram->size = aram_size;
 		aica_ram->data = (u8*)malloc_pages(aram_size);
@@ -466,20 +482,19 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		printf("Info: p_sh4rcb: %p virt_ram_base: %p\n", p_sh4rcb, virt_ram_base);
 		// Map the different parts of the memory file into the new memory range we got.
 		#define MAP_RAM_START_OFFSET  0
-		#define MAP_VRAM_START_OFFSET (MAP_RAM_START_OFFSET+RAM_SIZE)
-		#define MAP_ARAM_START_OFFSET (MAP_VRAM_START_OFFSET+VRAM_SIZE)
+		#define MAP_ARAM_START_OFFSET (MAP_RAM_START_OFFSET+VRAM_SIZE)
 		const vmem_mapping mem_mappings[] = {
-			{0x00000000, 0x00800000,                               0,         0, false},  // Area 0 -> unused
-			{0x00800000, 0x01000000,           MAP_ARAM_START_OFFSET, aram_size, false},  // Aica, wraps too
-			{0x20000000, 0x20000000+aram_size, MAP_ARAM_START_OFFSET, aram_size,  true},
-			{0x01000000, 0x04000000,                               0,         0, false},  // More unused
-			{0x04000000, 0x05000000,           MAP_VRAM_START_OFFSET, VRAM_SIZE,  true},  // Area 1 (vram, 16MB, wrapped on DC as 2x8MB)
-			{0x05000000, 0x06000000,                               0,         0, false},  // 32 bit path (unused)
-			{0x06000000, 0x07000000,           MAP_VRAM_START_OFFSET, VRAM_SIZE,  true},  // VRAM mirror
-			{0x07000000, 0x08000000,                               0,         0, false},  // 32 bit path (unused) mirror
-			{0x08000000, 0x0C000000,                               0,         0, false},  // Area 2
-			{0x0C000000, 0x10000000,            MAP_RAM_START_OFFSET,  RAM_SIZE,  true},  // Area 3 (main RAM + 3 mirrors)
-			{0x10000000, 0x20000000,                               0,         0, false},  // Area 4-7 (unused)
+			{0x00000000, 0x00800000,                               0,         0, 		  -1, false},  // Area 0 -> unused
+			{0x00800000, 0x01000000,           MAP_ARAM_START_OFFSET, aram_size, fd_ram_aram, false},  // Aica, wraps too
+			{0x20000000, 0x20000000+aram_size, MAP_ARAM_START_OFFSET, aram_size, fd_ram_aram, true},
+			{0x01000000, 0x04000000,                               0,         0, 		  -1, false},  // More unused
+			{0x04000000, 0x05000000,               HW_FPGA_VRAM_OFST, VRAM_SIZE,  fd_dev_mem,  true},  // Area 1 (vram, 16MB, wrapped on DC as 2x8MB)
+			{0x05000000, 0x06000000,                               0,         0, 		  -1,false},  // 32 bit path (unused)
+			{0x06000000, 0x07000000,               HW_FPGA_VRAM_OFST, VRAM_SIZE,  fd_dev_mem,  true},  // VRAM mirror
+			{0x07000000, 0x08000000,                               0,         0, 		  -1, false},  // 32 bit path (unused) mirror
+			{0x08000000, 0x0C000000,                               0,         0,  		  -1, false},  // Area 2
+			{0x0C000000, 0x10000000,            MAP_RAM_START_OFFSET,  RAM_SIZE,  fd_ram_aram, true},  // Area 3 (main RAM + 3 mirrors)
+			{0x10000000, 0x20000000,                               0,         0, 		  -1, false},  // Area 4-7 (unused)
 		};
 		vmem_platform_create_mappings(&mem_mappings[0], sizeof(mem_mappings) / sizeof(mem_mappings[0]));
 
@@ -487,26 +502,10 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		aica_ram->size = aram_size;
 		aica_ram->data = &virt_ram_base[0x20000000];  // Points to the writtable AICA addrspace
 
-		if (mmap_setup() != 0)
-			return false;
-		
-		if (mmap_fpga_region(&virt_ram_base[0x04000000], HW_FPGA_VRAM_OFST, VRAM_SIZE, &VRAM_BASE) != 0)
-			return false;
-
-		if (mmap_fpga_region(&virt_ram_base[0x04800000], HW_FPGA_VRAM_OFST, VRAM_SIZE, nullptr) != 0)
-			return false;
-
-		if (mmap_fpga_region(&virt_ram_base[0x06000000], HW_FPGA_VRAM_OFST, VRAM_SIZE, nullptr) != 0)
-			return false;
-
-		if (mmap_fpga_region(&virt_ram_base[0x06800000], HW_FPGA_VRAM_OFST, VRAM_SIZE, nullptr) != 0)
-			return false;
-
-		vram_virt_addr = (void*)VRAM_BASE;
-		FPGA_REGS_BASE = FPGA_SHARED_BASE + offs_8mb;
+		FPGA_VRAM_BASE = &virt_ram_base[0x04000000];
 
 		vram->size = VRAM_SIZE;
-		vram->data = (u8*)VRAM_BASE;   // Points to FPGA-visible DDR3, inside the fastmem address space
+		vram->data = &virt_ram_base[0x04000000];   // Points to FPGA-visible DDR3, inside the fastmem address space
 
 		mram->size = RAM_SIZE;
 		mram->data = &virt_ram_base[0x0C000000];   // Main memory, first mirror
@@ -528,10 +527,7 @@ void _vmem_release(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		vmem_platform_destroy();
 	else {
 		freedefptr(p_sh4rcb);
-		if (vram->data == (u8*)VRAM_BASE)
-			munmap((void*)VRAM_BASE, HW_FPGA_VRAM_SPAN);
-		else
-			freedefptr(vram->data);
+		freedefptr(vram->data);
 		freedefptr(aica_ram->data);
 		freedefptr(mram->data);
 	}
