@@ -304,4 +304,12 @@ else()
     target_link_libraries(${APP_NAME}.elf PRIVATE -static)
     target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_MISTER)
     target_compile_options(${APP_NAME}.elf PRIVATE -mcpu=cortex-a9 -mfpu=neon-vfpv4 -mfloat-abi=hard -marm)
+	target_compile_options(${APP_NAME}.elf PRIVATE
+    -Ofast
+	-marm
+    -mcpu=cortex-a9
+    -mfpu=neon
+    -mfloat-abi=hard
+    -funsafe-math-optimizations
+    -fomit-frame-pointer)
 endif()

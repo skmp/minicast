@@ -8,6 +8,84 @@
 #include "hw/aica/aica_mem.h"
 #include "hw/sh4/dyna/blockmanager.h"
 
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+
+#define HW_FPGA_VRAM_OFST (0x32000000)		// 800MB. (DDRAM_BASE address in the core).
+#define HW_FPGA_VRAM_SPAN (0x01000000) 		// Span of 16MB
+#define HW_FPGA_VRAM_MASK ( HW_FPGA_VRAM_SPAN - 1 )
+
+void *vram_virt_addr;
+volatile u8* VRAM_BASE;
+volatile u8* FPGA_SHARED_BASE;
+volatile u8* FPGA_REGS_BASE;
+
+uint32_t offs_8mb = 1024*1024*8;
+
+static int mmap_fpga_region(void* fixed_addr, uintptr_t fpga_offset, size_t span, volatile u8** mapped_base) {
+	printf("DC VRAM (DDR3) sharing setup. ElectronAsh 2025\n\n");
+
+	void *virtual_base;
+
+	int fd;
+
+	printf("Opening /dev/mem, for mmap...\n");
+	if ( ( fd = open( "/dev/mem", ( O_RDWR | O_SYNC ) ) ) == -1 ) {
+	//if ( ( fd = open( "/dev/mem", ( O_RDWR ) ) ) == -1 ) {
+		printf( "ERROR: could not open \"/dev/mem\"...\n\n" );
+		return( 1 );
+	}
+	else {
+		printf("/dev/mem opened OK...\n\n");
+	}
+
+	int mmap_flags = MAP_SHARED | MAP_SYNC;
+	if (fixed_addr)
+		mmap_flags |= MAP_FIXED;
+
+	//virtual_base = mmap( NULL, HW_FPGA_VRAM_SPAN, ( PROT_READ | PROT_WRITE ), MAP_SHARED, fd, HW_FPGA_VRAM_OFST );
+	virtual_base = mmap(fixed_addr, span, PROT_READ | PROT_WRITE, mmap_flags, fd, fpga_offset);
+	
+	printf("Mapping DC VRAM...\n");
+	if ( virtual_base == MAP_FAILED ) {
+		printf( "ERROR: VRAM mmap() failed...\n\n" );
+		close( fd );
+		return( 1 );
+	}
+	else {
+		printf("VRAM mapped OK.\n");
+	}
+	uint8_t* mapped_addr = (uint8_t*)virtual_base + ((uintptr_t)0 & HW_FPGA_VRAM_MASK);
+	
+	printf("DC VRAM Addr: 0x%08X\n\n", (unsigned int)mapped_addr );
+
+	printf("Closing /dev/mem...\n\n");
+	close( fd );
+
+	if (mapped_base)
+		*mapped_base = mapped_addr;
+	
+	/*
+	for (int i=0; i<(1024*1024*8); i++) {
+		VRAM_BASE[ FB_R_SOF1+i ] = 0xffaabbcc;
+	}
+	*/
+	
+	return 0;
+}
+
+int mmap_setup() {
+	if (mmap_fpga_region(nullptr, HW_FPGA_VRAM_OFST, HW_FPGA_VRAM_SPAN, &FPGA_SHARED_BASE) != 0)
+		return 1;
+
+	vram_virt_addr = (void*)FPGA_SHARED_BASE;
+	VRAM_BASE = FPGA_SHARED_BASE;
+	FPGA_REGS_BASE = FPGA_SHARED_BASE + offs_8mb;
+	return 0;
+}
+
+
 //top registered handler
 _vmem_handler       _vmem_lrp;
 
@@ -373,9 +451,12 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 
 		mram->size = RAM_SIZE;
 		mram->data = (u8*)malloc_pages(RAM_SIZE);
+		
+		mmap_setup();
 
 		vram->size = VRAM_SIZE;
-		vram->data = (u8*)malloc_pages(VRAM_SIZE);
+		//vram->data = (u8*)malloc_pages(VRAM_SIZE);
+		vram->data = (u8*)VRAM_BASE; // Points to FPGA-visible DDR3,
 
 		aica_ram->size = aram_size;
 		aica_ram->data = (u8*)malloc_pages(aram_size);
@@ -406,8 +487,26 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		aica_ram->size = aram_size;
 		aica_ram->data = &virt_ram_base[0x20000000];  // Points to the writtable AICA addrspace
 
+		if (mmap_setup() != 0)
+			return false;
+		
+		if (mmap_fpga_region(&virt_ram_base[0x04000000], HW_FPGA_VRAM_OFST, VRAM_SIZE, &VRAM_BASE) != 0)
+			return false;
+
+		if (mmap_fpga_region(&virt_ram_base[0x04800000], HW_FPGA_VRAM_OFST, VRAM_SIZE, nullptr) != 0)
+			return false;
+
+		if (mmap_fpga_region(&virt_ram_base[0x06000000], HW_FPGA_VRAM_OFST, VRAM_SIZE, nullptr) != 0)
+			return false;
+
+		if (mmap_fpga_region(&virt_ram_base[0x06800000], HW_FPGA_VRAM_OFST, VRAM_SIZE, nullptr) != 0)
+			return false;
+
+		vram_virt_addr = (void*)VRAM_BASE;
+		FPGA_REGS_BASE = FPGA_SHARED_BASE + offs_8mb;
+
 		vram->size = VRAM_SIZE;
-		vram->data = &virt_ram_base[0x04000000];   // Points to first vram mirror (writtable and lockable)
+		vram->data = (u8*)VRAM_BASE;   // Points to FPGA-visible DDR3, inside the fastmem address space
 
 		mram->size = RAM_SIZE;
 		mram->data = &virt_ram_base[0x0C000000];   // Main memory, first mirror
@@ -429,9 +528,11 @@ void _vmem_release(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		vmem_platform_destroy();
 	else {
 		freedefptr(p_sh4rcb);
-		freedefptr(vram->data);
+		if (vram->data == (u8*)VRAM_BASE)
+			munmap((void*)VRAM_BASE, HW_FPGA_VRAM_SPAN);
+		else
+			freedefptr(vram->data);
 		freedefptr(aica_ram->data);
 		freedefptr(mram->data);
 	}
 }
-

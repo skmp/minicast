@@ -231,6 +231,10 @@ void _vmem_get_ptrs(u32 sz,bool write,void*** vmap,void*** func);
 void* _vmem_get_ptr2(u32 addr,u32& mask);
 void* _vmem_read_const(u32 addr,bool& ismem,u32 sz);
 
+extern volatile u8* VRAM_BASE;
+extern volatile u8* FPGA_SHARED_BASE;
+extern volatile u8* FPGA_REGS_BASE;
+
 extern u8* virt_ram_base;
 
 static inline bool _nvmem_enabled() {
