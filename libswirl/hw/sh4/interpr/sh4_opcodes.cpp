@@ -1255,7 +1255,8 @@ INLINE void DYNACALL do_sqw(u32 Dest)
 	}
 	else
 	{
-		TAWriteSQ(Address,sq_both);
+		//TAWriteSQ(Address,sq_both);
+		do_sqw_nommu(Address, sq_both);
 	}
 }
 

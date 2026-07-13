@@ -49,7 +49,11 @@ struct Sh4ModCcn_impl : Sh4ModCcn {
 			break;
 
 		case 4:
-			do_sqw_nommu = (sqw_fp*)&TAWriteSQ;
+			if (settings.pvr.MultithreadedTA) {
+				do_sqw_nommu = (sqw_fp*)&TAWriteSQ_MTTA;
+			} else {
+				do_sqw_nommu = (sqw_fp*)&TAWriteSQ_STTA;
+			}
 			break;
 		default: do_sqw_nommu = &do_sqw_nommu_full;
 		}

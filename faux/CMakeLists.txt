@@ -6,6 +6,8 @@ project(${APP_NAME})
 
 enable_language(C ASM CXX)
 
+add_link_options("-Wl,--build-id=sha1")
+
 set(_sources
     ${CMAKE_SOURCE_DIR}/../main.cpp
 )
@@ -57,7 +59,7 @@ list(APPEND _sources
     ${swrl}/hw/pvr/pvr_regs.cpp
     # ${swrl}/hw/pvr/ta_ctx.cpp
     # ${swrl}/hw/pvr/ta_vtx.cpp
-    # ${swrl}/hw/pvr/ta.cpp
+    ${swrl}/hw/pvr/ta.cpp
     # ${swrl}/hw/naomi/m4cartridge.cpp
     # ${swrl}/hw/naomi/decrypt.cpp
     # ${swrl}/hw/naomi/naomi_cart.cpp

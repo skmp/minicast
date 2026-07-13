@@ -6,8 +6,129 @@
 
 #include "ta.h"
 #include "ta_ctx.h"
+#include "ta_ring.h"
+#include "gpl/lxdream/tacore.h"
 
-extern u32 ta_type_lut[256];
+// TA data ring buffer. The "ta fsm" below is the producer; lxdream's tacore
+// (on its own thread) is the consumer. See ta_ring.h.
+DECL_ALIGN(32) ta_ring_t ta_ring;
+
+/*
+	TA type lookup table.
+
+	Historically built and owned by ta_vtx.cpp (the HLE vertex decoder). That
+	TU is not compiled in the hybrid build, so the table and the two helpers
+	that populate it live here now - fill_fsm() is the only consumer.
+
+	Layout of each entry (indexed by PCW.obj_ctrl):
+	  bits [6:0]   poly_data_type_id  (0..14)
+	  bits [14:8]  poly_header type   (0..4, high bit = 64B header)
+	  bit  31      set when the header is 64B (SZ64)
+*/
+u32 ta_type_lut[256];
+
+static const u32 TA_SZ32 = 1;
+static const u32 TA_SZ64 = 2;
+
+static u32 ta_poly_data_type_id(PCW pcw)
+{
+	if (pcw.Texture)
+	{
+		if (pcw.Volume == 0)
+		{	//single volume
+			if (pcw.Col_Type == 0)
+				return pcw.UV_16bit == 0 ? 3 : 4;   //Textured, Packed Color
+			else if (pcw.Col_Type == 1)
+				return pcw.UV_16bit == 0 ? 5 : 6;   //Textured, Floating Color
+			else
+				return pcw.UV_16bit == 0 ? 7 : 8;   //Textured, Intensity
+		}
+		else
+		{	//two volumes
+			if (pcw.Col_Type == 0)
+				return pcw.UV_16bit == 0 ? 11 : 12; //Textured, Packed Color, Two Volumes
+			else if (pcw.Col_Type == 1)
+				return 0xFFFFFFFF;                  //invalid
+			else
+				return pcw.UV_16bit == 0 ? 13 : 14; //Textured, Intensity, Two Volumes
+		}
+	}
+	else
+	{
+		if (pcw.Volume == 0)
+		{	//single volume
+			if (pcw.Col_Type == 0)
+				return 0;                           //Non-Textured, Packed Color
+			else if (pcw.Col_Type == 1)
+				return 1;                           //Non-Textured, Floating Color
+			else
+				return 2;                           //Non-Textured, Intensity
+		}
+		else
+		{	//two volumes
+			if (pcw.Col_Type == 0)
+				return 9;                           //Non-Textured, Packed Color, Two Volumes
+			else if (pcw.Col_Type == 1)
+				return 0xFFFFFFFF;                  //invalid
+			else
+				return 10;                          //Non-Textured, Intensity, Two Volumes
+		}
+	}
+}
+
+//0-4 | 0x80
+static u32 ta_poly_header_type_size(PCW pcw)
+{
+	if (pcw.Volume == 0)
+	{
+		if (pcw.Col_Type < 2) //0,1
+		{
+			return 0 | 0;               //Polygon Type 0 -- SZ32
+		}
+		else if (pcw.Col_Type == 2)
+		{
+			if (pcw.Texture && pcw.Offset)
+				return 2 | 0x80;        //Polygon Type 2 -- SZ64
+			else
+				return 1 | 0;           //Polygon Type 1 -- SZ32
+		}
+		else	//col_type == 3
+		{
+			return 0 | 0;               //Polygon Type 0 -- SZ32
+		}
+	}
+	else
+	{
+		if (pcw.Col_Type == 0)
+			return 3 | 0;               //Polygon Type 3 -- SZ32
+		else if (pcw.Col_Type == 2)
+			return 4 | 0x80;            //Polygon Type 4 -- SZ64
+		else if (pcw.Col_Type == 3)
+			return 3 | 0;               //Polygon Type 3 -- SZ32
+		else
+			return 0xFFDDEEAA;          //invalid (Col_Type==1 && volume==1)
+	}
+}
+
+static void fill_ta_type_lut()
+{
+	for (int i = 0; i < 256; i++)
+	{
+		PCW pcw;
+		pcw.obj_ctrl = i;
+		u32 rv   = ta_poly_data_type_id(pcw);
+		u32 type = ta_poly_header_type_size(pcw);
+
+		if (type & 0x80)
+			rv |= (TA_SZ64 << 30);
+		else
+			rv |= (TA_SZ32 << 30);
+
+		rv |= (type & 0x7F) << 8;
+
+		ta_type_lut[i] = rv;
+	}
+}
 
 /*
 	Threaded TA Implementation
@@ -108,6 +229,9 @@ void fill_fsm(ta_state st, s8 pt, s8 obj, ta_state next, u32 proc=0, u32 sz64=0)
 
 void fill_fsm()
 {
+	//the FSM builder below reads ta_type_lut, so populate it first
+	fill_ta_type_lut();
+
 	//initialise to invalid
 	for (int i=0;i<2048;i++)
 		ta_fsm[i]=(i>>8) | 0x80;
@@ -219,9 +343,9 @@ const HollyInterruptID ListEndInterrupt[5]=
 };
 
 
-NOINLINE void DYNACALL ta_handle_cmd(u32 trans)
+NOINLINE void DYNACALL ta_handle_cmd(u32 trans, void* block)
 {
-	Ta_Dma* dat=(Ta_Dma*)(ta_tad.thd_data-32);
+	Ta_Dma* dat=(Ta_Dma*)block;
 
 	u32 cmd = trans>>4;
 	trans&=7;
@@ -243,6 +367,11 @@ NOINLINE void DYNACALL ta_handle_cmd(u32 trans)
 			{
 				//ta_tad.early=os_GetSeconds();
 			}
+			// Hybrid: this end-of-list block has already been pushed to the
+			// ring. Wait for tacore (the consumer) to drain everything up to
+			// and including it before raising the list interrupt, so the guest
+			// never sees the interrupt before the geometry has been processed.
+			ta_ring_drain();
 			asic_RaiseInterrupt( ListEndInterrupt[ta_fsm_cl]);
 			ta_fsm_cl=7;
 			trans=TAS_NS;
@@ -279,44 +408,51 @@ NOINLINE void DYNACALL ta_handle_cmd(u32 trans)
 
 static OnLoad ol_fillfsm(&fill_fsm);
 
+/*
+	TA control events (ListInit / SoftReset / ListCont).
+
+	These mutate tacore's private state (ta_status), which the consumer thread
+	reads while draining the ring. To serialize against the consumer without a
+	lock, the producer:
+	  1. drains the ring   -> consumer is parked on an empty ring, no in-flight block
+	  2. DMB ISH           -> the drain is observed before we touch tacore state
+	  3. calls into tacore -> safe: consumer won't read ta_status until we push more
+	  4. DMB ISH           -> the new tacore state is published before any later block
+*/
 void ta_vtx_ListCont()
 {
-	SetCurrentTARC(TA_CURRENT_CTX);
-	ta_tad.Continue();
-
+	// ListCont doesn't touch tacore state, but still order it after in-flight
+	// work so the FSM state change is consistent with what the consumer saw.
+	ta_ring_drain();
+	TA_RING_DMB();
 	ta_cur_state=TAS_NS;
+	TA_RING_DMB();
 }
-void ta_vtx_ListInit()
+void ta_vtx_ListInit(u8* vram)
 {
-	SetCurrentTARC(TA_CURRENT_CTX);
-	ta_tad.ClearPartial();
-
+	ta_ring_drain();
+	TA_RING_DMB();
+	lxd_ta_init(vram);
 	ta_cur_state=TAS_NS;
+	TA_RING_DMB();
 }
 void ta_vtx_SoftReset()
 {
+	ta_ring_drain();
+	TA_RING_DMB();
+	lxd_ta_reset();
 	ta_cur_state=TAS_NS;
+	TA_RING_DMB();
 }
 
 INLINE
 void DYNACALL ta_thd_data32_i(void* data)
 {
-	if (ta_ctx == NULL)
-	{
-		printf("Warning: data sent to TA prior to ListInit. Implied\n");
-		ta_vtx_ListInit();
-	}
-
-	simd256_t* dst = (simd256_t*)ta_tad.thd_data;
-	simd256_t* src = (simd256_t*)data;
-
 	// First byte is PCW
 	PCW pcw = *(PCW*)data;
-	
-	// Copy the TA data
-	*dst = *src;
 
-	ta_tad.thd_data += 32;
+	// Producer: hand the 32-byte block to tacore via the ring buffer.
+	ta_ring_push(data);
 
 	//process TA state
 	u32 state_in = (ta_cur_state << 8) | (pcw.ParaType << 5) | ((pcw.obj_ctrl >> 2) & 31);
@@ -332,7 +468,7 @@ void DYNACALL ta_thd_data32_i(void* data)
 	}
 	else
 	{
-		ta_handle_cmd(trans);
+		ta_handle_cmd(trans, data);
 	}
 }
 
@@ -373,4 +509,8 @@ void ta_vtx_data(u32* data, u32 size)
 		data+=8;
 		size--;
 	}
+
+	// Publish the tail of this DMA burst so the consumer gets fed promptly even
+	// when the burst didn't land on a batch boundary.
+	ta_ring_publish();
 }

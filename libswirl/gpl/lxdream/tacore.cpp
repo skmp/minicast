@@ -28,7 +28,11 @@
 #include "hw/pvr/pvr_regs.h"
 #include "hw/pvr/pvr_mem.h"
 #include "hw/pvr/pvr_sb_regs.h"
+#include "hw/pvr/ta.h"
+#include "hw/pvr/ta_ring.h"
 #include "hw/holly/holly_intc.h"
+
+#include <pthread.h>
 
 #define PVR2_RAM_SIZE VRAM_SIZE
 #define PVR2_RAM_MASK VRAM_MASK
@@ -271,6 +275,14 @@ void lxd_ta_reset() {
 void lxd_ta_init(u8* vram) {
     pvr2_main_ram_hidden = vram;
 
+    // Spin up the hybrid TA consumer thread once, on first init. pvr2_main_ram_hidden
+    // is set above, so the consumer can safely touch VRAM from here on.
+    static bool consumer_started = false;
+    if (!consumer_started && settings.pvr.MultithreadedTA) {
+        consumer_started = true;
+        ta_ring_consumer_start();
+    }
+
     ta_status.state = STATE_IDLE;
     ta_status.current_list_type = -1;
     ta_status.current_vertex_type = -1;
@@ -410,7 +422,10 @@ static HollyInterruptID list_events[5] = {holly_OPAQUE, holly_OPAQUEMOD,
 static void ta_end_list() {
     if( ta_status.current_list_type != TA_LIST_NONE ) {
         //asic_event( list_events[ta_status.current_list_type] );
-        asic_RaiseInterrupt(list_events[ta_status.current_list_type]);
+        if (!settings.pvr.MultithreadedTA)
+        {
+            asic_RaiseInterrupt(list_events[ta_status.current_list_type]);
+        }
     }
     ta_status.current_list_type = TA_LIST_NONE;
     ta_status.current_vertex_type = TA_VERTEX_LISTLESS;
@@ -420,9 +435,16 @@ static void ta_end_list() {
 }
 
 static void ta_bad_input_error() {
-    asic_RaiseInterrupt(holly_ILLEGAL_PARAM);
-    printf("TA error: holly_ILLEGAL_PARAM. Interrupt raised\n");
-    //asic_event( EVENT_PVR_BAD_INPUT );
+    if (settings.pvr.MultithreadedTA)
+    {
+        printf("TA error: holly_ILLEGAL_PARAM. (interrupt suppressed)\n");
+    }
+    else
+    {
+        asic_RaiseInterrupt(holly_ILLEGAL_PARAM);
+        printf("TA error: holly_ILLEGAL_PARAM. Interrupt raised\n");
+        //asic_event( EVENT_PVR_BAD_INPUT );
+    }
 }
 
 /**
@@ -439,9 +461,13 @@ static int ta_write_polygon_buffer( uint32_t *data, int length )
     int end = TA_ISP_LIMIT;// MMIO_READ( PVR2, TA_POLYEND );
     for( rv=0; rv < length; rv++ ) {
         if( posn == end ) {
-            asic_RaiseInterrupt(holly_PRIM_NOMEM);
-            printf("TA error: holly_PRIM_NOMEM. Interrupt Raised\n");
-            //asic_event( EVENT_PVR_PRIM_ALLOC_FAIL );
+            if (settings.pvr.MultithreadedTA) {
+                printf("TA error: holly_PRIM_NOMEM. (interrupt suppressed)\n");
+            } else {
+                asic_RaiseInterrupt(holly_PRIM_NOMEM);
+                printf("TA error: holly_PRIM_NOMEM. Interrupt Raised\n");
+                //asic_event( EVENT_PVR_PRIM_ALLOC_FAIL );
+            }
             ////	    ta_status.state = STATE_ERROR;
             break;
         }
@@ -477,9 +503,13 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             return TA_NO_ALLOC;
         } else if( newposn <= limit ) {
         } else if( newposn <= (limit + ta_status.tilelist_size) ) {
-            asic_RaiseInterrupt(holly_MATR_NOMEM);
-            printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
-            //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            if (settings.pvr.MultithreadedTA) {
+                printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+            } else {
+                asic_RaiseInterrupt(holly_MATR_NOMEM);
+                printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            }
             TA_NEXT_OPB = newposn;
             //MMIO_WRITE( PVR2, TA_LISTPOS, newposn );
         } else {
@@ -499,9 +529,13 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             return TA_NO_ALLOC;
         } else if( newposn >= limit ) {
         } else if( newposn >= (limit - ta_status.tilelist_size) ) {
-            asic_RaiseInterrupt(holly_MATR_NOMEM);
-            printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
-            //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            if (settings.pvr.MultithreadedTA) {
+                printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+            } else {
+                asic_RaiseInterrupt(holly_MATR_NOMEM);
+                printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            }
             TA_NEXT_OPB = newposn;
             //MMIO_WRITE( PVR2, TA_LISTPOS, newposn );
         } else {
@@ -1325,4 +1359,55 @@ void lxd_ta_write( unsigned char *buf, uint32_t length )
 void lxd_ta_write_burst( sh4addr_t addr, unsigned char *data )
 {
     pvr2_ta_process_block( data );
+}
+
+/*
+    Multithreaded TA consumer.
+
+    Runs on its own thread/core, draining the ta_ring that the "ta fsm"
+    producer (ta.cpp) fills. Cortex-A9 SMP ordering:
+      Consumer: read the published write index, then DMB ISH, then read the data.
+
+    Like the producer, the barrier is amortized: when the consumer notices new
+    published data it takes one dmb ish, processes the whole available batch with
+    plain loads, then publishes read_pub once. It also caches write_pub in
+    write_cache so an empty ring is detected without touching the producer's line.
+*/
+static void* ta_ring_consumer_thread(void* /*param*/) {
+    for (;;) {
+        // Fast empty check against our private cache first.
+        u32 rd = ta_ring.read_pub;
+        if (rd == ta_ring.write_cache) {
+            // Refresh from the shared line; still empty -> spin.
+            ta_ring.write_cache = ta_ring.write_pub;
+            if (rd == ta_ring.write_cache)
+                continue;
+
+            // New data was published: observe it after the index that announced it.
+            TA_RING_DMB();
+        }
+
+        // Drain everything currently published in one go (plain loads).
+        u32 wr = ta_ring.write_cache;
+        while (rd != wr) {
+            pvr2_ta_process_block(&ta_ring.data[(rd & TA_RING_MASK) * TA_RING_BLOCK]);
+            rd++;
+        }
+
+        // Retire the batch. One store, ordered after the reads above.
+        TA_RING_DMB();
+        ta_ring.read_pub = rd;
+    }
+
+    return NULL;
+}
+
+void ta_ring_consumer_start() {
+    static pthread_t consumer;
+    ta_ring.write_pub = 0;
+    ta_ring.write_priv = 0;
+    ta_ring.read_cache = 0;
+    ta_ring.read_pub = 0;
+    ta_ring.write_cache = 0;
+    pthread_create(&consumer, NULL, ta_ring_consumer_thread, NULL);
 }

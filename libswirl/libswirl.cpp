@@ -314,13 +314,15 @@ void InitSettings()
     settings.rend.FloatVMUs = false;
     settings.rend.Rotate90 = false;
     settings.rend.ScreenOrientation = 0; //default is 0 (Auto Rotation)
-
+    
     settings.pvr.ta_skip = 0;
     settings.pvr.backend = "auto";
-
+    
     settings.pvr.MaxThreads = 3;
     settings.pvr.SynchronousRender = false;
     settings.pvr.ForceGLES2 = false;
+
+    settings.pvr.MultithreadedTA = false;
 
     settings.debug.SerialConsole = false;
     settings.debug.VirtualSerialPort = false;
@@ -423,6 +425,8 @@ void LoadSettings(bool game_specific)
     settings.pvr.MaxThreads = cfgLoadInt(config_section, "pvr.MaxThreads", settings.pvr.MaxThreads);
     settings.pvr.SynchronousRender = cfgLoadBool(config_section, "pvr.SynchronousRendering", settings.pvr.SynchronousRender);
     settings.pvr.ForceGLES2 = cfgLoadBool(config_section, "pvr.ForceGLES2", settings.pvr.ForceGLES2);
+
+    settings.pvr.MultithreadedTA = cfgLoadBool(config_section, "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
     
     settings.debug.SerialConsole = cfgLoadBool(config_section, "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     settings.debug.VirtualSerialPort = cfgLoadBool(config_section, "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);
@@ -584,6 +588,8 @@ void SaveSettings()
     cfgSaveInt("config", "pvr.MaxThreads", settings.pvr.MaxThreads);
     cfgSaveBool("config", "pvr.SynchronousRendering", settings.pvr.SynchronousRender);
     cfgSaveBool("config", "pvr.ForceGLES2", settings.pvr.ForceGLES2);
+
+    cfgSaveBool("config", "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
 
     cfgSaveBool("config", "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     cfgSaveBool("config", "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);
