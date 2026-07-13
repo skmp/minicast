@@ -323,6 +323,7 @@ void InitSettings()
     settings.pvr.ForceGLES2 = false;
 
     settings.pvr.MultithreadedTA = false;
+    settings.pvr.FPSTarget = 66;
 
     settings.debug.SerialConsole = false;
     settings.debug.VirtualSerialPort = false;
@@ -427,6 +428,8 @@ void LoadSettings(bool game_specific)
     settings.pvr.ForceGLES2 = cfgLoadBool(config_section, "pvr.ForceGLES2", settings.pvr.ForceGLES2);
 
     settings.pvr.MultithreadedTA = cfgLoadBool(config_section, "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
+
+    settings.pvr.FPSTarget = cfgLoadInt(config_section, "pvr.FPSTarget", settings.pvr.FPSTarget);
     
     settings.debug.SerialConsole = cfgLoadBool(config_section, "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     settings.debug.VirtualSerialPort = cfgLoadBool(config_section, "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);
@@ -590,6 +593,7 @@ void SaveSettings()
     cfgSaveBool("config", "pvr.ForceGLES2", settings.pvr.ForceGLES2);
 
     cfgSaveBool("config", "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
+    cfgSaveInt("config", "pvr.FPSTarget", settings.pvr.FPSTarget);
 
     cfgSaveBool("config", "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     cfgSaveBool("config", "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);

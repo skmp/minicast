@@ -74,9 +74,7 @@ void rend_vblank() {
 }
 
 void rend_start_render(u8* vram) {
-    //SetREP(20 * 1000 * 1000); // in 20 mhz = 10 ms at 200 mhz
-    //SetREP(2 * 1000 * 1000); // in 2 mhz = 10 ms at 200 mhz
-    SetREP(200000000/70); // in 2 mhz = 10 ms at 200 mhz
+    SetREP(200000000/settings.pvr.FPSTarget);
 	
 
 	memcpy_neon((void*)FPGA_REGS_BASE, pvr_regs, pvr_RegSize);

@@ -574,6 +574,7 @@ struct settings_t
 		bool ForceGLES2;
 
 		bool MultithreadedTA;
+		u32 FPSTarget;
 	} pvr;
 
 	struct {
