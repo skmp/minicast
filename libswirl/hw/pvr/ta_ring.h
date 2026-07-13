@@ -1,0 +1,123 @@
+/*
+	This file is part of libswirl
+*/
+#include "license/bsd"
+
+#pragma once
+
+#include "types.h"
+#include <string.h>
+
+/*
+	TA data ring buffer
+
+	Producer: the "ta fsm" (ta.cpp) parses TA data, copies each 32-byte block
+	into this ring and, on end-of-list, spin-waits for it to drain before
+	raising the list interrupt.
+
+	Consumer: lxdream's tacore drains the ring on its own thread/core and feeds
+	pvr2_ta_process_block().
+
+	This is a Cortex-A9 (dual core) target, so the single-producer /
+	single-consumer hand-off is ordered with DMB ISH. The barrier is NOT taken
+	per block - on an A9 a dmb ish is a serializing ~30-cycle bubble, and taking
+	one per 32-byte block dominated the SQ path. Instead the producer copies
+	blocks and bumps a private write cursor with plain stores, then publishes
+	the whole batch with a single barrier via ta_ring_publish():
+	  Producer: write data..., then DMB ISH, then store the shared write index.
+	  Consumer: read the shared write index, then DMB ISH, then read the data.
+
+	False sharing is avoided by keeping the producer- and consumer-owned indices
+	on separate cache lines, and by each side caching the other's index so the
+	steady-state fill/empty checks don't touch the shared line.
+*/
+
+// 32*1024 bytes total => 1024 blocks of 32 bytes. Must stay a power of two.
+#define TA_RING_BYTES    (32 * 1024)
+#define TA_RING_BLOCK    32
+#define TA_RING_BLOCKS   (TA_RING_BYTES / TA_RING_BLOCK)
+#define TA_RING_MASK     (TA_RING_BLOCKS - 1)
+
+#define TA_RING_LINE     64  // A9 cache line
+
+// Publish to the consumer once this many blocks have been staged. Amortizes the
+// dmb ish across a batch instead of paying it per block, while still keeping the
+// consumer fed so it runs concurrently with the producer. Must be a power of two.
+#define TA_RING_BATCH    32
+
+struct ta_ring_t
+{
+	// Producer-owned. write_pub is the batch of blocks published to the
+	// consumer; write_priv is the producer's private cursor (unpublished
+	// blocks it has already copied in). Own cache line.
+	DECL_ALIGN(TA_RING_LINE) volatile u32 write_pub;
+	u32 write_priv;            // producer-private, not shared
+	u32 read_cache;            // producer's cached copy of read_pub
+
+	// Consumer-owned. Own cache line.
+	DECL_ALIGN(TA_RING_LINE) volatile u32 read_pub;
+	u32 write_cache;           // consumer's cached copy of write_pub
+
+	DECL_ALIGN(TA_RING_LINE) u8 data[TA_RING_BYTES];
+};
+
+extern ta_ring_t ta_ring;
+
+// DMB ISH - inner shareable data memory barrier (A9 SMP hand-off)
+#if HOST_CPU == CPU_ARM || HOST_CPU == CPU_ARM64
+#define TA_RING_DMB() __asm__ __volatile__("dmb ish" ::: "memory")
+#else
+#define TA_RING_DMB() __sync_synchronize()
+#endif
+
+// Producer: copy one 32-byte block into the ring, spinning while full. No
+// barrier and no shared-index store here - just a plain copy + private cursor
+// bump. Call ta_ring_publish() to make the batch visible to the consumer.
+static inline void ta_ring_push(const void* block)
+{
+	u32 wr = ta_ring.write_priv;
+
+	// Spin until there is room. Check against the cached read index first and
+	// only refresh from the shared line when the cache says we're full, so the
+	// common case never touches the consumer's cache line.
+	if ((wr - ta_ring.read_cache) >= TA_RING_BLOCKS)
+	{
+		do {
+			ta_ring.read_cache = ta_ring.read_pub;
+		} while ((wr - ta_ring.read_cache) >= TA_RING_BLOCKS);
+	}
+
+	memcpy(&ta_ring.data[(wr & TA_RING_MASK) * TA_RING_BLOCK], block, TA_RING_BLOCK);
+
+	wr += 1;
+	ta_ring.write_priv = wr;
+
+	// Publish on a batch boundary so the consumer stays fed. One barrier per
+	// TA_RING_BATCH blocks instead of one per block.
+	if ((wr & (TA_RING_BATCH - 1)) == 0)
+	{
+		TA_RING_DMB();
+		ta_ring.write_pub = wr;
+	}
+}
+
+// Producer: publish everything pushed since the last publish. One barrier for
+// the whole batch: all block stores are ordered before the index store.
+static inline void ta_ring_publish()
+{
+	if (ta_ring.write_pub != ta_ring.write_priv)
+	{
+		TA_RING_DMB();
+		ta_ring.write_pub = ta_ring.write_priv;
+	}
+}
+
+// Producer: publish, then spin until the consumer has drained everything.
+static inline void ta_ring_drain()
+{
+	ta_ring_publish();
+	while (ta_ring.read_pub != ta_ring.write_priv)
+	{
+		// wait for the consumer to drain the ring
+	}
+}

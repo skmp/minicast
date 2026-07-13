@@ -249,11 +249,13 @@ struct PVRDevice : MMIODevice {
 
             link_addr = ea_ptr[0x1C >> 2];//Next link
             //transfer global param
-            #if FEAT_TA == TA_HLE
-            ta_vtx_data(ea_ptr, ea_ptr[0x18 >> 2]);
-            #else
-            lxd_ta_write((u8*)ea_ptr, ea_ptr[0x18 >> 2]);
-            #endif
+            // Hybrid TA: producer path.
+            if (settings.pvr.MultithreadedTA) {
+                ta_vtx_data(ea_ptr, ea_ptr[0x18 >> 2]);
+            } else {
+                lxd_ta_write((u8*)ea_ptr, ea_ptr[0x18 >> 2]);
+            }
+
             if (link_addr == 2)
             {
                 link_addr = calculate_start_link_addr();
@@ -313,6 +315,10 @@ struct PVRDevice : MMIODevice {
             return;
         }
 
+        if (addr == FB_R_SOF1_addr) {
+            *(volatile uint32_t*)(FPGA_REGS_BASE + addr) = data;
+        }
+
         if (addr == TA_LIST_INIT_addr)
         {
             // FIXME: Fuller TA implementation
@@ -320,11 +326,15 @@ struct PVRDevice : MMIODevice {
             TA_ISP_CURRENT = TA_ISP_BASE;
             if (data >> 31)
             {
-                #if FEAT_TA == TA_HLE
-                ta_vtx_ListInit();
-                #else
-                lxd_ta_init(vram);
-                #endif
+                if (settings.pvr.MultithreadedTA)
+                {
+                    ta_vtx_ListInit(vram);
+                }
+                else
+                {
+                    lxd_ta_init(vram);
+                }
+                
                 data = 0;
             }
         }
@@ -334,11 +344,14 @@ struct PVRDevice : MMIODevice {
             if (data != 0)
             {
                 if (data & 1)
-                    #if FEAT_TA == TA_HLE
-                    ta_vtx_SoftReset();
-                    #else
-                    lxd_ta_reset();
-                    #endif
+                {
+                    if (settings.pvr.MultithreadedTA)
+                    {
+                        ta_vtx_SoftReset();
+                    } else {
+                        lxd_ta_reset();
+                    }
+                }
                 data = 0;
             }
         }
@@ -346,11 +359,12 @@ struct PVRDevice : MMIODevice {
         if (addr == TA_LIST_CONT_addr)
         {
             //a write of anything works ?
-            #if FEAT_TA == TA_HLE
-            ta_vtx_ListCont();
-            #else
-            verify(false);
-            #endif
+            if (settings.pvr.MultithreadedTA)
+            {
+                ta_vtx_ListCont();
+            } else {
+                // not supported in lxdream
+            }
         }
 
         if (addr == SPG_CONTROL_addr || addr == SPG_LOAD_addr)

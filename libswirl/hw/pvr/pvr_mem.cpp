@@ -107,11 +107,12 @@ void TAWrite(u32 address,u32* data,u32 count, u8* vram)
 	u32 address_w=address&0x1FFFFFF;//correct ?
 	if (address_w<0x800000)//TA poly
 	{
-		#if FEAT_TA == TA_HLE
-		ta_vtx_data(data, count);
-		#else
-		lxd_ta_write((u8*)data, count * 32);
-		#endif
+		if (settings.pvr.MultithreadedTA)
+		{
+			ta_vtx_data(data, count);
+		} else {
+			lxd_ta_write((u8*)data, count * 32);
+		}
 	}
 	else if(address_w<0x1000000) //Yuv Converter
 	{
@@ -134,7 +135,8 @@ void NOINLINE MemWrite32(void* dst, void* src)
 }
 
 // #if HOST_CPU!=CPU_ARM
-extern "C" void DYNACALL TAWriteSQ(u32 address,u8* sqb)
+template<bool mtta>
+void DYNACALL TAWriteSQ_internal(u32 address,u8* sqb)
 {
 	u32 address_w=address&0x1FFFFFF;//correct ?
 	u8* sq=&sqb[address&0x20];
@@ -143,11 +145,12 @@ extern "C" void DYNACALL TAWriteSQ(u32 address,u8* sqb)
 
 	if (likely(address_w<0x800000))//TA poly
 	{
-		#if FEAT_TA == TA_HLE
-		ta_vtx_data32(sq);
-		#else
-		lxd_ta_write_burst(address_w, sq);
-		#endif
+		if (mtta) {
+			// Multi threaded TA
+			ta_vtx_data32(sq);	
+		} else {
+			lxd_ta_write_burst(address_w, sq);
+		}
 	}
 	else if(likely(address_w<0x1000000)) //Yuv Converter
 	{
@@ -171,6 +174,16 @@ extern "C" void DYNACALL TAWriteSQ(u32 address,u8* sqb)
 			}
 		}
 	}
+}
+
+extern "C" void DYNACALL TAWriteSQ_STTA(u32 address,u8* sqb)
+{
+	TAWriteSQ_internal<false>(address, sqb);
+}
+
+extern "C" void DYNACALL TAWriteSQ_MTTA(u32 address,u8* sqb)
+{
+	TAWriteSQ_internal<true>(address, sqb);
 }
 // #endif
 

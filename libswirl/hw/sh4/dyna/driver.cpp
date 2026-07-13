@@ -510,11 +510,7 @@ struct recSH4 : SuperH4Backend {
 
         // Call the platform-specific magic to make the pages RWX
         CodeCache = NULL;
-#ifdef FEAT_NO_RWX_PAGES
-        verify(vmem_platform_prepare_jit_block(candidate_ptr, CODE_SIZE, (void**)& CodeCache, &cc_rx_offset));
-#else
         verify(vmem_platform_prepare_jit_block(candidate_ptr, CODE_SIZE, (void**)& CodeCache));
-#endif
         // Ensure the pointer returned is non-null
         verify(CodeCache != NULL);
 

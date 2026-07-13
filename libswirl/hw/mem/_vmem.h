@@ -16,10 +16,13 @@ enum VMemType {
 struct vmem_mapping {
 	u32 start_address, end_address;
 	unsigned memoffset, memsize;
+	int fd;
 	bool allow_writes;
 };
 
 // Platform specific vmemory API
+// To create a memfd backed fd
+int allocate_shared_filemem(unsigned size);
 // To initialize (maybe) the vmem subsystem
 VMemType vmem_platform_init(void **vmem_base_addr, void **sh4rcb_addr);
 // To reset the on-demand allocated pages.
@@ -33,9 +36,6 @@ void vmem_platform_destroy();
 // Given a block of data in the .text section, prepares it for JIT action.
 // both code_area and size are page aligned. Returns success.
 bool vmem_platform_prepare_jit_block(void *code_area, unsigned size, void **code_area_rwx);
-// Same as above but uses two address spaces one with RX and RW protections.
-// Note: this function doesnt have to be implemented, it's a fallback for the above one.
-bool vmem_platform_prepare_jit_block(void *code_area, unsigned size, void **code_area_rw, uintptr_t *rx_offset);
 // This might not need an implementation (ie x86/64 cpus).
 void vmem_platform_flush_cache(void *icache_start, void *icache_end, void *dcache_start, void *dcache_end);
 
@@ -230,6 +230,9 @@ void _vmem_release(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 void _vmem_get_ptrs(u32 sz,bool write,void*** vmap,void*** func);
 void* _vmem_get_ptr2(u32 addr,u32& mask);
 void* _vmem_read_const(u32 addr,bool& ismem,u32 sz);
+
+extern volatile u8* FPGA_VRAM_BASE;
+extern volatile u8* FPGA_REGS_BASE;
 
 extern u8* virt_ram_base;
 

@@ -1,10 +1,12 @@
 # Copyright (C) 2023 Advanced Micro Devices, Inc.  All rights reserved.
 # SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.16)
-set(APP_NAME app_component)
+set(APP_NAME minicast)
 project(${APP_NAME})
 
 enable_language(C ASM CXX)
+
+add_link_options("-Wl,--build-id=sha1")
 
 set(_sources
     ${CMAKE_SOURCE_DIR}/../main.cpp
@@ -57,7 +59,7 @@ list(APPEND _sources
     ${swrl}/hw/pvr/pvr_regs.cpp
     # ${swrl}/hw/pvr/ta_ctx.cpp
     # ${swrl}/hw/pvr/ta_vtx.cpp
-    # ${swrl}/hw/pvr/ta.cpp
+    ${swrl}/hw/pvr/ta.cpp
     # ${swrl}/hw/naomi/m4cartridge.cpp
     # ${swrl}/hw/naomi/decrypt.cpp
     # ${swrl}/hw/naomi/naomi_cart.cpp
@@ -295,13 +297,31 @@ add_executable(${APP_NAME}.elf ${_sources})
 set_property(TARGET ${APP_NAME}.elf PROPERTY CXX_STANDARD 17)
 target_compile_definitions(${APP_NAME}.elf PRIVATE  TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP HOST_NO_THREADS FAUX96 FEAT_HAS_SERIAL_TTY=0)
 target_include_directories(${APP_NAME}.elf PRIVATE ${swrl} ${swrl}/deps ${swrl}/deps/vixl)
-target_link_libraries(${APP_NAME}.elf PRIVATE stdc++)
+target_link_libraries(${APP_NAME}.elf PRIVATE stdc++ rt pthread)
 if (X11_FOUND)
     target_include_directories(${APP_NAME}.elf PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(${APP_NAME}.elf PRIVATE ${X11_LIBRARIES})
     target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_NO_REC TARGET_ULTRA96 TARGET_NO_EXCEPTIONS)
 else()
     target_link_libraries(${APP_NAME}.elf PRIVATE -static)
-    target_compile_definitions(${APP_NAME}.elf PRIVATE TARGET_MISTER)
-    target_compile_options(${APP_NAME}.elf PRIVATE -mcpu=cortex-a9 -mfpu=neon-vfpv4 -mfloat-abi=hard -marm)
+    target_compile_definitions(${APP_NAME}.elf PRIVATE NDEBUG TARGET_MISTER)
+    # target_compile_options(${APP_NAME}.elf PRIVATE -Ofast -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -marm -funroll-loops)
+	target_compile_options(${APP_NAME}.elf PRIVATE
+    -O3
+	-marm
+    #-mcpu=cortex-a9
+	#-mtune=cortex-a9
+	-march=armv7-a
+    -mfpu=neon
+	-mfloat-abi=hard
+	-ffast-math
+	-flto
+	-fwhole-program
+    -fno-exceptions
+    -fdata-sections
+    -ffunction-sections	
+	-fno-semantic-interposition
+    -funsafe-math-optimizations
+    -fomit-frame-pointer
+	)
 endif()

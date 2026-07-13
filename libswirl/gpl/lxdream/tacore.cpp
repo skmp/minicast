@@ -28,13 +28,37 @@
 #include "hw/pvr/pvr_regs.h"
 #include "hw/pvr/pvr_mem.h"
 #include "hw/pvr/pvr_sb_regs.h"
+#include "hw/pvr/ta.h"
+#include "hw/pvr/ta_ring.h"
 #include "hw/holly/holly_intc.h"
+
+#include <pthread.h>
 
 #define PVR2_RAM_SIZE VRAM_SIZE
 #define PVR2_RAM_MASK VRAM_MASK
 
 u8* pvr2_main_ram_hidden;
-#define PVRRAM(addr) (*(uint32_t *)(pvr2_main_ram_hidden + (pvr_map32(addr))))
+
+/* Local inlinable copy of pvr_map32() (hw/pvr/pvr_mem.cpp). Every PVRRAM access
+ * goes through this; keeping it inline in this TU turns each access into a few
+ * bit ops instead of a cross-TU function call. Must stay bit-identical to the
+ * canonical pvr_map32 - VRAM_BANK_BIT is private to pvr_mem.cpp, so it is
+ * duplicated here.
+ */
+#define TACORE_VRAM_BANK_BIT 0x400000
+static inline uint32_t pvr_map32_inl(uint32_t offset32) {
+    //64b wide bus is achieved by interleaving the banks every 32 bits
+    const uint32_t static_bits = (VRAM_MASK - (TACORE_VRAM_BANK_BIT * 2 - 1)) | 3;
+    const uint32_t offset_bits = (TACORE_VRAM_BANK_BIT - 1) & ~3;
+
+    uint32_t bank = (offset32 & TACORE_VRAM_BANK_BIT) / TACORE_VRAM_BANK_BIT;
+    uint32_t rv = offset32 & static_bits;
+    rv |= (offset32 & offset_bits) * 2;
+    rv |= bank * 4;
+    return rv;
+}
+
+#define PVRRAM(addr) (*(uint32_t *)(pvr2_main_ram_hidden + (pvr_map32_inl(addr))))
 
 /*
 #include "lxdream.h"
@@ -194,6 +218,23 @@ struct pvr2_ta_status {
     uint32_t current_list_type;
     uint32_t current_tile_matrix; /* Memory location of the first tile for the current list. */
     uint32_t current_tile_size; /* Size of the tile matrix space  in 32-bit words (0/8/16/32)*/
+    /* Cached per-tile write cursor for the currently-active list. Each entry
+     * points at the vram address of that tile's 0xF0000000 end marker, i.e. the
+     * next slot to write. Reset in ta_init_list. Avoids re-walking the tile's
+     * linked list on every ta_write_tile_entry. Sized for the max 64x64 tile grid.
+     */
+    uint32_t tile_cursor[64*64];
+    /* vram address of the head of the block that tile_cursor currently points
+     * into, so the block-relative offset of the cursor can be recovered without
+     * walking. Reset alongside tile_cursor in ta_init_list.
+     */
+    uint32_t tile_block[64*64];
+    /* Cached value of the entry immediately preceding the cursor (the triangle-
+     * stacking merge candidate), so ta_write_tile_entry needn't re-read it from
+     * vram. Only meaningful when the cursor's block-relative offset is >= 1;
+     * kept in sync on every append/merge. Reset in ta_init_list.
+     */
+    uint32_t tile_lastval[64*64];
     uint32_t intensity1, intensity2;
     struct tile_bounds clip;
     int32_t clip_mode;
@@ -208,6 +249,9 @@ struct pvr2_ta_status {
     struct tile_bounds last_triangle_bounds;
     struct pvr2_ta_vertex poly_vertex[8];
     uint32_t debug_output;
+
+    bool modifier_last_volume;
+    struct tile_bounds modifier_bounds;
 };
 
 static struct pvr2_ta_status ta_status;
@@ -230,6 +274,14 @@ void lxd_ta_reset() {
 
 void lxd_ta_init(u8* vram) {
     pvr2_main_ram_hidden = vram;
+
+    // Spin up the hybrid TA consumer thread once, on first init. pvr2_main_ram_hidden
+    // is set above, so the consumer can safely touch VRAM from here on.
+    static bool consumer_started = false;
+    if (!consumer_started && settings.pvr.MultithreadedTA) {
+        consumer_started = true;
+        ta_ring_consumer_start();
+    }
 
     ta_status.state = STATE_IDLE;
     ta_status.current_list_type = -1;
@@ -332,11 +384,16 @@ static void ta_init_list( unsigned int listtype ) {
         }
         ta_status.current_tile_size = tilematrix_sizes[(config & 0x03)];
 
-        /* Initialize each tile to 0xF0000000 */
+        /* Initialize each tile to 0xF0000000, and point each tile's write
+         * cursor at that marker (the next slot to write).
+         */
         if( ta_status.current_tile_size != 0 ) {
             pvraddr_t p = (ta_status.current_tile_matrix);
             for( i=0; i< ta_status.width * ta_status.height; i++ ) {
                 PVRRAM(p) = 0xF0000000;
+                ta_status.tile_cursor[i] = p;
+                ta_status.tile_block[i] = p;
+                ta_status.tile_lastval[i] = 0; /* no preceding entry yet (offset 0) */
                 p += ta_status.current_tile_size * 4;
             }
         }
@@ -365,7 +422,10 @@ static HollyInterruptID list_events[5] = {holly_OPAQUE, holly_OPAQUEMOD,
 static void ta_end_list() {
     if( ta_status.current_list_type != TA_LIST_NONE ) {
         //asic_event( list_events[ta_status.current_list_type] );
-        asic_RaiseInterrupt(list_events[ta_status.current_list_type]);
+        if (!settings.pvr.MultithreadedTA)
+        {
+            asic_RaiseInterrupt(list_events[ta_status.current_list_type]);
+        }
     }
     ta_status.current_list_type = TA_LIST_NONE;
     ta_status.current_vertex_type = TA_VERTEX_LISTLESS;
@@ -375,9 +435,16 @@ static void ta_end_list() {
 }
 
 static void ta_bad_input_error() {
-    asic_RaiseInterrupt(holly_ILLEGAL_PARAM);
-    printf("TA error: holly_ILLEGAL_PARAM. Interrupt raised\n");
-    //asic_event( EVENT_PVR_BAD_INPUT );
+    if (settings.pvr.MultithreadedTA)
+    {
+        printf("TA error: holly_ILLEGAL_PARAM. (interrupt suppressed)\n");
+    }
+    else
+    {
+        asic_RaiseInterrupt(holly_ILLEGAL_PARAM);
+        printf("TA error: holly_ILLEGAL_PARAM. Interrupt raised\n");
+        //asic_event( EVENT_PVR_BAD_INPUT );
+    }
 }
 
 /**
@@ -394,9 +461,13 @@ static int ta_write_polygon_buffer( uint32_t *data, int length )
     int end = TA_ISP_LIMIT;// MMIO_READ( PVR2, TA_POLYEND );
     for( rv=0; rv < length; rv++ ) {
         if( posn == end ) {
-            asic_RaiseInterrupt(holly_PRIM_NOMEM);
-            printf("TA error: holly_PRIM_NOMEM. Interrupt Raised\n");
-            //asic_event( EVENT_PVR_PRIM_ALLOC_FAIL );
+            if (settings.pvr.MultithreadedTA) {
+                printf("TA error: holly_PRIM_NOMEM. (interrupt suppressed)\n");
+            } else {
+                asic_RaiseInterrupt(holly_PRIM_NOMEM);
+                printf("TA error: holly_PRIM_NOMEM. Interrupt Raised\n");
+                //asic_event( EVENT_PVR_PRIM_ALLOC_FAIL );
+            }
             ////	    ta_status.state = STATE_ERROR;
             break;
         }
@@ -432,9 +503,13 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             return TA_NO_ALLOC;
         } else if( newposn <= limit ) {
         } else if( newposn <= (limit + ta_status.tilelist_size) ) {
-            asic_RaiseInterrupt(holly_MATR_NOMEM);
-            printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
-            //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            if (settings.pvr.MultithreadedTA) {
+                printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+            } else {
+                asic_RaiseInterrupt(holly_MATR_NOMEM);
+                printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            }
             TA_NEXT_OPB = newposn;
             //MMIO_WRITE( PVR2, TA_LISTPOS, newposn );
         } else {
@@ -454,9 +529,13 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             return TA_NO_ALLOC;
         } else if( newposn >= limit ) {
         } else if( newposn >= (limit - ta_status.tilelist_size) ) {
-            asic_RaiseInterrupt(holly_MATR_NOMEM);
-            printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
-            //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            if (settings.pvr.MultithreadedTA) {
+                printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+            } else {
+                asic_RaiseInterrupt(holly_MATR_NOMEM);
+                printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
+            }
             TA_NEXT_OPB = newposn;
             //MMIO_WRITE( PVR2, TA_LISTPOS, newposn );
         } else {
@@ -472,11 +551,8 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
  * Write a tile entry out to the matrix.
  */
 static void ta_write_tile_entry( int x, int y, uint32_t tile_entry ) {
-    uint32_t tile = TILESLOT(x,y);
-    uint32_t tilestart = tile;
-    uint32_t value;
+    int tileidx = y * ta_status.width + x;
     uint32_t lasttri = 0;
-    int i;
 
     if( ta_status.clip_mode == TA_POLYCMD_CLIP_OUTSIDE &&
             x >= ta_status.clip.x1 && x <= ta_status.clip.x2 &&
@@ -485,7 +561,7 @@ static void ta_write_tile_entry( int x, int y, uint32_t tile_entry ) {
         return;
     }
 
-    if( (tile_entry & 0x80000000) && 
+    if( (tile_entry & 0x80000000) &&
             ta_status.last_triangle_bounds.x1 != -1 &&
             ta_status.last_triangle_bounds.x1 <= x &&
             ta_status.last_triangle_bounds.x2 >= x &&
@@ -495,52 +571,53 @@ static void ta_write_tile_entry( int x, int y, uint32_t tile_entry ) {
         lasttri = tile_entry & 0xE1E00000;
     }
 
+    /* cursor points at this tile's 0xF0000000 end marker (the next slot to
+     * write); block is the head of the block the cursor lives in. The
+     * block-relative offset recovers the geometry the original linear walk
+     * derived from its loop index.
+     */
+    uint32_t cursor = ta_status.tile_cursor[tileidx];
+    uint32_t block  = ta_status.tile_block[tileidx];
+    uint32_t offset = (cursor - block) >> 2;
 
-    if( PVRRAM(tile) == 0xF0000000 ) {
-        PVRRAM(tile) = tile_entry;
-        PVRRAM(tile+4) = 0xF0000000;
-        return;
-    }
-
-    while(1) {
-        value = PVRRAM(tile);
-        for( i=1; i<ta_status.current_tile_size; i++ ) {
-            tile += 4;
-            uint32_t nextval = PVRRAM(tile);
-            if( nextval == 0xF0000000 ) {
-                if( lasttri != 0 && lasttri == (value&0xE1E00000) ) {
-                    int count = (value & 0x1E000000) + 0x02000000;
-                    if( count < 0x20000000 ) {
-                        PVRRAM(tile-4) = (value & 0xE1FFFFFF) | count;
-                        return;
-                    }
-                }
-                if( i < ta_status.current_tile_size-1 ) {
-                    PVRRAM(tile) = tile_entry;
-                    PVRRAM(tile+4) = 0xF0000000;
-                    return;
-                }
+    /* Triangle stacking: try to merge into the entry immediately preceding the
+     * marker, exactly as the linear walk did (only within a block, never across
+     * the block head). The candidate's value is cached, so no vram read here.
+     */
+    if( lasttri != 0 && offset >= 1 ) {
+        uint32_t value = ta_status.tile_lastval[tileidx];
+        if( lasttri == (value & 0xE1E00000) ) {
+            int count = (value & 0x1E000000) + 0x02000000;
+            if( count < 0x20000000 ) {
+                uint32_t merged = (value & 0xE1FFFFFF) | count;
+                PVRRAM(cursor-4) = merged;
+                ta_status.tile_lastval[tileidx] = merged;
+                return;
             }
-            value = nextval;
-        }
-
-        if( value == 0xF0000000 ) {
-            tile = ta_alloc_tilelist(tile);
-            if( tile != TA_NO_ALLOC ) {
-                PVRRAM(tile) = tile_entry;
-                PVRRAM(tile+4) = 0xF0000000;
-            }
-            return;
-        } else if( (value & 0xFF000000) == 0xE0000000 ) {
-            value &= 0x00FFFFFF;
-            if( value == tilestart )
-                return; /* Loop */
-            tilestart = tile = value;
-        } else {
-            /* This should never happen */
-            return;
         }
     }
+
+    /* If the marker sits at the last slot of the block (the link slot), this
+     * block is full - allocate a new one and continue there.
+     */
+    if( offset >= ta_status.current_tile_size-1 ) {
+        uint32_t newtile = ta_alloc_tilelist(cursor);
+        if( newtile == TA_NO_ALLOC ) {
+            /* Out of tile-list memory - drop the entry, leave cursor put. */
+            return;
+        }
+        cursor = newtile;
+        block = newtile;
+        ta_status.tile_block[tileidx] = block;
+    }
+
+    /* Append: entry into the marker slot, new marker after it, advance cursor.
+     * The just-written entry becomes the new stacking candidate.
+     */
+    PVRRAM(cursor) = tile_entry;
+    PVRRAM(cursor+4) = 0xF0000000;
+    ta_status.tile_cursor[tileidx] = cursor + 4;
+    ta_status.tile_lastval[tileidx] = tile_entry;
 }
 
 /**
@@ -606,7 +683,18 @@ static void ta_commit_polygon( ) {
     if( polygon_bound.x1 < 0 ) polygon_bound.x1 = 0;
     if( polygon_bound.x2 >= ta_status.width ) polygon_bound.x2 = ta_status.width-1;
     if( polygon_bound.y1 < 0 ) polygon_bound.y1 = 0;
-    if( polygon_bound.y2 >= ta_status.width ) polygon_bound.y2 = ta_status.height-1;
+    if( polygon_bound.y2 >= ta_status.height ) polygon_bound.y2 = ta_status.height-1;
+
+    if (ta_status.current_vertex_type == TA_VERTEX_MOD_VOLUME) {
+        ta_status.modifier_bounds.x1 = MIN(ta_status.modifier_bounds.x1, polygon_bound.x1);
+        ta_status.modifier_bounds.x2 = MAX(ta_status.modifier_bounds.x2, polygon_bound.x2);
+        ta_status.modifier_bounds.y1 = MIN(ta_status.modifier_bounds.y1, polygon_bound.y1);
+        ta_status.modifier_bounds.y2 = MAX(ta_status.modifier_bounds.y2, polygon_bound.y2);
+
+        if (ta_status.modifier_last_volume) {
+            polygon_bound = ta_status.modifier_bounds;
+        }
+    }
 
     /* Set the "single tile" flag if it's entirely contained in 1 tile */
     if( polygon_bound.x1 == polygon_bound.x2 &&
@@ -830,6 +918,14 @@ static void ta_parse_modifier_context( union ta_data *data ) {
     ta_status.vertex_count = 0;
     ta_status.max_vertex = 3;
     ta_status.poly_pointer = 0;
+
+    if (ta_status.modifier_last_volume) {
+        ta_status.modifier_bounds.x1 = INT_MAX/32;
+        ta_status.modifier_bounds.y1 = INT_MAX/32;
+        ta_status.modifier_bounds.x2 = -1;
+        ta_status.modifier_bounds.y2 = -1;
+    }
+    ta_status.modifier_last_volume = data[0].i & TA_POLYCMD_FULLMOD;
 }
 
 /**
@@ -993,7 +1089,11 @@ static void ta_parse_vertex( union ta_data *data ) {
         vertex++;
         vertex->x = data[7].f;
         ta_status.vertex_count += 2;
-        ta_status.state = STATE_EXPECT_VERTEX_BLOCK2;
+        if (ta_status.current_vertex_type  == TA_VERTEX_SPRITE || ta_status.current_vertex_type == TA_VERTEX_TEX_SPRITE) {
+            ta_status.state = STATE_EXPECT_END_VERTEX_BLOCK2;
+        } else {
+            ta_status.state = STATE_EXPECT_VERTEX_BLOCK2;
+        }
         break;
     }
     ta_status.vertex_count++;
@@ -1193,7 +1293,9 @@ void pvr2_ta_process_block( unsigned char *input ) {
             ta_status.state = STATE_IN_POLYGON;
             ta_parse_vertex(data);
 
-            if( ta_status.state == STATE_EXPECT_VERTEX_BLOCK2 ) {
+            if( ta_status.state == STATE_EXPECT_END_VERTEX_BLOCK2 ) {
+                // do nothing here - ta_parse_vertex already set the end state (sprites)
+            } else if( ta_status.state == STATE_EXPECT_VERTEX_BLOCK2 ) {
                 if( TA_IS_END_VERTEX(data[0].i) ) {
                     ta_status.state = STATE_EXPECT_END_VERTEX_BLOCK2;
                 }
@@ -1257,4 +1359,55 @@ void lxd_ta_write( unsigned char *buf, uint32_t length )
 void lxd_ta_write_burst( sh4addr_t addr, unsigned char *data )
 {
     pvr2_ta_process_block( data );
+}
+
+/*
+    Multithreaded TA consumer.
+
+    Runs on its own thread/core, draining the ta_ring that the "ta fsm"
+    producer (ta.cpp) fills. Cortex-A9 SMP ordering:
+      Consumer: read the published write index, then DMB ISH, then read the data.
+
+    Like the producer, the barrier is amortized: when the consumer notices new
+    published data it takes one dmb ish, processes the whole available batch with
+    plain loads, then publishes read_pub once. It also caches write_pub in
+    write_cache so an empty ring is detected without touching the producer's line.
+*/
+static void* ta_ring_consumer_thread(void* /*param*/) {
+    for (;;) {
+        // Fast empty check against our private cache first.
+        u32 rd = ta_ring.read_pub;
+        if (rd == ta_ring.write_cache) {
+            // Refresh from the shared line; still empty -> spin.
+            ta_ring.write_cache = ta_ring.write_pub;
+            if (rd == ta_ring.write_cache)
+                continue;
+
+            // New data was published: observe it after the index that announced it.
+            TA_RING_DMB();
+        }
+
+        // Drain everything currently published in one go (plain loads).
+        u32 wr = ta_ring.write_cache;
+        while (rd != wr) {
+            pvr2_ta_process_block(&ta_ring.data[(rd & TA_RING_MASK) * TA_RING_BLOCK]);
+            rd++;
+        }
+
+        // Retire the batch. One store, ordered after the reads above.
+        TA_RING_DMB();
+        ta_ring.read_pub = rd;
+    }
+
+    return NULL;
+}
+
+void ta_ring_consumer_start() {
+    static pthread_t consumer;
+    ta_ring.write_pub = 0;
+    ta_ring.write_priv = 0;
+    ta_ring.read_cache = 0;
+    ta_ring.read_pub = 0;
+    ta_ring.write_cache = 0;
+    pthread_create(&consumer, NULL, ta_ring_consumer_thread, NULL);
 }
