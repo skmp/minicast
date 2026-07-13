@@ -482,7 +482,7 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		printf("Info: p_sh4rcb: %p virt_ram_base: %p\n", p_sh4rcb, virt_ram_base);
 		// Map the different parts of the memory file into the new memory range we got.
 		#define MAP_RAM_START_OFFSET  0
-		#define MAP_ARAM_START_OFFSET (MAP_RAM_START_OFFSET+VRAM_SIZE)
+		#define MAP_ARAM_START_OFFSET (MAP_RAM_START_OFFSET+RAM_SIZE)
 		const vmem_mapping mem_mappings[] = {
 			{0x00000000, 0x00800000,                               0,         0, 		  -1, false},  // Area 0 -> unused
 			{0x00800000, 0x01000000,           MAP_ARAM_START_OFFSET, aram_size, fd_ram_aram, false},  // Aica, wraps too
