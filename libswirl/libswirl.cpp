@@ -122,6 +122,171 @@ int GetFile(char* szFileName)
     return stricmp(szFileName, "nodisk") != 0;
 }
 
+// Example: polling /tmp/FILESELECT + /tmp/FULLPATH + /tmp/CURRENTPATH for
+// a newly-mounted file, intended to be called once per vblank (or on
+// whatever cadence you like - reads are cheap since /tmp is tmpfs).
+//
+// Requires log_file_entry=1 in MiSTer.ini (or the core's own .ini) - see
+// Main_MiSTer's user_io.cpp / menu.cpp: FULLPATH/CURRENTPATH/FILESELECT
+// are only written when cfg.log_file_entry is set.
+//
+// IMPORTANT: for folder-based image mounts (e.g. a .gdi's containing
+// folder), FULLPATH is observed to be the RELATIVE directory (no leading
+// '/', e.g. "games/Dreamcast/Crazy Taxi 2 ...") and CURRENTPATH is the
+// filename within it (e.g. "Crazy Taxi 2 ....gdi") - the two must be
+// joined, and the result is still relative to whichever storage root
+// (/media/fat, /media/usb0, /media/usb1, ...) actually holds the file.
+// Main_MiSTer tracks that root internally (file_io.cpp's getRootDir()/
+// getStorageDir()) but doesn't expose it via /tmp, so there's no way to
+// know it for certain from outside the process - this just tries the
+// common roots in order and picks whichever one actually has the file.
+
+//#include <stdio.h>
+//#include <string.h>
+#include <sys/stat.h>
+
+// Reads a whole small text file into buf (NUL-terminated, trailing
+// newline stripped). Returns 0 on success, -1 if the file doesn't exist
+// or couldn't be read (buf is left as an empty string in that case).
+static int read_tmp_file(const char *path, char *buf, size_t bufsz)
+{
+    buf[0] = 0;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    size_t n = fread(buf, 1, bufsz - 1, f);
+    fclose(f);
+
+    buf[n] = 0;
+
+    // strip trailing newline/CR, MakeFile()-written files are single-line
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) {
+        buf[--n] = 0;
+    }
+
+    return 0;
+}
+
+// Storage roots to try, in order. /media/fat (the SD card) covers the
+// common case; USB devices are tried as fallbacks. Extend this list if
+// your setup uses more USB slots or a network share.
+static const char *storage_roots[] = {
+    "/media/fat",
+    "/media/usb0",
+    "/media/usb1",
+    "/media/usb2",
+    "/media/usb3",
+};
+
+// Resolves relpath (which may already be absolute, or may be relative to
+// an unknown storage root) to a real, existing absolute path. Returns a
+// pointer into a static buffer, or NULL if no candidate exists.
+static const char *resolve_existing_path(const char *relpath)
+{
+    static char resolved[1024];
+    struct stat st;
+
+    if (relpath[0] == '/') {
+        // already absolute - just verify it
+        if (stat(relpath, &st) == 0 && S_ISREG(st.st_mode)) {
+            strncpy(resolved, relpath, sizeof(resolved) - 1);
+            resolved[sizeof(resolved) - 1] = 0;
+            return resolved;
+        }
+        return NULL;
+    }
+
+    for (size_t i = 0; i < sizeof(storage_roots) / sizeof(storage_roots[0]); i++) {
+        snprintf(resolved, sizeof(resolved), "%s/%s", storage_roots[i], relpath);
+        if (stat(resolved, &st) == 0 && S_ISREG(st.st_mode)) {
+            return resolved;
+        }
+    }
+
+    return NULL;
+}
+
+// Call this once per vblank. Detects the ACTIVE/CANCELLED->SELECTED
+// transition (not just the current value) so a mount is only reported
+// once, and cross-checks /tmp/CORENAME so mounts from other cores are
+// ignored.
+//
+// Returns NULL if nothing new was selected since the last call, or a
+// pointer to the newly-mounted file's resolved, existing, absolute path
+// if a new selection was just made. The returned pointer is only valid
+// until the next call (backed by a static buffer) - copy it if you need
+// to keep it around.
+const char *poll_file_mount(const char *my_core_name)
+{
+    static char prev_fileselect[32] = "";
+
+    char fileselect[32];
+    if (read_tmp_file("/tmp/FILESELECT", fileselect, sizeof(fileselect)) != 0) {
+        return NULL; // LOG_FILE_ENTRY not enabled, or nothing written yet
+    }
+
+    // Only act on the ACTIVE/CANCELLED -> SELECTED transition, not every
+    // poll while it's sitting at "selected" (which persists until the
+    // next browse session starts).
+    int is_new_selection = (strcmp(fileselect, "selected") == 0) &&
+                            (strcmp(prev_fileselect, "selected") != 0);
+
+    strncpy(prev_fileselect, fileselect, sizeof(prev_fileselect) - 1);
+    prev_fileselect[sizeof(prev_fileselect) - 1] = 0;
+
+    if (!is_new_selection) return NULL;
+
+    // Make sure it's actually OUR core that triggered this - FILESELECT/
+    // CURRENTPATH/FULLPATH are shared across every core's file browser.
+    char corename[64];
+    if (read_tmp_file("/tmp/CORENAME", corename, sizeof(corename)) != 0) return NULL;
+    if (strcasecmp(corename, my_core_name) != 0) return NULL;
+
+    char fullpath[1024], currentpath[1024];
+    if (read_tmp_file("/tmp/FULLPATH", fullpath, sizeof(fullpath)) != 0) return NULL;
+    if (read_tmp_file("/tmp/CURRENTPATH", currentpath, sizeof(currentpath)) != 0) return NULL;
+    if (!fullpath[0] || !currentpath[0]) return NULL;
+
+    // FULLPATH already includes the filename in the simple (non-folder)
+    // case; in the folder-based case it's just the directory and
+    // CURRENTPATH is the filename within it. Try the combined form first
+    // since that's the more specific candidate.
+    char combined[2048];
+    snprintf(combined, sizeof(combined), "%s/%s", fullpath, currentpath);
+
+    const char *resolved = resolve_existing_path(combined);
+    if (!resolved) resolved = resolve_existing_path(fullpath);
+
+    return resolved;
+}
+
+// --- example usage ---
+
+// IMPORTANT (minicast/libswirl specific): GDRDisc::Swap() and Init() both
+// call GetFile(fn) before opening anything (libswirl.cpp), and GetFile()
+// does NOT use the fn/LastImage value passed in - it unconditionally
+// overwrites it via cfgLoadStr("config", "image", szFileName, ""), i.e.
+// it reads the path back out of minicast's own emu.cfg. Writing only to
+// settings.imgread.LastImage is therefore not enough - GetFile() clobbers
+// it right back to whatever's in the config (or "" if unset), which is
+// exactly what produces "gdrom: Failed to open image \"\"". The fix is to
+// call cfgSaveStr("config", "image", newfile) first, which writes into
+// the same in-memory cfgdb GetFile() reads from (and flushes it to disk
+// synchronously), so the very next GetFile() call sees it.
+
+/*
+#include "cfg/cfg.h"        // cfgSaveStr
+#include "gdr_disc.h"        // wherever g_GDRDisc / GDRDisc::Swap() is declared
+
+// in your per-vblank tick, or a periodic timer:
+const char *newfile = poll_file_mount("Dreamcast");
+if (newfile) {
+    cfgSaveStr("config", "image", newfile);
+    g_GDRDisc.Swap();
+}
+*/
+
 
 s32 plugins_Init()
 {
@@ -849,6 +1014,15 @@ struct Dreamcast_impl : VirtualDreamcast {
 #if FEAT_SHREC != DYNAREC_NONE
         bm_Periodical_1s();
 #endif
+		
+		const char *newfile = poll_file_mount("Dreamcast");
+		if (newfile) {
+			printf("newfile: %s\n", newfile);
+			printf("cfgHasGameSpecificConfig=%d game_id='%s'\n", cfgHasGameSpecificConfig(), cfgGetGameId());
+			//cfgSaveStr("config", "image", newfile);
+			cfgSetVirtual("config", "image", newfile);
+			g_GDRDisc->Swap();
+		}
 
         //printf("%d ticks\n",sh4_sched_intr);
         sh4_sched_intr = 0;
