@@ -19,6 +19,3 @@ void ta_vtx_ListInit(u8* vram);
 void ta_vtx_ListCont();
 void ta_vtx_SoftReset();
 
-// Drives the tacore consumer that drains the ta_ring. Called once at startup.
-void ta_ring_consumer_start();
-

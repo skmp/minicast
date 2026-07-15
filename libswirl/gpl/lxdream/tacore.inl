@@ -37,7 +37,7 @@
 #define PVR2_RAM_SIZE VRAM_SIZE
 #define PVR2_RAM_MASK VRAM_MASK
 
-u8* pvr2_main_ram_hidden;
+static u8* pvr2_main_ram_hidden;
 
 /* Local inlinable copy of pvr_map32() (hw/pvr/pvr_mem.cpp). Every PVRRAM access
  * goes through this; keeping it inline in this TU turns each access into a few
@@ -275,14 +275,6 @@ void lxd_ta_reset() {
 void lxd_ta_init(u8* vram) {
     pvr2_main_ram_hidden = vram;
 
-    // Spin up the hybrid TA consumer thread once, on first init. pvr2_main_ram_hidden
-    // is set above, so the consumer can safely touch VRAM from here on.
-    static bool consumer_started = false;
-    if (!consumer_started && settings.pvr.MultithreadedTA) {
-        consumer_started = true;
-        ta_ring_consumer_start();
-    }
-
     ta_status.state = STATE_IDLE;
     ta_status.current_list_type = -1;
     ta_status.current_vertex_type = -1;
@@ -422,10 +414,13 @@ static HollyInterruptID list_events[5] = {holly_OPAQUE, holly_OPAQUEMOD,
 static void ta_end_list() {
     if( ta_status.current_list_type != TA_LIST_NONE ) {
         //asic_event( list_events[ta_status.current_list_type] );
-        if (!settings.pvr.MultithreadedTA)
+        if (settings.pvr.MultithreadedTA == TA_STTA)
         {
             asic_RaiseInterrupt(list_events[ta_status.current_list_type]);
         }
+    }
+    if (settings.pvr.MultithreadedTA != TA_STTA) {
+        ta_eol_interrupt_mark++;
     }
     ta_status.current_list_type = TA_LIST_NONE;
     ta_status.current_vertex_type = TA_VERTEX_LISTLESS;
@@ -435,7 +430,7 @@ static void ta_end_list() {
 }
 
 static void ta_bad_input_error() {
-    if (settings.pvr.MultithreadedTA)
+    if (settings.pvr.MultithreadedTA != TA_STTA)
     {
         printf("TA error: holly_ILLEGAL_PARAM. (interrupt suppressed)\n");
     }
@@ -461,7 +456,7 @@ static int ta_write_polygon_buffer( uint32_t *data, int length )
     int end = TA_ISP_LIMIT;// MMIO_READ( PVR2, TA_POLYEND );
     for( rv=0; rv < length; rv++ ) {
         if( posn == end ) {
-            if (settings.pvr.MultithreadedTA) {
+            if (settings.pvr.MultithreadedTA != TA_STTA) {
                 printf("TA error: holly_PRIM_NOMEM. (interrupt suppressed)\n");
             } else {
                 asic_RaiseInterrupt(holly_PRIM_NOMEM);
@@ -503,7 +498,7 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             return TA_NO_ALLOC;
         } else if( newposn <= limit ) {
         } else if( newposn <= (limit + ta_status.tilelist_size) ) {
-            if (settings.pvr.MultithreadedTA) {
+            if (settings.pvr.MultithreadedTA != TA_STTA) {
                 printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
             } else {
                 asic_RaiseInterrupt(holly_MATR_NOMEM);
@@ -529,7 +524,7 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             return TA_NO_ALLOC;
         } else if( newposn >= limit ) {
         } else if( newposn >= (limit - ta_status.tilelist_size) ) {
-            if (settings.pvr.MultithreadedTA) {
+            if (settings.pvr.MultithreadedTA != TA_STTA) {
                 printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
             } else {
                 asic_RaiseInterrupt(holly_MATR_NOMEM);
@@ -1197,8 +1192,28 @@ static void ta_parse_vertex_block2( union ta_data *data ) {
 /**
  * Process 1 32-byte block of ta data
  */
-void pvr2_ta_process_block( unsigned char *input ) {
+static void pvr2_ta_process_block( unsigned char *input ) {
     union ta_data *data = (union ta_data *)input;
+
+    #ifdef MTTA_DECOUPLED
+    u64 ta_ring_magic =  *(u64*)input;
+    if (ta_ring_magic == TA_RING_DECOUPLED_MAGIC) {
+        switch(data[2].i) {
+            case TA_RING_DECOUPLED_OP_REGWRITE:
+                (u32&)pvr_regs[data[3].i] = data[4].i;
+                break;
+            case TA_RING_DECOUPLED_OP_LISTINIT:
+                lxd_ta_init(pvr2_main_ram_hidden);
+                break;
+            case TA_RING_DECOUPLED_OP_SOFTRESET:
+                lxd_ta_reset();
+                break;
+            default:
+                die("Bad ta_ring packet");
+        }
+        return;
+    }
+    #endif
 
     switch( ta_status.state ) {
     case STATE_ERROR:
@@ -1327,7 +1342,7 @@ void pvr2_ta_process_block( unsigned char *input ) {
  * data.
  * @return A pointer to the context, or NULL if it cannot be found 
  */
-uint32_t *pvr2_ta_find_polygon_context( uint32_t *buf, uint32_t length )
+static uint32_t *pvr2_ta_find_polygon_context( uint32_t *buf, uint32_t length )
 {
     uint32_t *poly;
     for( poly = buf; poly < buf+(length>>2); poly += 8 ) {
@@ -1402,7 +1417,8 @@ static void* ta_ring_consumer_thread(void* /*param*/) {
     return NULL;
 }
 
-void ta_ring_consumer_start() {
+void ta_ring_consumer_start(u8* vram) {
+    pvr2_main_ram_hidden = vram;
     static pthread_t consumer;
     ta_ring.write_pub = 0;
     ta_ring.write_priv = 0;

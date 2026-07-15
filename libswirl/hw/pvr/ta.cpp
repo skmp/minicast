@@ -342,6 +342,9 @@ const HollyInterruptID ListEndInterrupt[5]=
 	holly_PUNCHTHRU
 };
 
+std::atomic<u64> ta_eol_interrupt_mark;
+static u64 ta_fsm_eol_interrupt_mark;
+std::map<u32, u64> ta_contexts;
 
 NOINLINE void DYNACALL ta_handle_cmd(u32 trans, void* block)
 {
@@ -371,9 +374,13 @@ NOINLINE void DYNACALL ta_handle_cmd(u32 trans, void* block)
 			// ring. Wait for tacore (the consumer) to drain everything up to
 			// and including it before raising the list interrupt, so the guest
 			// never sees the interrupt before the geometry has been processed.
-			ta_ring_drain();
-			asic_RaiseInterrupt( ListEndInterrupt[ta_fsm_cl]);
+			asic_RaiseInterrupt(ListEndInterrupt[ta_fsm_cl]);
+			ta_fsm_eol_interrupt_mark++;
+			ta_contexts[TA_CURRENT_CTX] = ta_fsm_eol_interrupt_mark;
 			ta_fsm_cl=7;
+			if (settings.pvr.MultithreadedTA == TA_MTTA) {
+				ta_ring_drain();
+			}
 			trans=TAS_NS;
 		}
 		else if (dat->pcw.ParaType == ParamType_Polygon_or_Modifier_Volume)
@@ -423,26 +430,42 @@ void ta_vtx_ListCont()
 {
 	// ListCont doesn't touch tacore state, but still order it after in-flight
 	// work so the FSM state change is consistent with what the consumer saw.
-	ta_ring_drain();
+	if (settings.pvr.MultithreadedTA == TA_MTTA) {
+		ta_ring_drain();
+	}
 	TA_RING_DMB();
 	ta_cur_state=TAS_NS;
 	TA_RING_DMB();
 }
 void ta_vtx_ListInit(u8* vram)
 {
-	ta_ring_drain();
-	TA_RING_DMB();
-	lxd_ta_init(vram);
+	if (settings.pvr.MultithreadedTA == TA_MTTA) {
+		ta_ring_drain();
+		TA_RING_DMB();
+		lxd_ta_init(vram);
+		TA_RING_DMB();
+	} else if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
+		DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
+		(u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
+		ring_op[2] = TA_RING_DECOUPLED_OP_LISTINIT;
+		ta_ring_push(ring_op);
+	}
 	ta_cur_state=TAS_NS;
-	TA_RING_DMB();
 }
 void ta_vtx_SoftReset()
 {
-	ta_ring_drain();
-	TA_RING_DMB();
-	lxd_ta_reset();
+	if (settings.pvr.MultithreadedTA == TA_MTTA) {
+		ta_ring_drain();
+		TA_RING_DMB();
+		lxd_ta_reset();
+		TA_RING_DMB();
+	} else if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
+		DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
+		(u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
+		ring_op[2] = TA_RING_DECOUPLED_OP_SOFTRESET;
+		ta_ring_push(ring_op);
+	}
 	ta_cur_state=TAS_NS;
-	TA_RING_DMB();
 }
 
 INLINE

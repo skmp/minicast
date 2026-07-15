@@ -7,6 +7,8 @@
 
 #include "types.h"
 #include <string.h>
+#include <atomic>
+#include <map>
 
 /*
 	TA data ring buffer
@@ -32,8 +34,8 @@
 	steady-state fill/empty checks don't touch the shared line.
 */
 
-// 32*1024 bytes total => 1024 blocks of 32 bytes. Must stay a power of two.
-#define TA_RING_BYTES    (32 * 1024)
+// Must stay a power of two.
+#define TA_RING_BYTES    (8 * 1024 * 1024)
 #define TA_RING_BLOCK    32
 #define TA_RING_BLOCKS   (TA_RING_BYTES / TA_RING_BLOCK)
 #define TA_RING_MASK     (TA_RING_BLOCKS - 1)
@@ -44,6 +46,12 @@
 // dmb ish across a batch instead of paying it per block, while still keeping the
 // consumer fed so it runs concurrently with the producer. Must be a power of two.
 #define TA_RING_BATCH    32
+
+// Register and control ops
+#define TA_RING_DECOUPLED_MAGIC 0xDEADBEEDCAFEBEBEULL
+#define TA_RING_DECOUPLED_OP_REGWRITE 0
+#define TA_RING_DECOUPLED_OP_LISTINIT 1
+#define TA_RING_DECOUPLED_OP_SOFTRESET 2
 
 struct ta_ring_t
 {
@@ -62,6 +70,8 @@ struct ta_ring_t
 };
 
 extern ta_ring_t ta_ring;
+extern std::atomic<u64> ta_eol_interrupt_mark; // counts EOLs
+extern std::map<u32, u64> ta_contexts;
 
 // DMB ISH - inner shareable data memory barrier (A9 SMP hand-off)
 #if HOST_CPU == CPU_ARM || HOST_CPU == CPU_ARM64
@@ -121,3 +131,6 @@ static inline void ta_ring_drain()
 		// wait for the consumer to drain the ring
 	}
 }
+
+void ta_ring_consumer_start(u8* vram);
+void ta_ring_consumer_start_decoupled(u8* vram);

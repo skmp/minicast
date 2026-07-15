@@ -2,7 +2,7 @@
 	This file is part of libswirl
 */
 #include "license/bsd"
-
+#include "ta_ring.h"
 
 /*
     PVR-SB handling
@@ -399,6 +399,15 @@ struct PVRDevice : MMIODevice {
             PvrReg(addr, u32) = data;
             YUV_init(asic);
             return;
+        }
+
+        if (addr < FOG_TABLE_START_addr && settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
+            DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
+            (u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
+            ring_op[2] = TA_RING_DECOUPLED_OP_REGWRITE;
+            ring_op[3] = addr;
+            ring_op[4] = data;
+		    ta_ring_push(ring_op);
         }
 
         if (addr >= PALETTE_RAM_START_addr && PvrReg(addr, u32) != data)

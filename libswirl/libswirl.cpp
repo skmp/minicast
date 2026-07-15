@@ -40,6 +40,7 @@
 #include "hw/holly/holly_intc.h"
 #include "hw/aica/aica_mmio.h"
 #include "hw/arm7/SoundCPU.h"
+#include "hw/pvr/ta_ring.h"
 
 #define fault_printf(...)
 
@@ -322,7 +323,7 @@ void InitSettings()
     settings.pvr.SynchronousRender = false;
     settings.pvr.ForceGLES2 = false;
 
-    settings.pvr.MultithreadedTA = false;
+    settings.pvr.MultithreadedTA = 0;
     settings.pvr.FPSTarget = 66;
 
     settings.debug.SerialConsole = false;
@@ -427,7 +428,7 @@ void LoadSettings(bool game_specific)
     settings.pvr.SynchronousRender = cfgLoadBool(config_section, "pvr.SynchronousRendering", settings.pvr.SynchronousRender);
     settings.pvr.ForceGLES2 = cfgLoadBool(config_section, "pvr.ForceGLES2", settings.pvr.ForceGLES2);
 
-    settings.pvr.MultithreadedTA = cfgLoadBool(config_section, "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
+    settings.pvr.MultithreadedTA = cfgLoadInt(config_section, "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
 
     settings.pvr.FPSTarget = cfgLoadInt(config_section, "pvr.FPSTarget", settings.pvr.FPSTarget);
     
@@ -592,7 +593,7 @@ void SaveSettings()
     cfgSaveBool("config", "pvr.SynchronousRendering", settings.pvr.SynchronousRender);
     cfgSaveBool("config", "pvr.ForceGLES2", settings.pvr.ForceGLES2);
 
-    cfgSaveBool("config", "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
+    cfgSaveInt("config", "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
     cfgSaveInt("config", "pvr.FPSTarget", settings.pvr.FPSTarget);
 
     cfgSaveBool("config", "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
@@ -954,6 +955,11 @@ struct Dreamcast_impl : VirtualDreamcast {
 
         SPG* spg = SPG::Create(asic);
 
+        if (settings.pvr.MultithreadedTA == TA_MTTA) {
+            ta_ring_consumer_start(sh4_cpu->vram.data);
+        } else if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
+            ta_ring_consumer_start_decoupled(sh4_cpu->vram.data);
+        }
         MMIODevice* pvrDevice = Create_PVRDevice(sh4mmr, systemBus, asic, spg, sh4_cpu->mram.data, sh4_cpu->vram.data);
 
         aica_ctx.reset(AICA::CreateContext());
