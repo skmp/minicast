@@ -12,6 +12,8 @@
 
 #include <time.h>
 
+#include "hw/pvr/ta_ring.h"
+
 #define offs_8meg (1024*1024*8)
 #define __ARM_NR_cacheflush 0x0f0002
 
@@ -74,6 +76,14 @@ void rend_vblank() {
 }
 
 void rend_start_render(u8* vram) {
+    if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
+        auto goal = ta_contexts[CORE_CURRENT_CTX];
+
+        while (goal > ta_eol_interrupt_mark) {
+            ;
+        }
+    }
+    
     SetREP(200000000/settings.pvr.FPSTarget);
 	
 

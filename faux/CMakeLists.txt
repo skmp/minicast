@@ -131,7 +131,8 @@ list(APPEND _sources
     # ${swrl}/input/gamepad_device.cpp
     # ${swrl}/input/keyboard_device.cpp
     # ${swrl}/input/mapping.cpp
-    ${swrl}/gpl/lxdream/tacore.cpp
+    ${swrl}/gpl/lxdream/tacore-stta.cpp
+    ${swrl}/gpl/lxdream/tacore-mtta-decoupled.cpp
     # ${swrl}/jit/backend/arm64/rec_arm64.cpp
     ${swrl}/imgread/cdi.cpp
     ${swrl}/imgread/imgread_common.cpp

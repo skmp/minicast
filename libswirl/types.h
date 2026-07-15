@@ -451,6 +451,12 @@ enum SmcCheckEnum {
 	ValidationCheck = 3,
 };
 
+enum MTTAEnum {
+	TA_STTA = 0,
+	TA_MTTA = 1,
+	TA_MTTA_DECOUPLED = 2
+};
+
 struct settings_t
 {
 	struct {
@@ -573,7 +579,7 @@ struct settings_t
 		bool SynchronousRender;
 		bool ForceGLES2;
 
-		bool MultithreadedTA;
+		int MultithreadedTA;
 		u32 FPSTarget;
 	} pvr;
 
