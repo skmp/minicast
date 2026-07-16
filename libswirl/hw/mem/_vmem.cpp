@@ -16,10 +16,6 @@
 #define HW_FPGA_VRAM_SPAN (0x01000000) 		// Span of 16MB
 #define HW_FPGA_VRAM_MASK ( HW_FPGA_VRAM_SPAN - 1 )
 
-volatile u8* FPGA_VRAM_BASE;
-volatile u8* FPGA_REGS_BASE;
-
-uint32_t offs_8mb = 1024*1024*8;
 int fd_ram_aram;
 int fd_dev_mem;
 
@@ -437,18 +433,11 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		return false;
 	}
 
-	FPGA_REGS_BASE = (u8*) mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd_dev_mem, HW_FPGA_VRAM_OFST + offs_8mb);
-
-	if (FPGA_REGS_BASE == (u8*)MAP_FAILED) {
-		die("mapping FPGA_REGS_BASE failed");
-	}
-
 	fd_ram_aram = allocate_shared_filemem(RAM_SIZE + aram_size);
 	if (fd_ram_aram == -1) {
 		close(fd_dev_mem);
 		return false;
 	}
-			
 
 	VMemType vmemstatus = MemTypeError;
 
@@ -501,8 +490,6 @@ bool _vmem_reserve(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 		// Point buffers to actual data pointers
 		aica_ram->size = aram_size;
 		aica_ram->data = &virt_ram_base[0x20000000];  // Points to the writtable AICA addrspace
-
-		FPGA_VRAM_BASE = &virt_ram_base[0x04000000];
 
 		vram->size = VRAM_SIZE;
 		vram->data = &virt_ram_base[0x04000000];   // Points to FPGA-visible DDR3, inside the fastmem address space

@@ -583,6 +583,12 @@ struct settings_t
 		u32 FPSTarget;
 	} pvr;
 
+	struct
+	{
+		u32 ClockSel;
+		bool AutoReset;
+	} polly2;
+
 	struct {
 		bool SerialConsole;
 		bool VirtualSerialPort;
