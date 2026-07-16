@@ -359,12 +359,27 @@ static void do_bridge(uint32_t enable)
 	}
 }
 
-/* GPO bit 30 asserts the MiSTer framework's core reset, bit 31 enables I/O */
+/* GPO bit 30 asserts the MiSTer framework's core reset, bit 31 enables I/O.
+ *
+ * sys_top.v only CLEARS its latched reset_req on a 00 -> 10 transition of
+ * gp_out[31:30] ("special combination to prevent accidental reset"):
+ *   if(resetd==2 && resetd2==0) reset_req <= 0;
+ * A direct 01 -> 10 write (assert -> release) is ignored and the core stays
+ * in reset forever - Main_MiSTer only works because its SPI traffic writes
+ * 00 in between. So on release, step through 00 first. The two writes are
+ * far slower than the 50 MHz sampling in sys_top, no delay needed. */
 static void fpga_core_reset(int reset)
 {
 	uint32_t gpo = readl((void*)(SOCFPGA_MGR_ADDRESS + 0x10)) & ~0xC0000000;
-	writel(reset ? gpo | 0x40000000 : gpo | 0x80000000,
-	       (void*)(SOCFPGA_MGR_ADDRESS + 0x10));
+	if (reset)
+	{
+		writel(gpo | 0x40000000, (void*)(SOCFPGA_MGR_ADDRESS + 0x10));
+	}
+	else
+	{
+		writel(gpo,              (void*)(SOCFPGA_MGR_ADDRESS + 0x10));
+		writel(gpo | 0x80000000, (void*)(SOCFPGA_MGR_ADDRESS + 0x10));
+	}
 }
 
 static int fpga_io_init(void)
