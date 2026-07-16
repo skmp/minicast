@@ -872,7 +872,7 @@ struct Dreamcast_impl : VirtualDreamcast {
     {
         cfgSetVirtual("config", "image", path.c_str());
 
-        if (settings.bios.UseReios || !LoadRomFiles(get_readonly_data_path(DATA_PATH)))
+        if (settings.bios.UseReios || !LoadRomFiles("/media/fat/games/Dreamcast/")) // get_readonly_data_path(DATA_PATH)
         {
 #ifdef USE_REIOS
             if (!LoadHle(get_readonly_data_path(DATA_PATH)))
