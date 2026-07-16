@@ -9,12 +9,40 @@
 
 #include "cfg/cfg.h"
 
+//Joystick stuff
+#include <fcntl.h>
+#include <unistd.h>
+#include <linux/joystick.h>
+
+static int gJoyfd = 0;
+
+#define OLDJOYHACK
+
+//Which bit mapped to a button in /dev/input/js* (0-15 are valid)
+#define JBTN_A 0
+#define JBTN_B 1
+#define JBTN_X 3
+#define JBTN_Y 2
+#define JBTN_START 10
+
+//Which axis mapped in /dev/input/js* (0-7 are valid)
+#define DPADxloc 6
+#define DPADyloc 7
+#define JOYxloc 0
+#define JOYyloc 1
+#define TRIGL   2
+#define TRIGR   5
+
 int main(int argc, char* argv[])
 {
 	#if HOST_OS == OS_LINUX
 	void common_linux_setup();
 	common_linux_setup();
 	#endif
+	
+#ifndef OLDJOYHACK
+	gJoyfd = open("/dev/input/js0", O_RDONLY | O_NONBLOCK); //Open Joystick
+#endif
 	
 	set_user_config_dir(".");
 	set_user_data_dir(".");
@@ -26,6 +54,11 @@ int main(int argc, char* argv[])
 
 	libswirl_init();
 	libswirl_loop(argc == 1 ? "": argv[1]);
+
+#ifndef OLDJOYHACK
+	if (gJoyfd >= 0) close(gJoyfd);
+#endif
+
 	return 0;
 }
 
@@ -75,7 +108,8 @@ u16 kcode[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 u8 rt[4] = {0, 0, 0, 0};
 u8 lt[4] = {0, 0, 0, 0};
 u32 vks[4];
-s8 joyx[4], joyy[4];
+s8 joyx[4] = {0, 0, 0, 0};
+s8 joyy[4] = {0, 0, 0, 0};
 
 #include "oslib/threading.h"
 
@@ -267,13 +301,14 @@ int kbhit(void) {
 
 void UpdateInputState(u32 port) {
 
-	kcode[port] = 0xFFFF;
-	rt[port] = 0;
-	lt[port] = 0;
-	joyx[port] = 0;
-	joyy[port] = 0;
+	//kcode[port] = 0xFFFF;
+	//rt[port] = 0;
+	//lt[port] = 0;
+	//joyx[port] = 0;
+	//joyy[port] = 0;
 
-	while(kbhit()) {
+	//Scan Keybord
+/*	while(kbhit()) {
 		int ch = getchar();
 		switch(ch) {
 			case 'e': lt[port] = 255; break;
@@ -296,7 +331,73 @@ void UpdateInputState(u32 port) {
 			case 'f': joyx[port] = -128; break;
 			case 'h': joyx[port] = 127; break;
 		}
+	}*/
+
+	if (port > 0) return;
+	//Scan Joystick
+#ifdef OLDJOYHACK
+	gJoyfd = open("/dev/input/js0", O_RDONLY | O_NONBLOCK); //Open Joystick
+#endif
+	if (gJoyfd < 0) return;
+
+	int update = 0;
+	u16 buttons = 0xFFFF;
+	struct js_event e;
+    short ax[8];
+
+	while (read(gJoyfd, &e, sizeof(e)) == sizeof(e)) {
+		update = 1;
+		switch (e.type & ~JS_EVENT_INIT) {
+		case JS_EVENT_BUTTON:
+			if (e.value) {
+				switch (e.number) {
+					case JBTN_A:
+						buttons &= ~DC_BTN_A;
+						break;
+					case JBTN_B:
+						buttons &= ~DC_BTN_B;
+						break;
+					case JBTN_Y:
+						buttons &= ~DC_BTN_Y;
+						break;
+					case JBTN_X:
+						buttons &= ~DC_BTN_X;
+						break;
+					case JBTN_START:
+						buttons &= ~DC_BTN_START;
+						break;
+					default:
+					    break;
+				}
+			}
+			break;
+
+		case JS_EVENT_AXIS:
+			ax[e.number & 7] = e.value;
+			break;
+		}
 	}
+	
+	if (update) {
+		if (ax[DPADxloc] > 0) buttons &= ~DC_DPAD_RIGHT;
+		if (ax[DPADxloc] < 0) buttons &= ~DC_DPAD_LEFT;
+		if (ax[DPADyloc] > 0) buttons &= ~DC_DPAD_DOWN;
+		if (ax[DPADyloc] < 0) buttons &= ~DC_DPAD_UP;
+
+		joyx[port] = (ax[JOYxloc] >> 8) & 0xFF;
+		joyy[port] = (ax[JOYyloc] >> 8) & 0xFF;
+		lt[port]   = ((u16(ax[TRIGL])^0x8000) >> 8) & 0xFF;
+		rt[port]   = ((u16(ax[TRIGR])^0x8000) >> 8) & 0xFF;
+
+		//printf("%04X %04X %04X %04X %04X %04X %04X %04X %04X\n", buttons, ax[0], ax[1], ax[2], ax[3], ax[4], ax[5], ax[6], ax[7]);
+		
+		kcode[port] = buttons;
+	}
+
+#ifdef OLDJOYHACK
+	close(gJoyfd);
+#endif
+
 }
 
 void UpdateVibration(u32 port, float power, float inclination, u32 duration_ms) {
