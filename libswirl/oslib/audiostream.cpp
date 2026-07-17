@@ -379,6 +379,62 @@ struct AudioStream_impl : AudioStream {
 	}
 };
 
+#include "../../../polly2-rtl/driver/polly2_mmio.h"
+struct AudioStream_Mister : AudioStream {
+	// AICA produces 44.1 kHz; the polly2 HDMI I2S side drains at 48 kHz.
+	// Push-side mirror of ReadAudioResampling: each input frame shifts the
+	// 4-frame Catmull-Rom window by one, then emits the output points
+	// (spaced 44100/48000 of an input sample apart) inside that interval -
+	// 1 or 2 outputs per input, 48000/44100 on average.
+	SoundFrame Status[4] = { { 0 } };
+	float current_partial_pos = 0;
+
+	void WriteSample(s16 r, s16 l)
+	{
+		if (!polly2_mmio)
+			return;
+
+		bool wait = settings.aica.LimitFPS;
+
+		Status[0] = Status[1];
+		Status[1] = Status[2];
+		Status[2] = Status[3];
+		Status[3].l = l;
+		Status[3].r = r;
+
+		const float inc = 44100.0f / 48000.0f;
+		while (current_partial_pos < 1)
+		{
+			SoundFrame res = {
+				SaturateToS16(InterpolateCatmull4pt3oX(Status[0].l,Status[1].l,Status[2].l,Status[3].l,current_partial_pos)),
+				SaturateToS16(InterpolateCatmull4pt3oX(Status[0].r,Status[1].r,Status[2].r,Status[3].r,current_partial_pos))
+			};
+			// wait: the fabric stalls the store while the FIFO is full;
+			// otherwise drop rather than block the emu thread.
+			if (wait || (polly2_audio_space() > 1)) {
+				polly2_audio_push(res.l, res.r);
+			}
+			current_partial_pos += inc;
+		}
+		current_partial_pos -= 1;
+	}
+
+	void InitAudio()
+	{
+		if (cfgLoadInt("audio", "disable", 0)) {
+			printf("WARNING: Audio disabled in config!\n");
+			return;
+		}
+
+		polly2_mmio_init();
+	}
+
+	void TermAudio()
+	{
+		
+	}
+};
+
 AudioStream* AudioStream::Create() {
-	return new AudioStream_impl();
+	return new AudioStream_Mister();
 }
