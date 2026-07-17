@@ -9,7 +9,7 @@
 //#include "../../hw/pvr/pvr_mem.h"
 #include "../../hw/pvr/pvr_regs.h"
 #include "../../hw/mem/_vmem.h"
-#include "../../../polly2-rtl/polly2_mmio.h"
+#include "../../../../polly2-rtl/driver/polly2_mmio.h"
 
 #include <time.h>
 
