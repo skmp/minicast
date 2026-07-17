@@ -305,7 +305,6 @@ int kbhit(void) {
 //   key:<code>              button/key press
 //   keys:<neg>:<pos>        key pair driving an axis (-1 = unset)
 //   abs:<code>:<dir>        absolute axis, dir 1 or -1
-//   absdelta:<code>:<dir>   absolute axis, delta-encoded (pointer motion)
 //   rel:<code>:<dir>        relative axis (mouse motion)
 // Devices are matched by DeviceId = bus:vid:pid:ver[:uniq][#n] (all hex,
 // #n disambiguates identical ids in /dev/input/event* numeric order).
@@ -352,7 +351,6 @@ struct InMapping {
 	int code;       // KEY/ABS/REL
 	int dir;        // ABS/REL: 1 or -1
 	int neg, pos;   // KEYPAIR key codes, -1 = unset
-	bool delta;     // ABS: delta-encoded (absdelta)
 };
 
 static bool decode_mapping(const char* text, InMapping* m) {
@@ -367,9 +365,6 @@ static bool decode_mapping(const char* text, InMapping* m) {
 		m->kind = InMapping::KEYPAIR; m->neg = a; m->pos = b;
 	} else if (sscanf(text, "abs:%d:%d", &a, &b) == 2) {
 		m->kind = InMapping::ABS; m->code = a; m->dir = b >= 0 ? 1 : -1;
-	} else if (sscanf(text, "absdelta:%d:%d", &a, &b) == 2) {
-		m->kind = InMapping::ABS; m->code = a; m->dir = b >= 0 ? 1 : -1;
-		m->delta = true;
 	} else if (sscanf(text, "rel:%d:%d", &a, &b) == 2) {
 		m->kind = InMapping::REL; m->code = a; m->dir = b >= 0 ? 1 : -1;
 	}
@@ -377,7 +372,6 @@ static bool decode_mapping(const char* text, InMapping* m) {
 }
 
 #define EVDEV_REL_GAIN       4.0f  // mouse counts -> analog deflection
-#define EVDEV_ABS_DELTA_GAIN 512   // fraction-of-range moved -> deflection
 #define ABS_CODES            64    // ABS_MAX + 1
 
 struct EvdevPad {
@@ -392,10 +386,8 @@ struct EvdevPad {
 	int analog[2];             // TGT_ANALOG_X/Y, -128..127
 	int trig[2];               // TGT_TRIG_L/R, 0..255
 	bool kpNeg[2], kpPos[2];   // keypair halves per analog axis
-	bool relDriven[2];         // analog axis fed by rel/absdelta motion
+	bool relDriven[2];         // analog axis fed by rel (mouse) motion
 	float relAccum[2];         // motion accumulator, decays in tick
-	int absLast[ABS_CODES];    // last value per abs code (delta mode)
-	bool absLastValid[ABS_CODES];
 };
 
 static bool g_evdev_mode = false;   // any [inputN] section in emu.cfg
@@ -494,8 +486,6 @@ static void evdev_init() {
 		memset(&pad.kpPos, 0, sizeof(pad.kpPos));
 		memset(&pad.relDriven, 0, sizeof(pad.relDriven));
 		memset(&pad.relAccum, 0, sizeof(pad.relAccum));
-		memset(&pad.absLast, 0, sizeof(pad.absLast));
-		memset(&pad.absLastValid, 0, sizeof(pad.absLastValid));
 		pad.fd = fd;
 		pad.path = paths[i];
 		pad.id = id;
@@ -514,9 +504,7 @@ static void evdev_init() {
 					}
 				}
 				if (t == TGT_ANALOG_X || t == TGT_ANALOG_Y)
-					pad.relDriven[t - TGT_ANALOG_X] =
-						m.kind == InMapping::REL ||
-						(m.kind == InMapping::ABS && m.delta);
+					pad.relDriven[t - TGT_ANALOG_X] = m.kind == InMapping::REL;
 			}
 		}
 		// drain events queued before we started
@@ -566,20 +554,6 @@ static void evdev_feed(EvdevPad& p, u16 type, u16 code, s32 value) {
 			if (hi <= lo)
 				continue;
 			bool is_analog = t == TGT_ANALOG_X || t == TGT_ANALOG_Y;
-			if (is_analog && m.delta && code < ABS_CODES) {
-				bool hadLast = p.absLastValid[code];
-				int last = p.absLast[code];
-				p.absLast[code] = value;
-				p.absLastValid[code] = true;
-				if (!hadLast)
-					continue;
-				int delta = value - last;
-				if (abs(delta) > (hi - lo) * 0.3)
-					continue;  // touch lift/re-position jump, not motion
-				p.relAccum[t - TGT_ANALOG_X] +=
-					delta / (float)(hi - lo) * EVDEV_ABS_DELTA_GAIN * m.dir;
-				continue;
-			}
 			float norm = (value - lo) / (float)(hi - lo) * 2.0f - 1.0f;
 			if (m.dir < 0)
 				norm = -norm;
