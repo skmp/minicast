@@ -365,7 +365,8 @@ typedef void DYNACALL TaListVoidFP(void* data);
 struct Sh4RCB
 {
 	void* fpcb[FPCB_SIZE];
-	u64 _pad[(FPCB_PAD-sizeof(Sh4Context)-64-sizeof(void*)*2)/8];
+	u64 _pad[(FPCB_PAD-sizeof(Sh4Context)-64-sizeof(void*)*3)/8];
+	sqw_fp* do_sqw_ta;
 	TaListVoidFP* tacmd_voud; //*TODO* remove (not used)
 	sqw_fp* do_sqw_nommu;
 	u64 sq_buffer[64/8];
@@ -387,6 +388,7 @@ INLINE void sh4_sr_SetFull(u32 value)
 }
 
 #define do_sqw_nommu sh4rcb.do_sqw_nommu
+#define do_sqw_ta sh4rcb.do_sqw_ta
 
 template<typename T>
 s32 rcb_noffs(T* ptr)  
