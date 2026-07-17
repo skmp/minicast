@@ -86,8 +86,8 @@ bool cfgOpen()
 		return false;
 
 	const char* filename = "/emu.cfg";
-	string config_path_read = get_readonly_config_path(filename);
-	cfgPath = get_writable_config_path(filename);
+	string config_path_read = "/media/fat/games/Dreamcast/emu.cfg"; //get_readonly_config_path(filename);
+	cfgPath = "/media/fat/games/Dreamcast/emu.cfg" ;//get_writable_config_path(filename);
 
 	FILE* cfgfile = fopen(config_path_read.c_str(),"r");
 	if(cfgfile != NULL) {

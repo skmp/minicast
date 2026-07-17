@@ -12,6 +12,8 @@
 #include "sh4_sched.h"
 #include "sh4_interrupts.h"
 
+#include "hw/pvr/pvr_mem.h" // for TAWriteSQ_STTA / TAWriteSQ_MTTA
+
 // every SH4_TIMESLICE cycles
 int UpdateSystem()
 {
@@ -165,6 +167,7 @@ bool SuperH4_impl::Init()
     verify(sizeof(Sh4cntx) == 448);
 
     memset(&p_sh4rcb->cntx, 0, sizeof(p_sh4rcb->cntx));
+    do_sqw_ta = settings.pvr.MultithreadedTA ? &TAWriteSQ_MTTA : &TAWriteSQ_STTA;
 
     setBackend(SH4BE_INTERPRETER);
 

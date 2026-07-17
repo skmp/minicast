@@ -326,6 +326,9 @@ void InitSettings()
     settings.pvr.MultithreadedTA = 0;
     settings.pvr.FPSTarget = 66;
 
+    settings.polly2.AutoReset = true;
+    settings.polly2.ClockSel = 0;   // Default to no OC
+
     settings.debug.SerialConsole = false;
     settings.debug.VirtualSerialPort = false;
     settings.debug.VirtualSerialPortFile = "";
@@ -431,6 +434,9 @@ void LoadSettings(bool game_specific)
     settings.pvr.MultithreadedTA = cfgLoadInt(config_section, "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
 
     settings.pvr.FPSTarget = cfgLoadInt(config_section, "pvr.FPSTarget", settings.pvr.FPSTarget);
+
+    settings.polly2.AutoReset = cfgLoadBool(config_section, "polly2.AutoReset", settings.polly2.AutoReset);
+    settings.polly2.ClockSel = cfgLoadInt(config_section, "polly2.ClockSel", settings.polly2.ClockSel);
     
     settings.debug.SerialConsole = cfgLoadBool(config_section, "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     settings.debug.VirtualSerialPort = cfgLoadBool(config_section, "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);
@@ -595,6 +601,9 @@ void SaveSettings()
 
     cfgSaveInt("config", "pvr.MultithreadedTA", settings.pvr.MultithreadedTA);
     cfgSaveInt("config", "pvr.FPSTarget", settings.pvr.FPSTarget);
+
+    cfgSaveBool("config", "polly2.AutoReset", settings.polly2.AutoReset);
+    cfgSaveInt("config", "polly2.ClockSel", settings.polly2.ClockSel);
 
     cfgSaveBool("config", "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     cfgSaveBool("config", "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);
@@ -872,7 +881,7 @@ struct Dreamcast_impl : VirtualDreamcast {
     {
         cfgSetVirtual("config", "image", path.c_str());
 
-        if (settings.bios.UseReios || !LoadRomFiles(get_readonly_data_path(DATA_PATH)))
+        if (settings.bios.UseReios || !LoadRomFiles("/media/fat/games/Dreamcast/")) // get_readonly_data_path(DATA_PATH)
         {
 #ifdef USE_REIOS
             if (!LoadHle(get_readonly_data_path(DATA_PATH)))

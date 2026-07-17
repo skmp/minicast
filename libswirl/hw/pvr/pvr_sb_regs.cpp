@@ -26,6 +26,8 @@
 
 #include "hw/sh4/sh4_mmio.h"
 
+#include "../../../polly2-rtl/driver/polly2_mmio.h"
+
 bool pal_needs_update = true;
 bool fog_needs_update = true;
 
@@ -285,7 +287,9 @@ struct PVRDevice : MMIODevice {
     u8* mram;
     u8* vram;
 
-    PVRDevice(SuperH4Mmr* sh4mmr, SystemBus* sb, ASIC* asic, SPG* spg, u8* mram, u8* vram) : sh4mmr(sh4mmr), sb(sb), asic(asic), spg(spg), mram(mram), vram(vram) { }
+    PVRDevice(SuperH4Mmr* sh4mmr, SystemBus* sb, ASIC* asic, SPG* spg, u8* mram, u8* vram) : sh4mmr(sh4mmr), sb(sb), asic(asic), spg(spg), mram(mram), vram(vram) {
+        polly2_mmio_init();
+    }
 
     u32 Read(u32 addr, u32 sz)
     {
@@ -313,10 +317,6 @@ struct PVRDevice : MMIODevice {
             //start render
             rend_start_render(vram);
             return;
-        }
-
-        if (addr == FB_R_SOF1_addr) {
-            *(volatile uint32_t*)(FPGA_REGS_BASE + addr) = data;
         }
 
         if (addr == TA_LIST_INIT_addr)
@@ -374,7 +374,6 @@ struct PVRDevice : MMIODevice {
                 PvrReg(addr, u32) = data;
                 spg->CalculateSync();
             }
-            return;
         }
         if (addr == FB_R_CTRL_addr)
         {
@@ -382,7 +381,6 @@ struct PVRDevice : MMIODevice {
             PvrReg(addr, u32) = data;
             if (vclk_div_changed)
                 spg->CalculateSync();
-            return;
         }
         if (addr == FB_R_SIZE_addr)
         {
@@ -392,13 +390,11 @@ struct PVRDevice : MMIODevice {
                 fb_dirty = false;
                 pvr_update_framebuffer_watches();
             }
-            return;
         }
         if (addr == TA_YUV_TEX_BASE_addr || addr == TA_YUV_TEX_CTRL_addr)
         {
             PvrReg(addr, u32) = data;
             YUV_init(asic);
-            return;
         }
 
         if (addr < FOG_TABLE_START_addr && settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
@@ -420,6 +416,7 @@ struct PVRDevice : MMIODevice {
             fog_needs_update = true;
         }
         PvrReg(addr, u32) = data;
+        polly2_reg_write(addr, data);
     }
 
     //Init/Term , global
