@@ -52,6 +52,7 @@ list(APPEND _sources
     # ${swrl}/hw/modem/dns.cpp
     # ${swrl}/hw/modem/picoppp.cpp
     ${swrl}/hw/pvr/spg.cpp
+    ${swrl}/rend/mister_rend/mister_support.cpp
     ${swrl}/hw/pvr/pvr_sb_regs.cpp
     # ${swrl}/hw/pvr/Renderer_if.cpp
     ${swrl}/hw/pvr/pvr_mem.cpp

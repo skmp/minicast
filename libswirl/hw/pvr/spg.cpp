@@ -12,6 +12,7 @@
 #include "hw/holly/holly_intc.h"
 #include "oslib/oslib.h"
 #include "hw/sh4/sh4_sched.h"
+#include "rend/mister_rend/mister_support.h"
 
 //SPG emulation; Scanline/Raster beam registers & interrupts
 //Time to emulate that stuff correctly ;)
@@ -20,10 +21,11 @@ u32 in_vblank = 0;
 u32 clc_pvr_scanline;
 u32 pvr_numscanlines = 512;
 u32 prv_cur_scanline = -1;
-u32 vblk_cnt = 0;
+u32 vblk_cnt = 0, vblk_cnt_stats = 0;
 u32 vblank_count_monotonic = 0;
 
 float last_fps = 0;
+float last_stats = 0;
 
 //54 mhz pixel clock :)
 #define PIXEL_CLOCK (54*1000*1000/2)
@@ -148,10 +150,62 @@ struct SPG_impl final : SPG {
 
                 //Vblank counter
                 vblk_cnt++;
+                vblk_cnt_stats++;
                 vblank_count_monotonic++;
                 asic->RaiseInterrupt(holly_HBLank);// -> This turned out to be HBlank btw , needs to be emulated ;(
                 //TODO : rend_if_VBlank();
                 rend_vblank();//notify for vblank :)
+
+                if ((os_GetSeconds() - last_stats) > 0.5)
+                {
+                    static int Last_FC;
+                    double ts = os_GetSeconds() - last_stats;
+                    double spd_fps = (FrameCount - Last_FC) / ts;
+                    double spd_vbs = vblk_cnt_stats / ts;
+                    double spd_cpu = spd_vbs * Frame_Cycles;
+                    spd_cpu /= 1000000;	//mrhz kthx
+                    double fullvbs = (spd_vbs / spd_cpu) * 200;
+                    double mv = 0 / ts / (spd_cpu / 200);
+                    char mv_c = ' ';
+
+                    Last_FC = FrameCount;
+
+                    if (mv > 750)
+                    {
+                        mv /= 1000;	//KV
+                        mv_c = 'K';
+                    }
+                    if (mv > 750)
+                    {
+                        mv /= 1000;	//
+                        mv_c = 'M';
+                    }
+                    vblk_cnt_stats = 0;
+
+                    const char* mode = 0;
+                    const char* res = 0;
+
+                    res = SPG_CONTROL.interlace ? "480i" : "240p";
+
+                    if (SPG_CONTROL.NTSC == 0 && SPG_CONTROL.PAL == 1)
+                        mode = "PAL";
+                    else if (SPG_CONTROL.NTSC == 1 && SPG_CONTROL.PAL == 0)
+                        mode = "NTSC";
+                    else
+                    {
+                        res = SPG_CONTROL.interlace ? "480i" : "480p";
+                        mode = "VGA";
+                    }
+
+                    double frames_done = spd_cpu / 2;
+                    mspdf = 1 / frames_done * 1000;
+
+                    char modestr[16];
+                    snprintf(modestr, sizeof(modestr), "%s%s%4.2f", mode, res, fullvbs);
+                    ReportEmulatorStats(spd_cpu * 100 / 200, spd_vbs, modestr, spd_fps);
+                    UpdateStatsOSD();
+                    last_stats = os_GetSeconds();
+                }
 
                 if ((os_GetSeconds() - last_fps) > 2)
                 {
