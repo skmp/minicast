@@ -73,6 +73,8 @@ extern ta_ring_t ta_ring;
 extern std::atomic<u64> ta_eol_interrupt_mark; // counts EOLs
 extern std::map<u32, u64> ta_contexts;
 
+extern u8 pvr_regs_mtta[];
+
 // DMB ISH - inner shareable data memory barrier (A9 SMP hand-off)
 #if HOST_CPU == CPU_ARM || HOST_CPU == CPU_ARM64
 #define TA_RING_DMB() __asm__ __volatile__("dmb ish" ::: "memory")

@@ -51,6 +51,7 @@ void rend_vblank() {
 
 void rend_start_render(u8* vram) {
     if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
+        ta_ring_publish();
         auto goal = ta_contexts[CORE_CURRENT_CTX];
 
         while (goal > ta_eol_interrupt_mark) {
