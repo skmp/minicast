@@ -19,3 +19,7 @@ void ta_vtx_ListInit(u8* vram);
 void ta_vtx_ListCont();
 void ta_vtx_SoftReset();
 
+// MTTA_FREERUNNING producer entry points: pure fifo push, no FSM processing
+void ta_vtx_data_fr(u32* data, u32 size);
+void DYNACALL ta_vtx_data32_fr(void* data);
+

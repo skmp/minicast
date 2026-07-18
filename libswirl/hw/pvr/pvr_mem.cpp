@@ -107,7 +107,11 @@ void TAWrite(u32 address,u32* data,u32 count, u8* vram)
 	u32 address_w=address&0x1FFFFFF;//correct ?
 	if (address_w<0x800000)//TA poly
 	{
-		if (settings.pvr.MultithreadedTA)
+		if (settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING)
+		{
+			ta_vtx_data_fr(data, count);
+		}
+		else if (settings.pvr.MultithreadedTA)
 		{
 			ta_vtx_data(data, count);
 		} else {
@@ -135,7 +139,7 @@ void NOINLINE MemWrite32(void* dst, void* src)
 }
 
 // #if HOST_CPU!=CPU_ARM
-template<bool mtta>
+template<int mtta_mode>
 void DYNACALL TAWriteSQ_internal(u32 address,u8* sqb)
 {
 	u32 address_w=address&0x1FFFFFF;//correct ?
@@ -145,9 +149,12 @@ void DYNACALL TAWriteSQ_internal(u32 address,u8* sqb)
 
 	if (likely(address_w<0x800000))//TA poly
 	{
-		if (mtta) {
+		if (mtta_mode == TA_MTTA_FREERUNNING) {
+			// Multi threaded TA, freerunning: fifo push only
+			ta_vtx_data32_fr(sq);
+		} else if (mtta_mode != TA_STTA) {
 			// Multi threaded TA
-			ta_vtx_data32(sq);	
+			ta_vtx_data32(sq);
 		} else {
 			lxd_ta_write_burst(address_w, sq);
 		}
@@ -178,12 +185,17 @@ void DYNACALL TAWriteSQ_internal(u32 address,u8* sqb)
 
 extern "C" void DYNACALL TAWriteSQ_STTA(u32 address,u8* sqb)
 {
-	TAWriteSQ_internal<false>(address, sqb);
+	TAWriteSQ_internal<TA_STTA>(address, sqb);
 }
 
 extern "C" void DYNACALL TAWriteSQ_MTTA(u32 address,u8* sqb)
 {
-	TAWriteSQ_internal<true>(address, sqb);
+	TAWriteSQ_internal<TA_MTTA>(address, sqb);
+}
+
+extern "C" void DYNACALL TAWriteSQ_MTTA_FR(u32 address,u8* sqb)
+{
+	TAWriteSQ_internal<TA_MTTA_FREERUNNING>(address, sqb);
 }
 // #endif
 

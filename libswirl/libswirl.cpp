@@ -441,6 +441,8 @@ void LoadSettings(bool game_specific)
     settings.polly2.ClockSel = cfgLoadInt(config_section, "polly2.ClockSel", settings.polly2.ClockSel);
 
     settings.freerunning = cfgLoadBool(config_section, "Freerunning", settings.freerunning);
+    if (settings.freerunning)
+        settings.pvr.MultithreadedTA = TA_MTTA_FREERUNNING;
     
     settings.debug.SerialConsole = cfgLoadBool(config_section, "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     settings.debug.VirtualSerialPort = cfgLoadBool(config_section, "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);
@@ -970,7 +972,7 @@ struct Dreamcast_impl : VirtualDreamcast {
 
         SPG* spg = SPG::Create(asic);
 
-        if (settings.pvr.MultithreadedTA == TA_MTTA) {
+        if (settings.pvr.MultithreadedTA == TA_MTTA || settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING) {
             ta_ring_consumer_start(sh4_cpu->vram.data);
         } else if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
             ta_ring_consumer_start_decoupled(sh4_cpu->vram.data);

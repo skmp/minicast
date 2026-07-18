@@ -252,7 +252,9 @@ struct PVRDevice : MMIODevice {
             link_addr = ea_ptr[0x1C >> 2];//Next link
             //transfer global param
             // Hybrid TA: producer path.
-            if (settings.pvr.MultithreadedTA) {
+            if (settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING) {
+                ta_vtx_data_fr(ea_ptr, ea_ptr[0x18 >> 2]);
+            } else if (settings.pvr.MultithreadedTA) {
                 ta_vtx_data(ea_ptr, ea_ptr[0x18 >> 2]);
             } else {
                 lxd_ta_write((u8*)ea_ptr, ea_ptr[0x18 >> 2]);

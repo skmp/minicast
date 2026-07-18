@@ -346,6 +346,18 @@ std::atomic<u64> ta_eol_interrupt_mark;
 static u64 ta_fsm_eol_interrupt_mark;
 std::map<u32, u64> ta_contexts;
 
+// MTTA_FREERUNNING: bit per list type, set by the consumer (tacore) at
+// end-of-list, drained by UpdateSystem on the cpu thread
+std::atomic<u32> ta_pending_list_interrupts;
+
+void ta_freerunning_raise_pending()
+{
+	u32 pend = ta_pending_list_interrupts.exchange(0, std::memory_order_acquire);
+	for (int i = 0; pend; i++, pend >>= 1)
+		if (pend & 1)
+			asic_RaiseInterrupt(ListEndInterrupt[i]);
+}
+
 NOINLINE void DYNACALL ta_handle_cmd(u32 trans, void* block)
 {
 	Ta_Dma* dat=(Ta_Dma*)block;
@@ -449,6 +461,14 @@ void ta_vtx_ListInit(u8* vram)
 		(u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
 		ring_op[2] = TA_RING_DECOUPLED_OP_LISTINIT;
 		ta_ring_push(ring_op);
+	} else if (settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING) {
+		// through the ring so it stays ordered with the block stream; publish
+		// because no sync point will ever flush it
+		DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
+		(u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
+		ring_op[2] = TA_RING_DECOUPLED_OP_LISTINIT;
+		ta_ring_push(ring_op);
+		ta_ring_publish();
 	}
 	ta_cur_state=TAS_NS;
 }
@@ -464,6 +484,12 @@ void ta_vtx_SoftReset()
 		(u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
 		ring_op[2] = TA_RING_DECOUPLED_OP_SOFTRESET;
 		ta_ring_push(ring_op);
+	} else if (settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING) {
+		DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
+		(u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
+		ring_op[2] = TA_RING_DECOUPLED_OP_SOFTRESET;
+		ta_ring_push(ring_op);
+		ta_ring_publish();
 	}
 	ta_cur_state=TAS_NS;
 }
@@ -499,6 +525,35 @@ void DYNACALL ta_vtx_data32(void* data)
 {
 	SQWC(1);
 	ta_thd_data32_i(data);
+}
+
+/*
+	MTTA_FREERUNNING producer entry points: pure fifo push, no FSM processing.
+	List tracking and EOL interrupts happen entirely on the consumer (tacore)
+	side; UpdateSystem delivers the flagged interrupts on the cpu thread.
+*/
+void DYNACALL ta_vtx_data32_fr(void* data)
+{
+	SQWC(1);
+	ta_ring_push(data);
+
+	// there are no drain points in this mode: an end-of-list block must become
+	// visible to the consumer or the guest would wait forever for the interrupt
+	if (((PCW*)data)->ParaType == ParamType_End_Of_List)
+		ta_ring_publish();
+}
+
+void ta_vtx_data_fr(u32* data, u32 size)
+{
+	DMAWC(size);
+	while (size > 0)
+	{
+		ta_ring_push(data);
+		data += 8;
+		size--;
+	}
+
+	ta_ring_publish();
 }
 
 void ta_vtx_data(u32* data, u32 size)

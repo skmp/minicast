@@ -73,6 +73,11 @@ extern ta_ring_t ta_ring;
 extern std::atomic<u64> ta_eol_interrupt_mark; // counts EOLs
 extern std::map<u32, u64> ta_contexts;
 
+// MTTA_FREERUNNING: bit per list type, set by the consumer at end-of-list;
+// UpdateSystem drains it on the cpu thread via ta_freerunning_raise_pending()
+extern std::atomic<u32> ta_pending_list_interrupts;
+void ta_freerunning_raise_pending();
+
 extern u8 pvr_regs_mtta[];
 
 // DMB ISH - inner shareable data memory barrier (A9 SMP hand-off)

@@ -13,6 +13,7 @@
 #include "sh4_interrupts.h"
 
 #include "hw/pvr/pvr_mem.h" // for TAWriteSQ_STTA / TAWriteSQ_MTTA
+#include "hw/pvr/ta_ring.h" // for ta_pending_list_interrupts
 
 #if HOST_OS == OS_LINUX
 #include <fcntl.h>
@@ -84,6 +85,11 @@ int UpdateSystem()
 
     if (settings.freerunning)
     {
+        // MTTA_FREERUNNING: EOL interrupts flagged by the TA consumer thread
+        // are delivered here, on the cpu thread
+        if (ta_pending_list_interrupts.load(std::memory_order_relaxed))
+            ta_freerunning_raise_pending();
+
         u32 elapsed = freerun_now() - freerun_last;
 
         if (elapsed > FREERUN_MAX_BEHIND) {
@@ -257,7 +263,9 @@ bool SuperH4_impl::Init()
     verify(sizeof(Sh4cntx) == 448);
 
     memset(&p_sh4rcb->cntx, 0, sizeof(p_sh4rcb->cntx));
-    do_sqw_ta = settings.pvr.MultithreadedTA ? &TAWriteSQ_MTTA : &TAWriteSQ_STTA;
+    do_sqw_ta = settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING ? &TAWriteSQ_MTTA_FR
+              : settings.pvr.MultithreadedTA                        ? &TAWriteSQ_MTTA
+                                                                    : &TAWriteSQ_STTA;
 
     setBackend(SH4BE_INTERPRETER);
 

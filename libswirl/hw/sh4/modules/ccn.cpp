@@ -49,7 +49,9 @@ struct Sh4ModCcn_impl : Sh4ModCcn {
 			break;
 
 		case 4:
-			if (settings.pvr.MultithreadedTA) {
+			if (settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING) {
+				do_sqw_nommu = (sqw_fp*)&TAWriteSQ_MTTA_FR;
+			} else if (settings.pvr.MultithreadedTA) {
 				do_sqw_nommu = (sqw_fp*)&TAWriteSQ_MTTA;
 			} else {
 				do_sqw_nommu = (sqw_fp*)&TAWriteSQ_STTA;

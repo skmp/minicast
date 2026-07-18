@@ -460,6 +460,15 @@ static void ta_end_list() {
         {
             asic_RaiseInterrupt(list_events[ta_status.current_list_type]);
         }
+        else if (settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING)
+        {
+            // consumer thread: flag it for UpdateSystem to raise on the cpu
+            // thread. release pairs with the acquire exchange in the drain, so
+            // everything this list wrote is visible before the guest sees the
+            // interrupt.
+            ta_pending_list_interrupts.fetch_or(1u << ta_status.current_list_type,
+                                                std::memory_order_release);
+        }
     }
     if (settings.pvr.MultithreadedTA != TA_STTA) {
         ta_eol_interrupt_mark++;
@@ -1259,6 +1268,12 @@ static void pvr2_ta_process_block( unsigned char *input ) {
     #ifdef MTTA_DECOUPLED
     u64 ta_ring_magic =  *(u64*)input;
     if (ta_ring_magic == TA_RING_DECOUPLED_MAGIC) {
+    #else
+    // MTTA_FREERUNNING pushes ListInit/SoftReset through the ring so they stay
+    // ordered with the block stream without any producer-side sync
+    if (settings.pvr.MultithreadedTA == TA_MTTA_FREERUNNING &&
+        *(u64*)input == TA_RING_DECOUPLED_MAGIC) {
+    #endif
         switch(data[2].i) {
             case TA_RING_DECOUPLED_OP_REGWRITE:
                 (u32&)pvr_regs[data[3].i] = data[4].i;
@@ -1274,7 +1289,6 @@ static void pvr2_ta_process_block( unsigned char *input ) {
         }
         return;
     }
-    #endif
 
     switch( ta_status.state ) {
     case STATE_ERROR:

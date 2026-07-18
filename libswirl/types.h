@@ -454,7 +454,8 @@ enum SmcCheckEnum {
 enum MTTAEnum {
 	TA_STTA = 0,
 	TA_MTTA = 1,
-	TA_MTTA_DECOUPLED = 2
+	TA_MTTA_DECOUPLED = 2,
+	TA_MTTA_FREERUNNING = 3		// auto-selected when settings.freerunning is on
 };
 
 struct settings_t
