@@ -329,6 +329,8 @@ void InitSettings()
     settings.polly2.AutoReset = true;
     settings.polly2.ClockSel = 0;   // Default to no OC
 
+    settings.freerunning = false;
+
     settings.debug.SerialConsole = false;
     settings.debug.VirtualSerialPort = false;
     settings.debug.VirtualSerialPortFile = "";
@@ -437,6 +439,8 @@ void LoadSettings(bool game_specific)
 
     settings.polly2.AutoReset = cfgLoadBool(config_section, "polly2.AutoReset", settings.polly2.AutoReset);
     settings.polly2.ClockSel = cfgLoadInt(config_section, "polly2.ClockSel", settings.polly2.ClockSel);
+
+    settings.freerunning = cfgLoadBool(config_section, "Freerunning", settings.freerunning);
     
     settings.debug.SerialConsole = cfgLoadBool(config_section, "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     settings.debug.VirtualSerialPort = cfgLoadBool(config_section, "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);
@@ -604,6 +608,8 @@ void SaveSettings()
 
     cfgSaveBool("config", "polly2.AutoReset", settings.polly2.AutoReset);
     cfgSaveInt("config", "polly2.ClockSel", settings.polly2.ClockSel);
+
+    cfgSaveBool("config", "Freerunning", settings.freerunning);
 
     cfgSaveBool("config", "Debug.SerialConsoleEnabled", settings.debug.SerialConsole);
     cfgSaveBool("config", "Debug.VirtualSerialPort", settings.debug.VirtualSerialPort);

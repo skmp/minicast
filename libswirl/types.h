@@ -589,6 +589,10 @@ struct settings_t
 		bool AutoReset;
 	} polly2;
 
+	// slave the sh4 scheduler to wall clock time (CycloneV A9 global timer)
+	// instead of advancing it per executed timeslice
+	bool freerunning;
+
 	struct {
 		bool SerialConsole;
 		bool VirtualSerialPort;

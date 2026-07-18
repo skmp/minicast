@@ -1133,8 +1133,6 @@ struct Arm7JitVirt_impl : ARM7Backend {
         armv->end(&lps, (void*)rv, Cycles);
     }
 
-
-
     void InvalidateJitCache()
     {
         armv->InvalidateJitCache();
@@ -1159,6 +1157,28 @@ ARM7Backend* ARM7Backend::CreateJit(Arm7Context* ctx) {
 }
 
 void DYNACALL CompileCode(Arm7JitVirt_impl* arm) {
+    auto ctx = arm->ctx;
+
+    //the local is load bearing: bare 'pc' here is ARM::pc, the r15 enumerator
+    u32 pc = armNextPC;
+    u32 emptycheck = 0;
+    for (;emptycheck < 32;emptycheck++)
+    {
+        u32 opcd = CPUReadMemoryQuick(pc + emptycheck * 4);
+        if (opcd != 0) {
+            break;
+        }
+    }
+
+    if (emptycheck == 32) {
+        //interpret the nop-slide (andeq r0,r0,r0 has no effects): skip the
+        //scanned run without compiling. CYCL_CNT is only live here because
+        //arm_compilecode spills/reloads the cycle counter around this call
+        //and exits the slice when it runs out.
+        armNextPC += 32 * 4;
+        ctx->regs[CYCL_CNT].I -= 3000;
+        return;
+    }
     arm->CompileCode();
 }
 
