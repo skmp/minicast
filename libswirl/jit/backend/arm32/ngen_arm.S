@@ -12,6 +12,7 @@
 .equ SH4_TIMESLICE, 448
 .equ BM_BLOCKLIST_MASK, 65532 @FFFC
 .equ CPU_RATIO, 5
+.equ SH4_FR_NOFFS, 384	@ fr bank at r8-384 (xffr[16..31]); verified in Arm32NGenBackend::Init
 
 #if HOST_OS == OS_DARWIN
 #define CSYM(n) _##n
@@ -143,6 +144,7 @@ HIDDEN(ngen_mainloop)
 CSYM(ngen_mainloop):
 
 push { r4-r12,lr }
+vpush {d8-d15}			@ callee-saved; hold the statically mapped fr bank
 
 
 #if HOST_OS == OS_DARWIN
@@ -153,7 +155,10 @@ push { r4-r12,lr }
 
     mov r8, r0			@Load context
 	ldr r4, [r8,#-184]	@load pc
-	
+
+	sub r2, r8, #SH4_FR_NOFFS
+	vldmia r2, {s16-s31}	@ load the static fr bank
+
 	b CSYM(no_update)			@Go to mainloop !
 
 
@@ -203,6 +208,10 @@ CSYM(no_update):              @ next_pc _MUST_ be on r4 *R4 NOT R0 anymore*
 HIDDEN(cleanup)
 CSYM(cleanup):
 
+sub r2, r8, #SH4_FR_NOFFS
+vstmia r2, {s16-s31}	@ store the static fr bank back to the context
+
+vpop {d8-d15}
 pop {r4-r12,lr}
 bx lr
 

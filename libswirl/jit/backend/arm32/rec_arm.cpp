@@ -263,8 +263,8 @@ eReg alloc_regs[]={r5,r6,r7,r10,(eReg)-1};
 #else
 eReg alloc_regs[]={r5,r6,r7,r10,r11,(eReg)-1};
 #endif
-eFSReg alloc_fpu[]={f16,f17,f18,f19,f20,f21,f22,f23,
-					f24,f25,f26,f27,f28,f29,f30,f31,(eFSReg)-1};
+//fr0-15 are statically mapped to f16-f31 (see opt_static_fpu); no dynamic pool
+eFSReg alloc_fpu[]={(eFSReg)-1};
 
 struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 {
@@ -274,13 +274,19 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 		//any mapped dest, so dests may share a host reg with a dying source
 		opt_alias_mov=true;
 		opt_reuse_dead=true;
+
+		//fr0-15 live permanently in f16-f31 (d8-d15, callee-saved so C calls
+		//can't clobber them). ngen_mainloop loads/stores them at entry/exit;
+		//emitters flush/reload around anything touching fr memory (sync_fpscr
+		//bank switch, fp ifb fallbacks, canonical calls taking fr pointers).
+		opt_static_fpu=true;
 	}
 
 	virtual eFSReg FpuMap(u32 reg)
 	{
 		if (reg>=reg_fr_0 && reg<=reg_fr_15)
 		{
-			return alloc_fpu[reg-reg_fr_0];
+			return (eFSReg)(f16+(reg-reg_fr_0));
 		}
 		else
 			return (eFSReg)-1;
@@ -328,6 +334,39 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 
 
 arm_reg_alloc reg;
+
+//statically mapped fr regs: fr0-15 -> f16-f31 (d8-d15)
+static eFSReg static_fs(u32 sh4_reg)
+{
+	verify(sh4_reg>=reg_fr_0 && sh4_reg<=reg_fr_15);
+	return (eFSReg)(f16+(sh4_reg-reg_fr_0));
+}
+
+static eFDReg static_fd(u32 sh4_reg)
+{
+	verify(sh4_reg>=reg_fr_0 && sh4_reg<reg_fr_15 && !((sh4_reg-reg_fr_0)&1));
+	return (eFDReg)(d8+(sh4_reg-reg_fr_0)/2);
+}
+
+static bool is_static_freg(const shil_param& prm)
+{
+	return prm.is_reg() && prm._reg>=reg_fr_0 && prm._reg<=reg_fr_15;
+}
+
+//sync the static fr bank with the context. Clobbers tmp.
+static void FlushStaticFpu(eReg tmp=r0)
+{
+	const s32 offs=rcb_noffs(GetRegPtr(reg_fr_0));
+	SUB(tmp,r8,-offs);
+	VSTM(d8,tmp,8);
+}
+
+static void ReloadStaticFpu(eReg tmp=r0)
+{
+	const s32 offs=rcb_noffs(GetRegPtr(reg_fr_0));
+	SUB(tmp,r8,-offs);
+	VLDM(d8,tmp,8);
+}
 
 
 u32 blockno=0;
@@ -717,11 +756,6 @@ void vmem_slowpath(eReg raddr, eReg rt, eFSReg ft, eFDReg fd, mem_op_type optp, 
 		else if (optp == SZ_64F) VMOV(r2, r3, fd);
 	}
 
-	if (fd != d0 && optp == SZ_64F)
-	{
-		die("BLAH");
-	}
-
 	u32 funct = 0;
 
 	if (optp <= SZ_32I)
@@ -921,9 +955,14 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 					case SZ_64F:
 						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
-						VLDR(d0,r1,0);	//TODO: use reg alloc
-
-						VSTR(d0,r8,op->rd.reg_nofs()/4);
+						if (is_static_freg(op->rd))
+							VLDR(static_fd(op->rd._reg),r1,0);
+						else
+						{
+							//xf pair: stays in memory
+							VLDR(d0,r1,0);
+							VSTR(d0,r8,op->rd.reg_nofs()/4);
+						}
 						break;
 					}
 				} else {
@@ -946,8 +985,13 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 						break;
 
 					case SZ_64F:
-						vmem_slowpath(raddr, r0, f0, d0, optp, true);
-						VSTR(d0,r8,op->rd.reg_nofs()/4);
+						if (is_static_freg(op->rd))
+							vmem_slowpath(raddr, r0, f0, static_fd(op->rd._reg), optp, true);
+						else
+						{
+							vmem_slowpath(raddr, r0, f0, d0, optp, true);
+							VSTR(d0,r8,op->rd.reg_nofs()/4);
+						}
 						break;
 					}
 				}
@@ -962,9 +1006,14 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 			eReg raddr=GenMemAddr(op);
 			
-			//TODO: use reg alloc
 			if (optp == SZ_64F)
-				VLDR(d0,r8,op->rs2.reg_nofs()/4);
+			{
+				//stage the value in d0 for both the fast path and the slowpath
+				if (is_static_freg(op->rs2))
+					VMOV_F64(d0,static_fd(op->rs2._reg));
+				else
+					VLDR(d0,r8,op->rs2.reg_nofs()/4);
+			}
 
 			if (_nvmem_enabled()) {
 				BIC(r1,raddr,0xE0000000);
@@ -1144,11 +1193,25 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 		case shop_mov64:
 		{
 			verify(op->rs1.is_r64() && op->rd.is_r64());
-			//LoadSh4Reg64(r0,op->rs1);
-			//StoreSh4Reg64(r0,op->rd);
-			
-			VLDR(d0,r8,op->rs1.reg_nofs()/4);
-			VSTR(d0,r8,op->rd.reg_nofs()/4);
+
+			//either operand may be an xf pair (XD regs), which stay in memory
+			bool ds=is_static_freg(op->rd);
+			bool ss=is_static_freg(op->rs1);
+
+			if (ds && ss)
+			{
+				if (op->rd._reg!=op->rs1._reg)
+					VMOV_F64(static_fd(op->rd._reg),static_fd(op->rs1._reg));
+			}
+			else if (ds)
+				VLDR(static_fd(op->rd._reg),r8,op->rs1.reg_nofs()/4);
+			else if (ss)
+				VSTR(static_fd(op->rs1._reg),r8,op->rd.reg_nofs()/4);
+			else
+			{
+				VLDR(d0,r8,op->rs1.reg_nofs()/4);
+				VSTR(d0,r8,op->rd.reg_nofs()/4);
+			}
 			break;
 		}
 
@@ -1164,7 +1227,14 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 		case shop_ifb:
 		{
-			if (op->rs1._imm) 
+			//fp opcodes (0xFxxx) executed in the interpreter touch fr memory;
+			//so do lds/lds.l FPSCR (0x406A/0x4066): UpdateFPSCR may swap banks
+			bool touches_fpu=op->rs3._imm>=0xF000 || OpDesc[op->rs3._imm]->SetFPSCR();
+
+			if (touches_fpu)
+				FlushStaticFpu();
+
+			if (op->rs1._imm)
 			{
 				MOV32(r1,op->rs2._imm);
 				StoreSh4Reg_mem(r1,reg_nextpc);
@@ -1173,6 +1243,9 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 			MOV32(r0, op->rs3._imm);
 			CALL((u32)(OpPtr[op->rs3._imm]));
+
+			if (touches_fpu)
+				ReloadStaticFpu();
 			break;
 		}
 
@@ -1298,6 +1371,15 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 		{
 			//must flush: SRS, SRT, r0-r7, r0b-r7b
 			CALL((u32)UpdateSR);
+			break;
+		}
+
+		case shop_sync_fpscr:
+		{
+			//UpdateFPSCR may swap the fr/xf banks in the context
+			FlushStaticFpu();
+			CALL((u32)UpdateFPSCR);
+			ReloadStaticFpu();
 			break;
 		}
 
@@ -1597,90 +1679,57 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 		case shop_fsca:
 			{
-				reg.writeback_fpu+=2;
-
 				//r1: base ptr
 				MOVW(r1,((unat)sin_table)&0xFFFF);
 				UXTH(r0,reg.mapg(op->rs1));
 				MOVT(r1,((u32)sin_table)>>16);
-				
-				/*
-					LDRD(r0,r1,r0,lsl,3);
-					VMOV.64
-					or
-					ADD(r0,r1,r0,LSL,3);
-					VLDR(d0,r0);
-				*/
 
-				//LSL(r0,r0,3);
-				//ADD(r0,r1,r0); //EMITTER: Todo, add with shifted !
 				ADD(r0,r1,r0, S_LSL, 3);
-				
-				VLDR(/*reg.mapf(op->rd,0)*/d0,r0,0);
-				VSTR(d0,r8,op->rd.reg_nofs()/4);
+
+				if (is_static_freg(op->rd))
+					VLDR(static_fd(op->rd._reg),r0,0);
+				else
+				{
+					VLDR(d0,r0,0);
+					VSTR(d0,r8,op->rd.reg_nofs()/4);
+				}
 			}
 			break;
 
 		case shop_fipr:
 			{
-				
-				eFQReg _r1=q0;
-				eFQReg _r2=q0;
+				//rs1/rs2 are fr vectors and live in the static regs; accumulate
+				//in f0 since rd (fr[n+3]) is part of the rs2 vector
+				eFSReg a=static_fs(op->rs1._reg);
+				eFSReg b=static_fs(op->rs2._reg);
 
-				SUB(r0,r8,op->rs1.reg_aofs());
-				if (op->rs2.reg_aofs()==op->rs1.reg_aofs())
-				{
-					reg.preload_fpu+=4;
-					VLDM(d0,r0,2);
-				}
-				else
-				{
-					reg.preload_fpu+=8;
-					SUB(r1,r8,op->rs2.reg_aofs());
-					VLDM(d0,r0,2);
-					VLDM(d2,r1,2);
-					_r2=q1;
-				}
-
-#if 1
-				//VFP
-				eFSReg fs2=_r2==q0?f0:f4;
-
-				VMUL_VFP(reg.mapfs(op->rd),f0,(eFSReg)(fs2+0));
-				VMLA_VFP(reg.mapfs(op->rd),f1,(eFSReg)(fs2+1));
-				VMLA_VFP(reg.mapfs(op->rd),f2,(eFSReg)(fs2+2));
-				VMLA_VFP(reg.mapfs(op->rd),f3,(eFSReg)(fs2+3));
-#else			
-				VMUL_F32(q0,_r1,_r2);
-				VPADD_F32(d0,d0,d1);
-				VADD_VFP(reg.mapfs(op->rd),f0,f1);
-#endif
+				VMUL_VFP(f0,(eFSReg)(a+0),(eFSReg)(b+0));
+				VMLA_VFP(f0,(eFSReg)(a+1),(eFSReg)(b+1));
+				VMLA_VFP(f0,(eFSReg)(a+2),(eFSReg)(b+2));
+				VMLA_VFP(f0,(eFSReg)(a+3),(eFSReg)(b+3));
+				VMOV(reg.mapfs(op->rd),f0);
 			}
 			break;
 
 		case shop_ftrv:
 			{
-				reg.preload_fpu+=4;
-				reg.writeback_fpu+=4;
+				//rs2 is the xf matrix and stays in memory; rs1/rd are fr
+				//vectors living in the static regs (usually the same vector)
+				eFDReg vin=static_fd(op->rs1._reg);
+				eFDReg vout=static_fd(op->rd._reg);
 
-				eReg rdp=r1;
 				SUB(r2,r8,op->rs2.reg_aofs());
-				SUB(r1,r8,op->rs1.reg_aofs());
-				if (op->rs1.reg_aofs() != op->rd.reg_aofs())
-				{
-					rdp=r0;
-					SUB(r0,r8,op->rd.reg_aofs());
-				}
-	
+
 #if 1
-				//f0,f1,f2,f3	  : vin
+				//f0,f1,f2,f3	  : vin (copied: out overwrites the input vector)
 				//f4,f5,f6,f7     : out
 				//f8,f9,f10,f11   : mtx temp
 				//f12,f13,f14,f15 : mtx temp
 				//(This is actually faster than using neon)
 
 				VLDM(d4,r2,2,1);
-				VLDM(d0,r1,2);
+				VMOV_F64(d0,vin);
+				VMOV_F64(d1,(eFDReg)(vin+1));
 
 				VMUL_VFP(f4,f8,f0);
 				VMUL_VFP(f5,f9,f0);
@@ -1708,7 +1757,8 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 				VMLA_VFP(f6,f14,f3);
 				VMLA_VFP(f7,f15,f3);
 
-				VSTM(d2,rdp,2);
+				VMOV_F64(vout,d2);
+				VMOV_F64((eFDReg)(vout+1),d3);
 #else
 				//this fits really nicely to NEON !
 				VLDM(d16,r2,8);
@@ -1756,23 +1806,22 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 			case shop_frswap:
 			{
-				reg.preload_fpu+=16;
-				reg.writeback_fpu+=16;
-
 				verify(op->rd._reg==op->rs2._reg);
 				verify(op->rd2._reg==op->rs1._reg);
 
 				verify(op->rs1.count()==16 && op->rs2.count()==16);
 				verify(op->rd2.count()==16 && op->rd.count()==16);
 
-				SUB(r0,r8,op->rs1.reg_aofs());
-				SUB(r1,r8,op->rd.reg_aofs());
-				//Assumes no FPU reg alloc here
-				//frswap touches all FPU regs, so all spans should be clear here ..
-				VLDM(d0,r1,8);
-				VLDM(d8,r0,8);
-				VSTM(d0,r0,8);
-				VSTM(d8,r1,8);
+				//swap the fr bank (static d8-d15) with the xf bank (memory)
+				const shil_param& xfp=op->rs1._reg>=reg_xf_0 ? op->rs1 : op->rs2;
+				const shil_param& frp=op->rs1._reg>=reg_xf_0 ? op->rs2 : op->rs1;
+				verify(xfp._reg==reg_xf_0 && frp._reg==reg_fr_0);
+
+				SUB(r0,r8,xfp.reg_aofs());
+				VLDM(d0,r0,8);	//xf -> scratch
+				VSTM(d8,r0,8);	//fr statics -> xf
+				for (int i=0;i<8;i++)
+					VMOV_F64((eFDReg)(d8+i),(eFDReg)(d0+i));	//xf -> fr statics
 			}
 			break;
 
@@ -1817,6 +1866,12 @@ struct Arm32NGenBackend: NGenBackend
 		printf("Initializing the ARM32 dynarec\n");
 	    verify(FPCB_OFFSET == -0x2100000 || FPCB_OFFSET == -0x4100000);
 	    verify(rcb_noffs(p_sh4rcb->fpcb) == FPCB_OFFSET);
+
+	    //static fr mapping: ngen_mainloop hardcodes the fr bank at r8-384
+	    //(SH4_FR_NOFFS in ngen_arm.S) and loads it into s16-s31 (d8-d15).
+	    //sh4_dyna_rcb isn't set yet at Init time, so measure via rcb_noffs
+	    verify(rcb_noffs(GetRegPtr(reg_fr_0)) == -384);
+	    verify(reg.FpuMap(reg_fr_0)==f16 && reg.FpuMap(reg_fr_15)==f31);
 	   	
 	    for (int s=0;s<6;s++)
 		{
@@ -2248,11 +2303,6 @@ struct Arm32NGenBackend: NGenBackend
 				else if (optp==SZ_64F) VMOV(r2,r3,fd);
 			}
 
-			if (fd!=d0 && optp==SZ_64F)
-			{
-				die("BLAH");
-			}
-
 			u32 funct=0;
 
 			if (offs==1)
@@ -2343,10 +2393,27 @@ struct Arm32NGenBackend: NGenBackend
 		}
 	}
 
-	void CC_Call(shil_opcode* op,void* function) 
+	void CC_Call(shil_opcode* op,void* function)
 	{
 		u32 rd=r0;
 		u32 fd=f0;
+
+		//fallbacks taking reg pointers may access fr regs in memory: sync the
+		//static bank around the call (flush first: it clobbers r0)
+		bool sync_static=false;
+		for (size_t i=0;i<CC_pars.size();i++)
+		{
+			if (CC_pars[i].type==CPT_ptr && CC_pars[i].par->is_reg())
+			{
+				u32 first=CC_pars[i].par->_reg;
+				u32 last=first+CC_pars[i].par->count()-1;
+				if (first<=(u32)reg_fr_15 && last>=(u32)reg_fr_0)
+					sync_static=true;
+			}
+		}
+
+		if (sync_static)
+			FlushStaticFpu();
 
 		for (int i=CC_pars.size();i-->0;)
 		{
@@ -2401,6 +2468,10 @@ struct Arm32NGenBackend: NGenBackend
 		}
 		//printf("used reg r0 to r%d, %d params, calling %08X\n",rd-1,CC_pars.size(),function);
 		CALL((u32)function);
+
+		//r2 as scratch: r0/r1/f0 may hold return values consumed by rv params
+		if (sync_static)
+			ReloadStaticFpu(r2);
 	}
 
 	void CC_Finish(shil_opcode* op) 

@@ -22,6 +22,14 @@ struct TestAlloc : RegAlloc<int, int, false>
 		spills = 0;
 	}
 
+	// with opt_static_fpu, fr0-15 map permanently to host fpr ids 0-15
+	virtual int FpuMap(u32 reg)
+	{
+		if (reg >= reg_fr_0 && reg <= reg_fr_15)
+			return reg - reg_fr_0;
+		return -1;
+	}
+
 	virtual void Preload(u32 reg, int nreg) { Rg[nreg] = ctx[reg]; }
 	virtual void Writeback(u32 reg, int nreg) { ctx[reg] = Rg[nreg]; }
 	virtual void Preload_FPU(u32 reg, int nreg) { Rf[nreg] = ctx[reg]; }
@@ -185,6 +193,9 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 	int gprs[17], fprs[17];
 	for (u32 i = 0; i < ngpr; i++) gprs[i] = i;
 	gprs[ngpr] = -1;
+	// statics use the whole fpr file; no dynamic fpr pool
+	if (alloc->opt_static_fpu)
+		nfpr = 0;
 	for (u32 i = 0; i < nfpr; i++) fprs[i] = i;
 	fprs[nfpr] = -1;
 
@@ -197,6 +208,11 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 	u64 next_val = 0x1000000;
 	for (int i = 0; i < sh4_reg_count; i++)
 		arch[i] = alloc->ctx[i] = next_val++;
+
+	// mainloop entry: the static bank is loaded from the context
+	if (alloc->opt_static_fpu)
+		for (int i = 0; i < 16; i++)
+			alloc->Rf[i] = alloc->ctx[reg_fr_0 + i];
 
 	for (size_t opid = 0; opid < blk->oplist.size(); opid++)
 	{
@@ -260,6 +276,11 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 		alloc->OpEnd(op);
 	}
 
+	// mainloop exit: the static bank is stored back to the context
+	if (alloc->opt_static_fpu)
+		for (int i = 0; i < 16; i++)
+			alloc->ctx[reg_fr_0 + i] = alloc->Rf[i];
+
 	for (int i = 0; i < sh4_reg_count; i++)
 		CHECK(alloc->ctx[i] == arch[i], "final state of r%d: ctx has %llx, arch has %llx\n",
 			i, (unsigned long long)alloc->ctx[i], (unsigned long long)arch[i]);
@@ -272,6 +293,7 @@ int main(int argc, char** argv)
 
 	struct { u32 ngpr, nfpr; } pools[] = { {5, 4}, {3, 2}, {2, 2}, {6, 8} };
 
+	for (int stat = 0; stat <= 1; stat++)
 	for (int alias = 0; alias <= 1; alias++)
 	for (int reuse = 0; reuse <= 1; reuse++)
 	{
@@ -281,10 +303,11 @@ int main(int argc, char** argv)
 			TestAlloc alloc;
 			alloc.opt_alias_mov = alias != 0;
 			alloc.opt_reuse_dead = reuse != 0;
+			alloc.opt_static_fpu = stat != 0;
 
 			for (u32 it = 0; it < iters; it++)
 			{
-				g_cur_seed = base_seed + it + pi * 1000000ull + (alias * 2 + reuse) * 100000000ull;
+				g_cur_seed = base_seed + it + pi * 1000000ull + (stat * 4 + alias * 2 + reuse) * 100000000ull;
 				rng_state = g_cur_seed * 2654435761ull + 1;
 
 				RuntimeBlockInfo blk;
@@ -294,8 +317,8 @@ int main(int argc, char** argv)
 				run_block(&alloc, &blk, pools[pi].ngpr, pools[pi].nfpr);
 			}
 		}
-		printf("alias=%d reuse=%d: OK  (movs %llu, elided %llu, spills %llu)\n",
-			alias, reuse, (unsigned long long)g_movs, (unsigned long long)g_elided,
+		printf("static=%d alias=%d reuse=%d: OK  (movs %llu, elided %llu, spills %llu)\n",
+			stat, alias, reuse, (unsigned long long)g_movs, (unsigned long long)g_elided,
 			(unsigned long long)g_spills);
 	}
 

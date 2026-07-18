@@ -132,7 +132,14 @@ namespace ARM
 	}
 
 
-//	EAPI VMOV(eFDReg Dd, eFDReg Dm, ConditionCode CC=AL)	{}		VFP Double Version Not Implemented here for obvious reasons : same as below except would set SZ @bit8 : 0x0EB00B40
+	EAPI VMOV_F64(eFDReg Dd, eFDReg Dm, ConditionCode CC=AL)	// VFP encoding: doesn't mix NEON into VFP streams
+	{
+		DECL_Id(0x0EB00B40);	SET_CC;
+
+		I |= ((Dd&0x0F)<<12) | ((Dd&0x10)<<18);
+		I |= ((Dm&0x0F))     | ((Dm&0x10)<<1);
+		EMIT_I;
+	}
 
 	EAPI VMOV(eFSReg Sd, eFSReg Sm, ConditionCode CC=AL)
 	{

@@ -216,6 +216,17 @@ struct RegAlloc
 	bool opt_alias_mov=false;   //coalesce reg-reg movs: alias the dst span onto the src host reg
 	bool opt_reuse_dead=false;  //spans starting at an op may take a host reg that dies at that op
 
+	//Regs mapped by FpuMap() live permanently in their host regs: no spans, no
+	//preload/writeback. The backend must sync them with the context at jit
+	//entry/exit and around anything that touches those regs in memory (ifb,
+	//sync_fpscr bank switch, canonical fallbacks taking reg pointers).
+	bool opt_static_fpu=false;
+
+	bool IsStaticf(u32 reg)
+	{
+		return opt_static_fpu && FpuMap(reg)!=(nregf_t)-1;
+	}
+
 	u32 current_opid;
 	u32 preload_fpu,preload_gpr;
 	u32 writeback_fpu,writeback_gpr;
@@ -269,6 +280,9 @@ struct RegAlloc
 
 	bool IsAllocf(Sh4RegType reg)
 	{
+		if (IsStaticf(reg))
+			return true;
+
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
 			if (all_spans[sid]->regstart==(u32)reg && all_spans[sid]->contains(current_opid))
@@ -333,6 +347,9 @@ struct RegAlloc
 	nregf_t mapf(Sh4RegType reg)
 	{
 		verify(IsAllocf(reg));
+
+		if (IsStaticf(reg))
+			return FpuMap(reg);
 
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
@@ -587,8 +604,16 @@ struct RegAlloc
 				InsertRegs(reg_rd,op->rs3);
 
 				set<shil_param>::iterator iter=reg_wt.begin();
-				while( iter != reg_wt.end() ) 
+				while( iter != reg_wt.end() )
 				{
+					//statically mapped regs don't use spans
+					if ((*iter).is_r32f() && IsStaticf((*iter)._reg))
+					{
+						reg_rd.erase(*iter);
+						++iter;
+						continue;
+					}
+
 					if (reg_rd.count(*iter))
 					{
 						reg_rd.erase(*iter);
@@ -657,8 +682,15 @@ struct RegAlloc
 				}
 
 				iter=reg_rd.begin();
-				while( iter != reg_rd.end() ) 
+				while( iter != reg_rd.end() )
 				{
+					//statically mapped regs don't use spans
+					if ((*iter).is_r32f() && IsStaticf((*iter)._reg))
+					{
+						++iter;
+						continue;
+					}
+
 					//r
 					if ((*iter).is_reg())
 					{
@@ -764,7 +796,8 @@ struct RegAlloc
 			if (opt_alias_mov && block->oplist[opid].op==shop_mov32 &&
 				(
 				(block->oplist[opid].rd.is_r32i() && block->oplist[opid].rs1.is_r32i() ) ||
-				(block->oplist[opid].rd.is_r32f() && block->oplist[opid].rs1.is_r32f() )
+				(block->oplist[opid].rd.is_r32f() && block->oplist[opid].rs1.is_r32f() &&
+				 !IsStaticf(block->oplist[opid].rd._reg) && !IsStaticf(block->oplist[opid].rs1._reg))
 				))
 			{
 				RegSpan* x=FindSpan(block->oplist[opid].rs1._reg,(u32)opid);
