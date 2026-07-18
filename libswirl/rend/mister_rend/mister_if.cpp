@@ -14,6 +14,7 @@
 #include <time.h>
 
 #include "hw/pvr/ta_ring.h"
+#include "mister_support.h"
 
 u32 FrameCount;
 static uint64_t RenderTime = 0;
@@ -97,7 +98,10 @@ void rend_end_render() {
     }
 	
     FrameCount++;
-        
+
+	// per-frame render stats; mister_support tracks min/max per OSD window
+	ReportRendererStats((now_ns() - WaitTime) / 1e6, polly2_frame_cycles());
+
 	if ( (FrameCount&0xf) == 0x0) {
 		uint64_t DoneTime = now_ns();
 		printf("GPU: %1.1fms, Wait: %1.1fms, Frame to Frame: %1.1fms, Frame Slack: %1.1fms, %u cycles\n", (DoneTime - RenderTime)/1e6, (DoneTime - WaitTime)/1e6, (RenderTime - DelayTime)/1e6, int64_t(RenderTime - DelayTime - (DoneTime - RenderTime))/1e6, polly2_frame_cycles());
