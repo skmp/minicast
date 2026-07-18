@@ -225,18 +225,31 @@ ldr pc, [r4, r2, lsl #2]
             assembler->B(&dispatch);
         }
 
+        Label arm_exit_label;
+
         lp->compilecode = assembler->GetCursorAddress<void*>();
         // arm_compilecode
         {
+            // spill the live cycle counter so CompileCode's empty-block skip
+            // can consume cycles from the C side; reload it afterwards and
+            // exit the slice if it ran out (the skip never runs a compiled
+            // block, so nothing else would ever end the timeslice)
+            assembler->Str(r5, MemOperand(r8, 192));
+
             assembler->Mov(r0, (uintptr_t)arm);
             ptrdiff_t offset = reinterpret_cast<uintptr_t>(&CompileCode) - assembler->GetBuffer()->GetStartAddress<uintptr_t>();
             Label CompileCode_label;
             assembler->BindToOffset(&CompileCode_label, offset);
             assembler->Bl(&CompileCode_label);
 
+            assembler->Ldr(r5, MemOperand(r8, 192));
+            assembler->Cmp(r5, 0);
+            assembler->B(mi, &arm_exit_label);
+
             assembler->B(&dispatch);
         }
 
+        assembler->Bind(&arm_exit_label);
         lp->exit = assembler->GetCursorAddress<void*>();
         // arm_exit
         {

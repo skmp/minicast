@@ -14,6 +14,67 @@
 
 #include "hw/pvr/pvr_mem.h" // for TAWriteSQ_STTA / TAWriteSQ_MTTA
 
+#if HOST_OS == OS_LINUX
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#endif
+
+/*
+    Freerunning mode: instead of advancing emulated time per executed
+    timeslice, slave the scheduler to wall clock time read from the CycloneV
+    A9 global timer. It runs at mpu_periph_clk = mpu_clk/4 = 200MHz on the
+    DE10-Nano, so one timer tick == one SH4 cycle.
+*/
+
+#define CV_GLOBALTMR_PHYS 0xFFFEC000u   /* A9 private peripheral space */
+#define CV_GLOBALTMR_LO   0x200u        /* counter low word */
+#define CV_GLOBALTMR_CTRL 0x208u        /* bit0: timer enable */
+
+// never advance more this
+#define FREERUN_MAX_BEHIND (200000000u / 60)
+
+static volatile u8* freerun_gt;
+static u32 freerun_last;
+
+static inline u32 freerun_now()
+{
+    return *(volatile u32*)(freerun_gt + CV_GLOBALTMR_LO);
+}
+
+static bool freerun_init()
+{
+    static int state;   /* 0 = untried, 1 = ok, -1 = unavailable */
+    if (state) return state > 0;
+    state = -1;
+
+#if HOST_OS == OS_LINUX
+    int fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+    if (fd < 0) {
+        printf("freerunning: cannot open /dev/mem, using normal timing\n");
+        return false;
+    }
+    void* m = mmap(0, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                   CV_GLOBALTMR_PHYS);
+    close(fd);
+    if (m == MAP_FAILED) {
+        printf("freerunning: global timer mmap failed, using normal timing\n");
+        return false;
+    }
+    freerun_gt = (volatile u8*)m;
+
+    volatile u32* ctrl = (volatile u32*)(freerun_gt + CV_GLOBALTMR_CTRL);
+    if (!(*ctrl & 1))
+        *ctrl |= 1;     /* linux normally has it enabled already */
+
+    freerun_last = freerun_now();
+    state = 1;
+    return true;
+#else
+    return false;
+#endif
+}
+
 // every SH4_TIMESLICE cycles
 int UpdateSystem()
 {
@@ -21,9 +82,36 @@ int UpdateSystem()
     //makes scheduling easier !
     //update_fp* tmu=pUpdateTMU;
 
-    Sh4cntx.sh4_sched_next -= SH4_TIMESLICE;
-    if (Sh4cntx.sh4_sched_next < 0)
-        sh4_sched_tick(SH4_TIMESLICE);
+    if (settings.freerunning)
+    {
+        u32 elapsed = freerun_now() - freerun_last;
+
+        if (elapsed > FREERUN_MAX_BEHIND) {
+            freerun_last += elapsed - FREERUN_MAX_BEHIND;
+            elapsed = FREERUN_MAX_BEHIND;
+        }
+
+        s32 cycles = elapsed;
+        while (cycles>=SH4_TIMESLICE) {
+            cycles -= SH4_TIMESLICE+1;
+            freerun_last += SH4_TIMESLICE;
+            Sh4cntx.sh4_sched_next -= SH4_TIMESLICE;
+            if (Sh4cntx.sh4_sched_next < 0)
+                sh4_sched_tick(SH4_TIMESLICE);
+        }
+        if (cycles > 1) {
+            Sh4cntx.sh4_sched_next -= cycles - 1;
+            freerun_last += cycles - 1;
+        }
+        if (Sh4cntx.sh4_sched_next < 0)
+                sh4_sched_tick(SH4_TIMESLICE);
+    }
+    else
+    {
+        Sh4cntx.sh4_sched_next -= SH4_TIMESLICE;
+        if (Sh4cntx.sh4_sched_next < 0)
+            sh4_sched_tick(SH4_TIMESLICE);
+    }
 
     // Force an interrupt check if the cpu has been stopped
     // ngen is required to only check the bCpuRun on interrupt processing
@@ -164,6 +252,8 @@ SuperH4_impl::SuperH4_impl() {
 
 bool SuperH4_impl::Init()
 {
+    verify(freerun_init() == true);
+
     verify(sizeof(Sh4cntx) == 448);
 
     memset(&p_sh4rcb->cntx, 0, sizeof(p_sh4rcb->cntx));

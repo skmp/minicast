@@ -8,6 +8,7 @@
 
 //#include "../../hw/pvr/pvr_mem.h"
 #include "../../hw/pvr/pvr_regs.h"
+#include "../../hw/pvr/Renderer_if.h"
 #include "../../hw/mem/_vmem.h"
 #include "../../../../polly2-rtl/driver/polly2_mmio.h"
 
@@ -49,6 +50,32 @@ void rend_vblank() {
     // printf("rend_vblank\n");
 }
 
+// freerunning REP poll: report the FPGA's actual completion, with the same
+// 500ms watchdog + AutoReset the blocking wait in rend_end_render has
+static uint64_t poll_deadline_ns;
+
+bool rend_render_done() {
+    if (polly2_done()) {
+        poll_deadline_ns = 0;
+        return true;
+    }
+
+    if (!poll_deadline_ns) {
+        poll_deadline_ns = now_ns() + 500000000ULL;
+    } else if (now_ns() > poll_deadline_ns) {
+        poll_deadline_ns = 0;
+        printf("polly2: Timeout waiting for Frame Done!\n");
+
+        if (settings.polly2.AutoReset) {
+            printf("polly2: Auto resetting!\n");
+            polly2_reset();
+            polly2_set_vram_base(0x32000000);
+            polly2_go();
+        }
+    }
+    return false;
+}
+
 void rend_start_render(u8* vram) {
     if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
         ta_ring_publish();
@@ -58,8 +85,15 @@ void rend_start_render(u8* vram) {
             ;
         }
     }
-    
-    SetREP(200000000/settings.pvr.FPSTarget);
+
+    // freerunning: REP polls for real completion; FPSTarget pacing only
+    // applies when emulated time is decoupled from wall time
+    if (settings.freerunning) {
+        poll_deadline_ns = 0;
+        SetREP(REND_DONE_POLL_CYCLES);
+    } else {
+        SetREP(200000000/settings.pvr.FPSTarget);
+    }
 	
 	__asm__ volatile("dsb sy" ::: "memory");
 

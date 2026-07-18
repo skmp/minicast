@@ -146,6 +146,10 @@ void rend_end_render() {
     printf("rend_end_render\n");
 }
 
+bool rend_render_done() {
+    return true; // RenderCORE is synchronous
+}
+
 void rend_vblank() {
     // present framebuffer to video out
     // printf("rend_vblank\n");

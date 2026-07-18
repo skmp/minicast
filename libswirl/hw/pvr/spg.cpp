@@ -323,6 +323,9 @@ struct SPG_impl final : SPG {
 
     int rend_end_sch(int tag, int cycl, int jitt)
     {
+        if (settings.freerunning && !rend_render_done())
+            return REND_DONE_POLL_CYCLES;
+
         asic->RaiseInterrupt(holly_RENDER_DONE);
         asic->RaiseInterrupt(holly_RENDER_DONE_isp);
         asic->RaiseInterrupt(holly_RENDER_DONE_vd);
