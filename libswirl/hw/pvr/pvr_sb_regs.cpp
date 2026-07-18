@@ -299,11 +299,10 @@ struct PVRDevice : MMIODevice {
 
         if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED)
         {
-            // Make up a value that hopefully makes sense
             u32 a = addr & pvr_RegMask;
             if (a == TA_ISP_CURRENT_addr)
             {
-                return (u32&)pvr_regs_mtta[TA_ISP_LIMIT_addr] - 32;
+                return TA_ISP_LIMIT - 32;
             }
         }
         return PvrReg(addr, u32);
