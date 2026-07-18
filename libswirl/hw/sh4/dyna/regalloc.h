@@ -55,6 +55,7 @@ struct RegAlloc
 		nregf_t nregf;
 
 		bool aliased;
+		bool freed_early;
 
 		vector<RegAccess> accesses;
 
@@ -68,6 +69,7 @@ struct RegAlloc
 			verify(prm.count()==1);
 
 			aliased=false;
+			freed_early=false;
 
 			if (mode&AM_WRITE)
 				writeback=true;
@@ -206,6 +208,13 @@ struct RegAlloc
 
 	vector<RegSpan*> all_spans;
 	u32 spills;
+
+	//Optional optimisations, off by default. A backend may only enable these
+	//if, for every op, its emitter reads all register-allocated sources before
+	//writing any register-allocated dest (single 3-operand host instructions
+	//have this for free; multi-instruction sequences must be audited).
+	bool opt_alias_mov=false;   //coalesce reg-reg movs: alias the dst span onto the src host reg
+	bool opt_reuse_dead=false;  //spans starting at an op may take a host reg that dies at that op
 
 	u32 current_opid;
 	u32 preload_fpu,preload_gpr;
@@ -408,6 +417,25 @@ struct RegAlloc
 				l.insert(p);
 			}
 		}
+	}
+
+	//A span dying at opid may return its host reg to the pool before the op's
+	//dests are allocated, so a dest can take it over. Only spans that are clean
+	//(no writeback: OpEnd runs after the op body, and would store the new
+	//owner's value) and whose final access is a plain read can donate — a span
+	//ending on a write is this op's dest and is written by the op body itself.
+	//The reg must also be exclusively owned: an alias partner still live at
+	//this op may be read, or written back at OpEnd, from the shared reg.
+	bool CanFreeEarly(RegSpan* spn, int opid)
+	{
+		if (!(spn->ending(opid) && !spn->begining(opid) && !spn->aliased
+			&& !spn->writeback && spn->cacc_am(opid)==AM_READ))
+			return false;
+
+		if (spn->fpr)
+			return SpanNRegfIntr(opid,spn->nregf)==1;
+		else
+			return SpanNRegIntr(opid,spn->nreg)==1;
 	}
 
 	RegSpan* FindSpan(Sh4RegType reg, u32 opid)
@@ -730,73 +758,122 @@ struct RegAlloc
 		//Allocate the registers to the spans !
 		for (size_t opid=0;opid<block->oplist.size();opid++)
 		{
-			bool alias_mov=false;
+			RegSpan* alias_src=0;
+			RegSpan* alias_dst=0;
 
-			if (block->oplist[opid].op==shop_mov32 && 
-				( 
-				(block->oplist[opid].rd.is_r32i() && block->oplist[opid].rs1.is_r32i() ) || 
+			if (opt_alias_mov && block->oplist[opid].op==shop_mov32 &&
+				(
+				(block->oplist[opid].rd.is_r32i() && block->oplist[opid].rs1.is_r32i() ) ||
 				(block->oplist[opid].rd.is_r32f() && block->oplist[opid].rs1.is_r32f() )
 				))
 			{
-				//FindSpan(block->oplist[opid].rd._reg);
 				RegSpan* x=FindSpan(block->oplist[opid].rs1._reg,(u32)opid);
-				if (0 && x->nacc_w(opid)==-1 && (x->nreg!=-1 || x->nregf!=-1) && !x->aliased)
+				RegSpan* d=FindSpan(block->oplist[opid].rd._reg,(u32)opid);
+
+				//src must never be written again (the shared reg holds both
+				//values until one dies), and dst must not be written again
+				//until strictly after src's end: src's writeback runs at OpEnd
+				//of its last op, after that op's body has already stored dst
+				//into the shared reg.
+				if (x!=d && !x->aliased && x->nacc_w((int)opid)==-1)
 				{
-					RegSpan* d=FindSpan(block->oplist[opid].rd._reg,opid);
-					int nwa=d->nacc_w(opid);
+					int nwa=d->nacc_w((int)opid);
 
-					if (nwa==-1 || nwa>=x->end)
+					if (nwa==-1 || nwa>(int)x->end)
 					{
-
 						verify(d->fpr==x->fpr);
-						d->nreg=x->nreg;
-						d->nregf=x->nregf;
-						//x->aliased=true;
+						verify(d->begining((int)opid) && !d->preload);
 
-						verify(d->begining(opid) && !d->preload);
-						//verify(d->end>=x->end);
-
+						//exactly one of the pair returns the shared reg to the pool
 						if (d->end>=x->end)
 							x->aliased=true;
 						else
 							d->aliased=true;
 
-						//printf("[%08X] rALIA %d from %d\n",spn,spn->regstart,spn->nreg);
-						alias_mov=true;
+						alias_src=x;
+						alias_dst=d;
+						//printf("rALIA %d from %d\n",d->regstart,x->regstart);
 					}
 				}
 			}
 
-			if (!alias_mov)
+			if (opt_reuse_dead)
 			{
+				//return regs dying at this op to the back of the pool before
+				//allocating, so the op's dests (allocated from the back) take
+				//them over first
 				for (u32 sid=0;sid<all_spans.size();sid++)
 				{
 					RegSpan* spn=all_spans[sid];
 
-					if (spn->begining((int)opid))
+					if (CanFreeEarly(spn,(int)opid))
 					{
-						if (spn->fpr)
-						{
-							verify(regsf.size()>0);
-							spn->nregf=regsf.back();
-							regsf.pop_back();
-						}
-						else
-						{
-							verify(regs.size()>0);
-							spn->nreg=regs.back();
-							regs.pop_back();
+						spn->freed_early=true;
 
-							//printf("rALOC %d from %d\n",spn->regstart,spn->nreg);
-						}
+						if (spn->fpr)
+							regsf.push_back(spn->nregf);
+						else
+							regs.push_back(spn->nreg);
 					}
 				}
 			}
+
 			for (u32 sid=0;sid<all_spans.size();sid++)
 			{
 				RegSpan* spn=all_spans[sid];
 
-				if ( spn->ending((int)opid) && !spn->aliased)
+				if (spn->begining((int)opid) && spn!=alias_dst)
+				{
+					//preloads run at OpBegin, before this op's body reads the
+					//dying regs freed above: serve them from the front so the
+					//just-died regs only go to write-first (dest) spans
+					bool from_front=opt_reuse_dead && spn->preload;
+
+					if (spn->fpr)
+					{
+						verify(regsf.size()>0);
+						if (from_front)
+						{
+							spn->nregf=regsf.front();
+							regsf.pop_front();
+						}
+						else
+						{
+							spn->nregf=regsf.back();
+							regsf.pop_back();
+						}
+					}
+					else
+					{
+						verify(regs.size()>0);
+						if (from_front)
+						{
+							spn->nreg=regs.front();
+							regs.pop_front();
+						}
+						else
+						{
+							spn->nreg=regs.back();
+							regs.pop_back();
+						}
+
+						//printf("rALOC %d from %d\n",spn->regstart,spn->nreg);
+					}
+				}
+			}
+
+			if (alias_dst)
+			{
+				//src is allocated by now even if its own span starts at this op
+				alias_dst->nreg=alias_src->nreg;
+				alias_dst->nregf=alias_src->nregf;
+			}
+
+			for (u32 sid=0;sid<all_spans.size();sid++)
+			{
+				RegSpan* spn=all_spans[sid];
+
+				if ( spn->ending((int)opid) && !spn->aliased && !spn->freed_early)
 				{
 					if (spn->fpr)
 					{
