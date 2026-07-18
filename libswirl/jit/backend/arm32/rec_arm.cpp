@@ -268,6 +268,13 @@ eFSReg alloc_fpu[]={f16,f17,f18,f19,f20,f21,f22,f23,
 
 struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 {
+	arm_reg_alloc()
+	{
+		//every emitter in this backend reads its mapped sources before writing
+		//any mapped dest, so dests may share a host reg with a dying source
+		opt_alias_mov=true;
+		opt_reuse_dead=true;
+	}
 
 	virtual eFSReg FpuMap(u32 reg)
 	{
@@ -1121,7 +1128,8 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 						break;
 
 					case 3: //vfp=vfp
-						VMOV(reg.mapfs(op->rd),reg.mapfs(op->rs1));
+						if (reg.mapfs(op->rd)!=reg.mapfs(op->rs1))
+							VMOV(reg.mapfs(op->rd),reg.mapfs(op->rs1));
 						break;
 					}
 				}
@@ -1217,8 +1225,8 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 					LSR(reg.mapg(op->rd2),reg.mapg(op->rs2),1,true); //C=rs2, rd2=0
 					AND(reg.mapg(op->rd2),reg.mapg(op->rs1),1);      //get new carry
 				} else {
-					LSR(r0,reg.mapg(op->rs2),1,true); //C=rs2, rd2=0
-					ADD(r0, reg.mapg(op->rs1),1);
+					LSR(r0,reg.mapg(op->rs2),1,true); //C=rs2
+					AND(r0, reg.mapg(op->rs1),1);     //get new carry
 				}
 				RRX(reg.mapg(op->rd),reg.mapg(op->rs1));         //RRX w/ carry :)
 				if (reg.mapg(op->rd2)==reg.mapg(op->rs1))
@@ -1239,10 +1247,24 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 		case shop_sbc:
 			//printf("sbc: r%d r%d r%d r%d r%d\n",reg.mapg(op->rd),reg.mapg(op->rd2),reg.mapg(op->rs1),reg.mapg(op->rs2), reg.mapg(op->rs3));
 			{
-				EOR(reg.mapg(op->rd2),reg.mapg(op->rs3),1);
-				LSR(reg.mapg(op->rd2),reg.mapg(op->rd2),1,true); //C=rs3, rd2=0
-				SBC(reg.mapg(op->rd), reg.mapg(op->rs1), reg.mapg(op->rs2), true);
-				MOV(reg.mapg(op->rd2), 1, CC_CC);
+				eReg rd2=reg.mapg(op->rd2);
+				if (rd2==reg.mapg(op->rs1) || rd2==reg.mapg(op->rs2))
+				{
+					//rd2 shares a host reg with a source: prep the carry in r0
+					//and write rd2 only after SBC has consumed rs1/rs2
+					EOR(r0,reg.mapg(op->rs3),1);
+					LSR(r0,r0,1,true); //C=rs3
+					SBC(reg.mapg(op->rd), reg.mapg(op->rs1), reg.mapg(op->rs2), true);
+					MOVW(rd2,0);
+					MOV(rd2, 1, CC_CC);
+				}
+				else
+				{
+					EOR(rd2,reg.mapg(op->rs3),1);
+					LSR(rd2,rd2,1,true); //C=rs3, rd2=0
+					SBC(reg.mapg(op->rd), reg.mapg(op->rs1), reg.mapg(op->rs2), true);
+					MOV(rd2, 1, CC_CC);
+				}
 			}
 			break;
 		
@@ -1281,11 +1303,12 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 		case shop_div32p2:
 		{
-			if (reg.mapg(op->rs1)!=reg.mapg(op->rd))
-				MOV(reg.mapg(op->rd),reg.mapg(op->rs1));
-
+			//rd=rs3==0 ? rs1-rs2 : rs1, with all sources read before rd is
+			//written so rd may share a host reg with any of them
 			CMP(reg.mapg(op->rs3),0);
-			SUB(reg.mapg(op->rd),reg.mapg(op->rd),reg.mapg(op->rs2),CC_EQ);
+			SUB(reg.mapg(op->rd),reg.mapg(op->rs1),reg.mapg(op->rs2),CC_EQ);
+			if (reg.mapg(op->rs1)!=reg.mapg(op->rd))
+				MOV(reg.mapg(op->rd),reg.mapg(op->rs1),CC_NE);
 		}
 		break;
 
@@ -1296,12 +1319,6 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 		case shop_setae:
 		case shop_setab:
 		{
-			verify(op->rd._reg!=op->rs1._reg);
-			verify(op->rs2.is_imm() || op->rd._reg!=op->rs2._reg);
-
-			//rd is always NOT a source !
-			MOVW(reg.mapg(op->rd),0);
-
 			eReg rs2=r0;
 			bool is_imm=false;
 
@@ -1340,6 +1357,9 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 			eCC opcls2[]={CC_EQ,CC_EQ,CC_GE,CC_GT,CC_HS,CC_HI };
 
+			//rd is written after the compare (MOVW leaves flags alone), so it
+			//may share a host reg with rs1/rs2
+			MOVW(reg.mapg(op->rd),0);
 		    MOVW(reg.mapg(op->rd),1,opcls2[op->op-shop_test]);
 		    break;
         }

@@ -300,6 +300,8 @@ set_property(TARGET ${APP_NAME}.elf PROPERTY CXX_STANDARD 17)
 target_compile_definitions(${APP_NAME}.elf PRIVATE  TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP HOST_NO_THREADS FAUX96 FEAT_HAS_SERIAL_TTY=0)
 target_include_directories(${APP_NAME}.elf PRIVATE ${swrl} ${swrl}/deps ${swrl}/deps/vixl)
 target_link_libraries(${APP_NAME}.elf PRIVATE stdc++ rt pthread)
+add_subdirectory(${CMAKE_SOURCE_DIR}/../tests ${CMAKE_BINARY_DIR}/tests)
+
 if (X11_FOUND)
     target_include_directories(${APP_NAME}.elf PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(${APP_NAME}.elf PRIVATE ${X11_LIBRARIES})
