@@ -24,6 +24,10 @@
 #include <stdint.h>
 #include <limits.h>
 
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "tacore.h"
 #include "hw/pvr/pvr_regs.h"
 #include "hw/pvr/pvr_mem.h"
@@ -310,39 +314,35 @@ void lxd_ta_init(u8* vram) {
     ta_status.polybuf_start = TA_ISP_BASE & 0x00F00000; // MMIO_READ( PVR2, TA_POLYBASE )
 }
 
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+/* Branchless in the NEON pipe: the scalar versions pay an inf-check vmov plus
+ * two vcmpe+vmrs flag transfers per channel, each serializing the core
+ * against the FPU on the A9.
+ *  - 256*c-1 via vmla is chained mul+add (no NEON fma on the A9), bit-equal
+ *    to the scalar expression; vcvt truncates toward zero like the scalar
+ *    int conversion
+ *  - +inf saturates to INT_MAX then clamps to 255 (the TA_IS_INF value);
+ *    -inf / c<=0 land at -1 or below and clamp to 0
+ *  - lanes are packed {b,g,r,a} so two narrows produce the ARGB word
+ * (+NaN becomes 0 instead of the inf-macro's 255 - garbage input either way.)
+ */
 static uint32_t parse_float_colour( float a, float r, float g, float b ) {
-    int ai,ri,gi,bi;
-
-    if( TA_IS_INF(a) ) {
-        ai = 255;
-    } else {
-        ai = 256 * CLAMP(a,0.0,1.0) - 1;
-        if( ai < 0 ) ai = 0;
-    }
-    if( TA_IS_INF(r) ) {
-        ri = 255;
-    } else {
-        ri = 256 * CLAMP(r,0.0,1.0) - 1;
-        if( ri < 0 ) ri = 0;
-    }
-    if( TA_IS_INF(g) ) {
-        gi = 255;
-    } else {
-        gi = 256 * CLAMP(g,0.0,1.0) - 1;
-        if( gi < 0 ) gi = 0;
-    }
-    if( TA_IS_INF(b) ) {
-        bi = 255;
-    } else {
-        bi = 256 * CLAMP(b,0.0,1.0) - 1;
-        if( bi < 0 ) bi = 0;
-    }
-    return (ai << 24) | (ri << 16) | (gi << 8) | bi;
+    float32x4_t v = { b, g, r, a };
+    int32x4_t t = vcvtq_s32_f32(vmlaq_n_f32(vdupq_n_f32(-1.0f), v, 256.0f));
+    t = vmaxq_s32(t, vdupq_n_s32(0));
+    t = vminq_s32(t, vdupq_n_s32(255));
+    uint16x4_t n16 = vmovn_u32(vreinterpretq_u32_s32(t));
+    uint8x8_t n8 = vmovn_u16(vcombine_u16(n16, n16));
+    return vget_lane_u32(vreinterpret_u32_u8(n8), 0);
 }
 
 static uint32_t parse_intensity_colour( uint32_t base, float intensity )
 {
-    unsigned int i = (unsigned int)(256 * CLAMP(intensity, 0.0,1.0));
+    /* NEON vmax/vmin propagate NaN, and vcvt.u32 sends NaN to 0 - same
+     * result as the scalar CLAMP + convert. */
+    float32x2_t v = vmax_f32(vdup_n_f32(intensity), vdup_n_f32(0.0f));
+    v = vmin_f32(v, vdup_n_f32(1.0f));
+    unsigned int i = vget_lane_u32(vcvt_u32_f32(vmul_n_f32(v, 256.0f)), 0);
 
     return
     (((((base & 0xFF) * i) & 0xFF00) |
@@ -350,6 +350,48 @@ static uint32_t parse_intensity_colour( uint32_t base, float intensity )
             (((base & 0xFF0000) * i) & 0xFF000000)) >> 8) |
             (base & 0xFF000000);
 }
+#else
+static uint32_t parse_float_colour( float a, float r, float g, float b ) {
+    int ai,ri,gi,bi;
+
+    if( TA_IS_INF(a) ) {
+        ai = 255;
+    } else {
+        ai = 256 * CLAMP(a,0.0f,1.0f) - 1;
+        if( ai < 0 ) ai = 0;
+    }
+    if( TA_IS_INF(r) ) {
+        ri = 255;
+    } else {
+        ri = 256 * CLAMP(r,0.0f,1.0f) - 1;
+        if( ri < 0 ) ri = 0;
+    }
+    if( TA_IS_INF(g) ) {
+        gi = 255;
+    } else {
+        gi = 256 * CLAMP(g,0.0f,1.0f) - 1;
+        if( gi < 0 ) gi = 0;
+    }
+    if( TA_IS_INF(b) ) {
+        bi = 255;
+    } else {
+        bi = 256 * CLAMP(b,0.0f,1.0f) - 1;
+        if( bi < 0 ) bi = 0;
+    }
+    return (ai << 24) | (ri << 16) | (gi << 8) | bi;
+}
+
+static uint32_t parse_intensity_colour( uint32_t base, float intensity )
+{
+    unsigned int i = (unsigned int)(256 * CLAMP(intensity, 0.0f,1.0f));
+
+    return
+    (((((base & 0xFF) * i) & 0xFF00) |
+            (((base & 0xFF00) * i) & 0xFF0000) |
+            (((base & 0xFF0000) * i) & 0xFF000000)) >> 8) |
+            (base & 0xFF000000);
+}
+#endif
 
 /**
  * Initialize the specified TA list.
@@ -632,23 +674,42 @@ static void ta_commit_polygon( ) {
     /* Compute the tile coordinates for each vertex (need to be careful with
      * clamping here)
      */
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+    /* Branchless, entirely inside the NEON pipe: the scalar version's four
+     * vcmpe+vmrs flag transfers per vertex serialize the core against the
+     * FPU on the A9 and dominate this loop.
+     *  - x/32.0f is exact (power of two), so (int)(x/32.0f) == ((int)x)>>5
+     *  - vcvt saturates: +inf/huge -> INT_MAX, and INT_MAX>>5 == INT_MAX/32,
+     *    exactly the explicit clamp
+     *  - v < 0 (including -inf) forces -1 via the compare mask
+     * (NaNs become 0 instead of the inf-macro clamps - nominal under
+     * -ffast-math either way.)
+     */
     for( i=0; i<ta_status.vertex_count; i++ ) {
-        if( ta_status.poly_vertex[i].x < 0.0 || TA_IS_NINF(ta_status.poly_vertex[i].x) ) {
+        float32x2_t v = vld1_f32(&ta_status.poly_vertex[i].x);
+        int32x2_t t = vshr_n_s32(vcvt_s32_f32(v), 5);
+        t = vorr_s32(t, vreinterpret_s32_u32(vclt_f32(v, vdup_n_f32(0.0f))));
+        vst1_lane_s32(&tx[i], t, 0);
+        vst1_lane_s32(&ty[i], t, 1);
+    }
+#else
+    for( i=0; i<ta_status.vertex_count; i++ ) {
+        if( ta_status.poly_vertex[i].x < 0.0f || TA_IS_NINF(ta_status.poly_vertex[i].x) ) {
             tx[i] = -1;
         } else if( ta_status.poly_vertex[i].x > (float)INT_MAX || TA_IS_INF(ta_status.poly_vertex[i].x) ) {
             tx[i] = INT_MAX/32;
         } else {
-            tx[i] = (int)(ta_status.poly_vertex[i].x / 32.0);
+            tx[i] = (int)(ta_status.poly_vertex[i].x / 32.0f);
         }
-        if( ta_status.poly_vertex[i].y < 0.0 || TA_IS_NINF(ta_status.poly_vertex[i].y)) {
+        if( ta_status.poly_vertex[i].y < 0.0f || TA_IS_NINF(ta_status.poly_vertex[i].y)) {
             ty[i] = -1;
         } else if( ta_status.poly_vertex[i].y > (float)INT_MAX || TA_IS_INF(ta_status.poly_vertex[i].y) ) {
             ty[i] = INT_MAX/32;
         } else {
-            ty[i] = (int)(ta_status.poly_vertex[i].y / 32.0);
+            ty[i] = (int)(ta_status.poly_vertex[i].y / 32.0f);
         }
-
     }
+#endif
 
     /* Compute bounding box for each triangle individually, as well
      * as the overall polygon.
