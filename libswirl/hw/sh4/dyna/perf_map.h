@@ -1,0 +1,35 @@
+/*
+	This file is part of libswirl
+*/
+#include "license/bsd"
+
+#pragma once
+
+#include "types.h"
+
+/*
+	Writes a text map of jit blocks (runtime address, size, guest pc) so that
+	dynarec frames can be symbolized after a perf run.
+
+	perf will not consume this itself. The usual /tmp/perf-<pid>.map fallback only
+	applies to addresses in *anonymous* executable mappings, and our code cache
+	lives inside SH4_TCB, a static array in .text of the main binary -- so perf
+	resolves jit addresses against minicast.elf and never reads the map. jitdump
+	does not work either: perf inject --jit fails to decode a MiSTer-recorded
+	perf.data on a different host arch.
+
+	Instead, tools/symbolize_perf.py joins `perf script` text output against this
+	map, which avoids perf's symbolization path entirely.
+
+	Set MINICAST_PERF_MAP to enable. An absolute path is used as-is, anything else
+	falls back to /tmp/perf-<pid>.map.
+
+	Usage:
+		MINICAST_PERF_MAP=/tmp/jit.map ./minicast.elf ...
+		perf record -F 999 -g --tid <tid> ...
+		perf script -i perf.data -F ip,sym,dso > samples.txt
+		tools/symbolize_perf.py samples.txt /tmp/jit.map minicast.elf
+*/
+void perf_map_Init();
+void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr);
+void perf_map_Term();

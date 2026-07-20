@@ -106,6 +106,7 @@ list(APPEND _sources
     ${swrl}/hw/sh4/sh4_mmr.cpp
     ${swrl}/hw/sh4/dyna/blockmanager.cpp
     ${swrl}/hw/sh4/dyna/driver.cpp
+    ${swrl}/hw/sh4/dyna/perf_map.cpp
     ${swrl}/hw/sh4/dyna/blockmanager-extras.cpp
     ${swrl}/hw/sh4/dyna/shil.cpp
     ${swrl}/hw/sh4/dyna/decoder.cpp

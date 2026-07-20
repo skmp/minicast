@@ -23,6 +23,7 @@
 #include "blockmanager.h"
 #include "ngen.h"
 #include "decoder.h"
+#include "perf_map.h"
 
 #define bm_printf(...)
 
@@ -263,6 +264,9 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 
 		verify(rbi->code!=0);
 
+		// perf samples the rx mapping, rbi->code is rw
+		perf_map_AddBlock((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi->addr);
+
 		bool doLock = !bm_RamPageHasData(rbi->addr, rbi->sh4_code_size); // && maybe some setting?
 
 		bm_AddBlock(rbi, doLock);
@@ -490,7 +494,9 @@ struct recSH4 : SuperH4Backend {
     bool Init()
     {
         printf("recSh4 Init\n");
-        
+
+        perf_map_Init();
+
         bm_Init();
         bm_Reset();
 
@@ -526,6 +532,7 @@ struct recSH4 : SuperH4Backend {
     {
         printf("recSh4 Term\n");
         bm_Term();
+        perf_map_Term();
     }
 };
 
