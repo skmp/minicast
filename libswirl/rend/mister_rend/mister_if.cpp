@@ -76,14 +76,26 @@ bool rend_render_done() {
     return false;
 }
 
+void startpolly() {
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    polly2_go();
+}
+
 void rend_start_render(u8* vram) {
     if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
-        ta_ring_publish();
-        auto goal = ta_contexts[CORE_CURRENT_CTX];
+        // ta_ring_publish();
+        // auto goal = ta_contexts[CORE_CURRENT_CTX];
 
-        while (goal > ta_eol_interrupt_mark) {
-            ;
-        }
+        // while (goal > ta_eol_interrupt_mark) {
+        //     ;
+        // }
+
+        DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
+        (u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
+        ring_op[2] = TA_RING_DECOUPLED_OP_STARTPOLLY;
+        ta_ring_push(ring_op);
+        ta_ring_publish();
     }
 
     // freerunning: REP polls for real completion; FPSTarget pacing only
@@ -95,9 +107,9 @@ void rend_start_render(u8* vram) {
         SetREP(200000000/settings.pvr.FPSTarget);
     }
 	
-	__asm__ volatile("dsb sy" ::: "memory");
-
-    polly2_go();
+    if (settings.pvr.MultithreadedTA != TA_MTTA_DECOUPLED) {
+        startpolly();
+    }
 
 	DelayTime = RenderTime;
 	RenderTime = now_ns();

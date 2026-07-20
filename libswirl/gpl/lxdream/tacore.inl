@@ -1269,6 +1269,11 @@ static void pvr2_ta_process_block( unsigned char *input ) {
             case TA_RING_DECOUPLED_OP_SOFTRESET:
                 lxd_ta_reset();
                 break;
+            case TA_RING_DECOUPLED_OP_STARTPOLLY:
+                void startpolly();
+                startpolly();
+                break;
+
             default:
                 die("Bad ta_ring packet");
         }
