@@ -1988,7 +1988,9 @@ struct Arm32NGenBackend: NGenBackend
 			STR(r1,r0);
 		}
 		//pre-load the first reg alloc operations, for better efficiency ..
+		block->host_preload0=(u8*)EMIT_GET_PTR()-blk_start;
 		reg.OpBegin(&block->oplist[0],0);
+		block->host_preload0_end=(u8*)EMIT_GET_PTR()-blk_start;
 
 		//scheduler
 		switch (smc_checks) {
@@ -2102,7 +2104,11 @@ struct Arm32NGenBackend: NGenBackend
 			if (i!=0)
 				reg.OpBegin(op,i);
 
+			op->host_body=(u8*)EMIT_GET_PTR()-blk_start;
+
 			ngen_compile_opcode(block,op,staging,optimise);
+
+			op->host_body_end=(u8*)EMIT_GET_PTR()-blk_start;
 
 			if (xmtrx_resident && op_kills_xmtrx(op))
 				xmtrx_resident=false;

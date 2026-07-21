@@ -60,6 +60,11 @@ struct RuntimeBlockInfo: RuntimeBlockInfo_Core
 	// backwards-only cycle check must not treat it as provably forward.
 	bool static_from_constprop;
 
+	// op 0's regalloc preloads are emitted before the smc/cycle-check code;
+	// this range lets the shop map attribute them (per-shop profiling only)
+	u16 host_preload0;
+	u16 host_preload0_end;
+
 	vector<shil_opcode> oplist;
 
 	bool contains_code(u8* ptr)

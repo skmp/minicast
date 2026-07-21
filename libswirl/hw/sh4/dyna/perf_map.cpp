@@ -124,21 +124,37 @@ void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block)
 	fprintf(shop_map_file, "block %lx %x %08X %x\n",
 		(unsigned long)code, host_code_size, block->addr, block->relink_offset);
 
+	// op 0's preloads are hoisted above the smc/cycle-check code; give them
+	// their own row so the sched/smc part of the prologue stands alone
+	if (block->host_preload0_end > block->host_preload0)
+		fprintf(shop_map_file, "op %x <regalloc>\n", block->host_preload0);
+	fprintf(shop_map_file, "op %x <sched/smc>\n", block->host_preload0_end);
+
 	// host_offs is relative to block->code, which is what the block line records,
 	// so the offsets need no adjustment here. They come out of the emitter in
-	// emission order, i.e. already ascending.
+	// emission order, i.e. already ascending. Each op splits into regalloc
+	// preload [host_offs,host_body), the body itself, and writebacks from
+	// host_body_end to whatever comes next.
 	for (size_t i = 0; i < block->oplist.size(); i++)
 	{
 		shil_opcode& op = block->oplist[i];
 
+		if (op.host_body > op.host_offs)
+			fprintf(shop_map_file, "op %x <regalloc>\n", op.host_offs);
+
 		if (op.op == shop_readm || op.op == shop_writem)
-			fprintf(shop_map_file, "op %x %s.%s%s\n", op.host_offs, shil_opcode_name(op.op),
+			fprintf(shop_map_file, "op %x %s.%s%s\n", op.host_body, shil_opcode_name(op.op),
 				memop_kind(op),
 				(op.op == shop_writem && op.flags2 == 0x1337) ? ".sq" : "");
 		else if (op.op == shop_mov32)
-			fprintf(shop_map_file, "op %x mov32.%s\n", op.host_offs, mov32_kind(op));
+			fprintf(shop_map_file, "op %x mov32.%s\n", op.host_body, mov32_kind(op));
 		else
-			fprintf(shop_map_file, "op %x %s\n", op.host_offs, shil_opcode_name(op.op));
+			fprintf(shop_map_file, "op %x %s\n", op.host_body, shil_opcode_name(op.op));
+
+		u16 next = (i + 1 < block->oplist.size()) ? block->oplist[i + 1].host_offs
+		                                          : (u16)block->relink_offset;
+		if (next > op.host_body_end)
+			fprintf(shop_map_file, "op %x <regalloc>\n", op.host_body_end);
 	}
 
 	fflush(shop_map_file);

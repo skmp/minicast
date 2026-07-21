@@ -137,3 +137,24 @@ static inline void ta_ring_drain()
 
 void ta_ring_consumer_start(u8* vram);
 void ta_ring_consumer_start_decoupled(u8* vram);
+
+// Pin the calling thread to one core: sh4/producer on cpu0, ta consumer on
+// cpu1, so the SPSC hand-off above always runs core-to-core instead of
+// migrating and false-sharing. Raw syscall: the CPU_SET macros need
+// _GNU_SOURCE before the first glibc header, which this build doesn't define.
+#if HOST_OS == OS_LINUX
+#include <unistd.h>
+#include <sys/syscall.h>
+
+static inline void ta_ring_pin_thread(int cpu)
+{
+	unsigned long mask = 1ul << cpu;
+
+	if (syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask) != 0)
+		printf("ta_ring: failed to pin thread to cpu%d\n", cpu);
+	else
+		printf("ta_ring: pinned thread to cpu%d\n", cpu);
+}
+#else
+static inline void ta_ring_pin_thread(int cpu) { }
+#endif

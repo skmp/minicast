@@ -194,6 +194,8 @@ struct shil_opcode
 	shil_param rd, rd2, rs1, rs2, rs3;
 	u16 host_offs = 0;
 	u16 guest_offs = 0;
+	u16 host_body = 0;
+	u16 host_body_end = 0;
 };
 
 struct RuntimeBlockInfo

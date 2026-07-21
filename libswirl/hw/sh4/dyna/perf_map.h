@@ -44,6 +44,11 @@
 	ascending; an op runs until the next op's offset, the last until the relink
 	offset. Code before the first op (prologue) and from relink-offs to size
 	(block exit) belongs to no shop.
+
+	Regalloc-emitted code (OpBegin preloads / OpEnd writebacks) is reported as
+	its own synthetic shop, <regalloc>, and the smc/cycle-check prologue as
+	<sched/smc>, so the fixed per-block overhead and the allocator's spill
+	traffic can be read separately from the op bodies.
 */
 struct RuntimeBlockInfo;
 

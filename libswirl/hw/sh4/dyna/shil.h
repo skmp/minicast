@@ -157,6 +157,10 @@ struct shil_opcode
 
 	u16 host_offs;
 	u16 guest_offs;
+	//sub-offsets for per-shop profiling: [host_offs,host_body) is regalloc
+	//preload, [host_body,host_body_end) the op body, then writebacks follow
+	u16 host_body;
+	u16 host_body_end;
 
 	string dissasm();
 };

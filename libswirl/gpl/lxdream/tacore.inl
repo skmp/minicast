@@ -1455,6 +1455,8 @@ void lxd_ta_write_burst( sh4addr_t addr, unsigned char *data )
     write_cache so an empty ring is detected without touching the producer's line.
 */
 static void* ta_ring_consumer_thread(void* /*param*/) {
+    ta_ring_pin_thread(1);
+
     for (;;) {
         // Fast empty check against our private cache first.
         u32 rd = ta_ring.read_pub;

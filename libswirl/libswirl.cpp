@@ -751,6 +751,9 @@ struct Dreamcast_impl : VirtualDreamcast {
 #ifndef TARGET_DISPFRAME
     void MainLoop()
     {
+        // sh4/producer on cpu0; the mtta consumer pins itself to cpu1
+        ta_ring_pin_thread(0);
+
 #if FEAT_HAS_NIXPROF
         install_prof_handler(0);
 #endif
