@@ -229,7 +229,9 @@ void _vmem_release(VLockedMemory* mram, VLockedMemory* vram, VLockedMemory* aica
 //dynarec helpers
 void _vmem_get_ptrs(u32 sz,bool write,void*** vmap,void*** func);
 void* _vmem_get_ptr2(u32 addr,u32& mask);
-void* _vmem_read_const(u32 addr,bool& ismem,u32 sz);
+//For handler regions (ismem==false) *ctx_out receives the context the handler
+//was registered with -- callers emitting a call must pass it as the first arg.
+void* _vmem_read_const(u32 addr,bool& ismem,u32 sz,void** ctx_out=nullptr);
 
 extern u8* virt_ram_base;
 

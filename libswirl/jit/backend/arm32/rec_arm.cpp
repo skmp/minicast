@@ -574,7 +574,7 @@ struct CC_PS
 };
 vector<CC_PS> CC_pars;
 
-void* _vmem_read_const(u32 addr,bool& ismem,u32 sz);
+void* _vmem_read_const(u32 addr,bool& ismem,u32 sz,void** ctx_out);
 void* _vmem_page_info(u32 addr,bool& ismem,u32 sz,u32& page_sz, bool rw);
 
 
@@ -794,7 +794,8 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 			if (op->rs1.is_imm())
 			{
 				bool isram=false;
-				void* ptr=_vmem_read_const(op->rs1._imm,isram,memop_bytes(optp));
+				void* handler_ctx=nullptr;
+				void* ptr=_vmem_read_const(op->rs1._imm,isram,memop_bytes(optp),&handler_ctx);
 				
 				verify(optp!=SZ_64F);
 
@@ -868,9 +869,11 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 						break;
 					}
 				} 
-				else 
+				else
 				{
-					MOV32(r0, (uintptr_t)sh4_cpu);
+					//handlers take (ctx, addr); ctx is whatever the region
+					//was registered with (mmr, vram, ...), NOT sh4_cpu
+					MOV32(r0, (uintptr_t)handler_ctx);
 					MOV32(r1,op->rs1._imm);
 
 					switch(optp)

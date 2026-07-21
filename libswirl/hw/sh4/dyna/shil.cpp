@@ -52,8 +52,8 @@ bool isdst(shil_opcode* op,Sh4RegType rd)
 }
 
 //really hacky ~
-//Isn't this now obsolete anyway ? (constprop pass should include it ..)
-// -> constprop has some small stability issues still, not ready to be used on ip/bios fully yet
+//Obsolete: constprop() subsumes this (address promotion for any base reg, not just r0).
+//Kept around for reference only; no callers.
 void PromoteConstAddress(RuntimeBlockInfo* blk)
 {
 	bool is_const=false;
@@ -383,167 +383,441 @@ void rw_related(RuntimeBlockInfo* blk)
 }
 
 
-//constprop
-void constprop(RuntimeBlockInfo* blk)
+//-----------------------------------------------------------------------------
+// Constant propagation
+//
+// Modeled on nullDC's shil_optimise_pass_ce_main (shil_ce.cpp): a forward walk
+// over the block that tracks known-constant values of r0..r15 and rebuilds the
+// opcode stream as it goes.  An opcode whose result is fully known is dropped
+// and its destination just becomes a tracked constant; when a later opcode
+// needs the real register (or the block ends) the constant is materialized
+// ("written back") as a mov32 right before it.  Sources are rewritten to
+// immediate form only where the arm32 backend accepts immediates:
+//   - rs2 of add/sub/and/or/xor/shl/shr/sar/ror/test/set*/jdyn
+//   - rs1 of readm (rs3 folded in; 16/32-bit only)
+//   - rs3 of readm/writem
+//   - rs1 of mov32 (f32 destinations only for 0/0x3F800000)
+// Notably NOT: shld/shad rs2 (converted to shl/shr/sar instead), writem
+// rs1/rs2, and rs1 of everything else.
+//
+// Memory reads are folded to compile-time constants ("baked") only when every
+// page of [addr, addr+size) belongs to the block's own locked code pages: any
+// write there faults and discards this block (bm_LockedWrite), which is the
+// same guarantee the block's own code relies on.  Baking stops at the first
+// opcode that may store to those pages (writem with unknown or overlapping
+// target, ifb, pref) -- past that point this very block could have modified
+// the data mid-execution, like nullDC's is_writem_safe/shil_ce_is_locked.
+//-----------------------------------------------------------------------------
+
+struct constprop_pass
 {
-	u32 rv[16];
-	bool isi[16]={0};
+	RuntimeBlockInfo* blk;
+	vector<shil_opcode> out;
 
-	for (size_t i=0;i<blk->oplist.size();i++)
+	u32  val[16];     //known value, if konst
+	bool konst[16];
+	u32  rb_val[16];  //value the register really holds in the emitted stream
+	bool rb[16];      //rb_val is valid
+
+	bool locked;      //no possibly-self-modifying store seen yet
+	bool baking_ok;   //block runs from ram and its pages will be locked
+	bool allow_baking;
+
+	u16 cur_guest_offs;
+
+	static bool tracked(const shil_param& p) { return p.is_r32i() && p._reg<16; }
+	bool is_const(const shil_param& p) { return tracked(p) && konst[p._reg]; }
+	u32 cval(const shil_param& p) { return val[p._reg]; }
+
+	static shil_param mk_immp(u32 v) { shil_param p; p.type=FMT_IMM; p._imm=v; return p; }
+	static shil_param mk_regp(u32 r) { shil_param p; p.type=FMT_I32; p._reg=(Sh4RegType)r; return p; }
+
+	void kill(const shil_param& p) { if (tracked(p)) { konst[p._reg]=false; rb[p._reg]=false; } }
+
+	//rb/rb_val deliberately survive a value change: if the register already
+	//holds the new value in the emitted stream the next writeback is free
+	void set_const(const shil_param& p, u32 v) { konst[p._reg]=true; val[p._reg]=v; }
+
+	void push(const shil_opcode& o) { out.push_back(o); }
+
+	void emit_mov32(const shil_param& rd, u32 v)
 	{
-		shil_opcode* op=&blk->oplist[i];
+		shil_opcode o{};
+		o.op=shop_mov32;
+		o.rd=rd;
+		o.rs1=mk_immp(v);
+		o.guest_offs=cur_guest_offs;
+		push(o);
+	}
 
-		if (op->rs2.is_r32i() && op->rs2._reg<16 && isi[op->rs2._reg])
+	void writeback(u32 r)
+	{
+		if (!konst[r]) return;
+		if (rb[r] && rb_val[r]==val[r]) return;
+		emit_mov32(mk_regp(r),val[r]);
+		rb[r]=true;
+		rb_val[r]=val[r];
+	}
+	void writeback(const shil_param& p) { if (tracked(p)) writeback(p._reg); }
+	void writeback_range(u32 first, u32 last) { for (u32 r=first;r<=last;r++) writeback(r); }
+	void kill_range(u32 first, u32 last) { for (u32 r=first;r<=last;r++) { konst[r]=false; rb[r]=false; } }
+
+	//default handling: sources must hold their real values, dests lose any const
+	void fallback(shil_opcode& o)
+	{
+		writeback(o.rs1);
+		writeback(o.rs2);
+		writeback(o.rs3);
+		push(o);
+		kill(o.rd);
+		kill(o.rd2);
+	}
+
+	//result fully known: track it if we can, else emit it as a mov32
+	void set_or_mov32(const shil_param& rd, u32 v)
+	{
+		if (tracked(rd))
 		{
-			/*
-				not all opcodes can take rs2 as constant
-			*/
-			if (op->op!=shop_readm && op->op!=shop_writem 
-				&& op->op!=shop_mul_u16 && op->op!=shop_mul_s16 && op->op!=shop_mul_i32 
-				&& op->op!=shop_mul_u64 && op->op!=shop_mul_s64 
-				&& op->op!=shop_adc && op->op!=shop_sbc)
+			set_const(rd,v);
+			return;
+		}
+		verify(rd.is_r32i());
+		emit_mov32(rd,v);
+	}
+
+	//does [addr,addr+size) live entirely on the block's own (lockable) pages?
+	bool on_block_pages(u32 addr, u32 size)
+	{
+		if (!IsOnRam(addr)) return false;
+		u32 pf=(addr&RAM_MASK)/PAGE_SIZE;
+		u32 pl=((addr+size-1)&RAM_MASK)/PAGE_SIZE;
+		u32 bf=(blk->addr&RAM_MASK)/PAGE_SIZE;
+		u32 bl=((blk->addr+blk->sh4_code_size-1)&RAM_MASK)/PAGE_SIZE;
+		return pf>=bf && pl<=bl;
+	}
+
+	bool write_may_hit_block_pages(u32 addr, u32 size)
+	{
+		if (!IsOnRam(addr)) return false;
+		u32 pf=(addr&RAM_MASK)/PAGE_SIZE;
+		u32 pl=((addr+size-1)&RAM_MASK)/PAGE_SIZE;
+		u32 bf=(blk->addr&RAM_MASK)/PAGE_SIZE;
+		u32 bl=((blk->addr+blk->sh4_code_size-1)&RAM_MASK)/PAGE_SIZE;
+		return !(pl<bf || pf>bl);
+	}
+
+	void step(shil_opcode o)
+	{
+		switch(o.op)
+		{
+		case shop_mov32:
+		{
+			bool known=false;
+			u32 v=0;
+			if (o.rs1.is_imm())          { known=true; v=o.rs1._imm; }
+			else if (is_const(o.rs1))    { known=true; v=cval(o.rs1); }
+
+			if (known)
 			{
-				op->rs2.type=FMT_IMM;
-				op->rs2._imm=rv[op->rs2._reg];
-
-				if (op->op==shop_shld || op->op==shop_shad)
-				{
-					//convert em to mov/shl/shr
-
-					printf("sh*d -> s*l !\n");
-					s32 v=op->rs2._imm;
-
-					if (v>=0)
-					{
-						//x86e->Emit(sl32,reg.mapg(op->rd),v);
-						op->op=shop_shl;
-						op->rs2._imm=0x1f & v;
-					}
-					else if (0==(v&0x1f))
-					{
-						if (op->op!=shop_shad)
-						{
-							//r[n]=0;
-							//x86e->Emit(op_mov32,reg.mapg(op->rd),0);
-							op->op=shop_mov32;
-							op->rs1.type=FMT_IMM;
-							op->rs1._imm=0;
-							op->rs2.type=FMT_NULL;
-						}
-						else
-						{
-							//r[n]>>=31;
-							//x86e->Emit(op_sar32,reg.mapg(op->rd),31);
-							op->op=shop_sar;
-							op->rs2._imm=31;
-						}
-					}
-					else
-					{
-						//x86e->Emit(sr32,reg.mapg(op->rd),-v);
-						if (op->op!=shop_shad)	
-							op->op=shop_shr;
-						else
-							op->op=shop_sar;
-
-						op->rs2._imm=0x1f & (-v);
-					}
-				}
+				if (tracked(o.rd)) { set_const(o.rd,v); return; }
+				if (o.rd.is_r32i()) { o.rs1=mk_immp(v); push(o); return; }
+				//f32 dest: arm32 can only load these two immediates
+				if (o.rd.is_r32f() && (v==0 || v==0x3F800000)) { o.rs1=mk_immp(v); push(o); return; }
 			}
+			fallback(o);
+			return;
 		}
 
-		if (op->rs1.is_r32i() && op->rs1._reg<16 && isi[op->rs1._reg])
+		case shop_add: case shop_sub: case shop_and: case shop_or: case shop_xor:
 		{
-			if ((op->op==shop_readm /*|| op->op==shop_writem*/) && (op->flags&0x7F)==4)
+			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs1) && o.rs2.is_imm() && o.rd.is_r32i())
 			{
-				op->rs1.type=FMT_IMM;
-				op->rs1._imm=rv[op->rs1._reg];
-
-				if (op->rs3.is_imm())
+				u32 a=cval(o.rs1), b=o.rs2._imm, r;
+				switch(o.op)
 				{
-					op->rs1._imm+=op->rs3._imm;
-					op->rs3.type=FMT_NULL;
+				case shop_add: r=a+b; break;
+				case shop_sub: r=a-b; break;
+				case shop_and: r=a&b; break;
+				case shop_or:  r=a|b; break;
+				default:       r=a^b; break;
 				}
-				printf("%s promotion: %08X\n",shop_readm==op->op?"shop_readm":"shop_writem",op->rs1._imm);
+				set_or_mov32(o.rd,r);
+				return;
 			}
-			else if (op->op==shop_jdyn)
+			if (is_const(o.rs1) && o.rs2.is_r32i() && o.op!=shop_sub)
 			{
-				if (blk->BlockType==BET_DynamicJump || blk->BlockType==BET_DynamicCall)
-				{
-					blk->BranchBlock=rv[op->rs1._reg];
-					if (op->rs2.is_imm())	
-						blk->BranchBlock+=op->rs2._imm;;
+				//commutative: move the constant into the imm slot
+				u32 a=cval(o.rs1);
+				o.rs1=o.rs2;
+				o.rs2=mk_immp(a);
+			}
+			fallback(o);
+			return;
+		}
 
-					blk->BlockType=blk->BlockType==BET_DynamicJump?BET_StaticJump:BET_StaticCall;
-					blk->oplist.erase(blk->oplist.begin()+i);
-					i--;
-					printf("SBP: %08X -> %08X!\n",blk->addr,blk->BranchBlock);
-					continue;
+		case shop_shld: case shop_shad:
+		{
+			if (!is_const(o.rs2) || !o.rd.is_r32i()) { fallback(o); return; }
+			//dynamic shifts don't take an immediate on arm32; rewrite them
+			//to the fixed-shift ops, which do (semantics from shil_canonical)
+			{
+				s32 sh=(s32)cval(o.rs2);
+				bool arith = o.op==shop_shad;
+				if (sh>=0)
+				{
+					o.op=shop_shl;
+					o.rs2=mk_immp(sh&0x1F);
+				}
+				else if ((sh&0x1F)==0)
+				{
+					if (!arith) { set_or_mov32(o.rd,0); return; }
+					o.op=shop_sar;
+					o.rs2=mk_immp(31);
 				}
 				else
 				{
-					printf("SBP: failed :(\n");
+					o.op=arith?shop_sar:shop_shr;
+					o.rs2=mk_immp((-sh)&0x1F);
 				}
 			}
-			else if (op->op==shop_mov32)
+			//fallthrough: maybe rs1 is known too
+		}
+		case shop_shl: case shop_shr: case shop_sar: case shop_ror:
+		{
+			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs1) && o.rs2.is_imm() && o.rd.is_r32i())
 			{
-				//handled later on !
-			}
-			else if (op->op==shop_add || op->op==shop_sub)
-			{
-									
-				if (op->rs2.is_imm())
+				u32 a=cval(o.rs1), k=o.rs2._imm&0x1F, r;
+				switch(o.op)
 				{
-					op->rs1.type=1;
-					op->rs1._imm= op->op==shop_add ? 
-						(rv[op->rs1._reg]+op->rs2._imm):
-						(rv[op->rs1._reg]-op->rs2._imm);
-					op->rs2.type=0;
-					printf("%s -> mov32!\n",op->op==shop_add?"shop_add":"shop_sub");
-					op->op=shop_mov32;
+				case shop_shl: r=a<<k; break;
+				case shop_shr: r=a>>k; break;
+				case shop_sar: r=(u32)((s32)a>>k); break;
+				default:       r=k?((a>>k)|(a<<(32-k))):a; break;
 				}
-				
-				else if (op->op==shop_add && !op->rs2.is_imm())
-				{
-					u32 immy=rv[op->rs1._reg];
-					op->rs1=op->rs2;
-					op->rs2.type=1;
-					op->rs2._imm=immy;
-					printf("%s -> imm prm (%08X)!\n",op->op==shop_add?"shop_add":"shop_sub",immy);
-				}
+				set_or_mov32(o.rd,r);
+				return;
 			}
-			else
-			{
-				op->op=op->op;
-			}
+			fallback(o);
+			return;
 		}
 
-		if (op->rd.is_r32i() && op->rd._reg<16) isi[op->rd._reg]=false;
-		if (op->rd2.is_r32i() && op->rd2._reg<16) isi[op->rd._reg]=false;
-
-		if (op->op==shop_mov32 && op->rs1.is_imm() && op->rd.is_r32i() && op->rd._reg<16)
+		case shop_not: case shop_neg: case shop_ext_s8: case shop_ext_s16:
+		case shop_swaplb: case shop_swap:
 		{
-			isi[op->rd._reg]=true;
-			rv[op->rd._reg]=op->rs1._imm;
+			if (is_const(o.rs1) && o.rd.is_r32i())
+			{
+				u32 a=cval(o.rs1), r;
+				switch(o.op)
+				{
+				case shop_not:     r=~a; break;
+				case shop_neg:     r=0-a; break;
+				case shop_ext_s8:  r=(u32)(s32)(s8)a; break;
+				case shop_ext_s16: r=(u32)(s32)(s16)a; break;
+				case shop_swaplb:  r=(a&0xFFFF0000)|((a&0xFF)<<8)|((a>>8)&0xFF); break;
+				default:           r=(a>>24)|((a>>16)&0xFF00)|((a&0xFF00)<<8)|(a<<24); break;
+				}
+				set_or_mov32(o.rd,r);
+				return;
+			}
+			fallback(o);
+			return;
 		}
 
-		//NOT WORKING
-		//WE NEED PROPER PAGELOCKS
-		if (op->op==shop_readm && op->rs1.is_imm() && op->rd.is_r32i() && op->rd._reg<16 && op->flags==0x4 && op->rs3.is_null())
+		case shop_mul_u16: case shop_mul_s16: case shop_mul_i32:
 		{
-			//u32 baddr=blk->addr&0x0FFFFFFF;
-
-			if (/*baddr==0xC158400 &&*/ blk->addr/PAGE_SIZE == op->rs1._imm/PAGE_SIZE)
+			if (is_const(o.rs1) && is_const(o.rs2) && o.rd.is_r32i())
 			{
-				isi[op->rd._reg]=true;
-				rv[op->rd._reg]= ReadMem32(op->rs1._imm);
-				printf("IMM MOVE: %08X -> %08X\n",op->rs1._imm,rv[op->rd._reg]);
-
-				op->op=shop_mov32;
-				op->rs1._imm=rv[op->rd._reg];
+				u32 a=cval(o.rs1), b=cval(o.rs2), r;
+				switch(o.op)
+				{
+				case shop_mul_u16: r=(u32)(u16)a*(u32)(u16)b; break;
+				case shop_mul_s16: r=(u32)((s32)(s16)a*(s32)(s16)b); break;
+				default:           r=a*b; break;
+				}
+				set_or_mov32(o.rd,r);
+				return;
 			}
+			fallback(o);
+			return;
+		}
+
+		case shop_test: case shop_seteq: case shop_setge: case shop_setgt:
+		case shop_setae: case shop_setab:
+		{
+			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs1) && o.rs2.is_imm() && o.rd.is_r32i())
+			{
+				u32 a=cval(o.rs1), b=o.rs2._imm, r;
+				switch(o.op)
+				{
+				case shop_test:  r=(a&b)==0; break;
+				case shop_seteq: r=a==b; break;
+				case shop_setge: r=(s32)a>=(s32)b; break;
+				case shop_setgt: r=(s32)a>(s32)b; break;
+				case shop_setae: r=a>=b; break;
+				default:         r=a>b; break;
+				}
+				set_or_mov32(o.rd,r);
+				return;
+			}
+			fallback(o);
+			return;
+		}
+
+		case shop_setpeq:
+		{
+			//no immediate form on the backend; fold only if fully known
+			if (is_const(o.rs1) && is_const(o.rs2) && o.rd.is_r32i())
+			{
+				u32 t=cval(o.rs1)^cval(o.rs2);
+				u32 r=!((t&0xFF000000)&&(t&0x00FF0000)&&(t&0x0000FF00)&&(t&0x000000FF));
+				set_or_mov32(o.rd,r);
+				return;
+			}
+			fallback(o);
+			return;
+		}
+
+		case shop_readm:
+		{
+			if (is_const(o.rs3)) o.rs3=mk_immp(cval(o.rs3));
+			u32 size=o.flags&0x7F;
+
+			if (is_const(o.rs1))
+			{
+				if (o.rs3.is_null() || o.rs3.is_imm())
+				{
+					u32 addr=cval(o.rs1)+(o.rs3.is_imm()?o.rs3._imm:0);
+
+					if (allow_baking && baking_ok && locked &&
+					    (size==1||size==2||size==4) && on_block_pages(addr,size))
+					{
+						u32 data = size==1 ? (u32)(s32)(s8)ReadMem8(addr)
+						         : size==2 ? (u32)(s32)(s16)ReadMem16(addr)
+						         :           ReadMem32(addr);
+						if (tracked(o.rd))  { set_const(o.rd,data); return; }
+						if (o.rd.is_r32i()) { emit_mov32(o.rd,data); return; }
+						if (o.rd.is_r32f() && (data==0||data==0x3F800000)) { emit_mov32(o.rd,data); return; }
+						//other destinations: keep the load, imm address form below
+					}
+
+					//address-imm form: 16/32-bit only.  arm32 has no 64-bit
+					//imm loads, and no 8-bit ones for direct-mapped regions
+					//(which we can't tell apart from handler regions here).
+					if ((size==2 || size==4) && o.rd.is_r32())
+					{
+						o.rs1=mk_immp(addr);
+						o.rs3=shil_param();
+						push(o);
+						kill(o.rd);
+						return;
+					}
+				}
+				else if (o.rs3.is_r32i())
+				{
+					//const base + reg offset: swap them, base becomes the imm offset
+					u32 base=cval(o.rs1);
+					o.rs1=o.rs3;
+					o.rs3=mk_immp(base);
+				}
+			}
+			fallback(o);
+			return;
+		}
+
+		case shop_writem:
+		{
+			if (is_const(o.rs3)) o.rs3=mk_immp(cval(o.rs3));
+
+			if (locked)
+			{
+				if (is_const(o.rs1) && (o.rs3.is_null() || o.rs3.is_imm()))
+				{
+					u32 addr=cval(o.rs1)+(o.rs3.is_imm()?o.rs3._imm:0);
+					if (write_may_hit_block_pages(addr,o.flags&0x7F))
+						locked=false;
+				}
+				else
+				{
+					locked=false; //unknown target: assume the worst
+				}
+			}
+			fallback(o); //address and data always stay in registers on arm32
+			return;
+		}
+
+		case shop_jdyn:
+		{
+			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs1))
+			{
+				u32 target=cval(o.rs1)+(o.rs2.is_imm()?o.rs2._imm:0);
+				if (blk->BlockType==BET_DynamicJump || blk->BlockType==BET_DynamicCall)
+				{
+					blk->BranchBlock=target;
+					blk->BlockType = blk->BlockType==BET_DynamicJump ? BET_StaticJump : BET_StaticCall;
+					return; //dropped; pc_dyn no longer needed
+				}
+			}
+			fallback(o);
+			return;
+		}
+
+		case shop_ifb:
+		{
+			writeback_range(0,15);
+			push(o);
+			kill_range(0,15);
+			locked=false; //the interpreter can write anywhere
+			return;
+		}
+
+		case shop_sync_sr:
+		{
+			//UpdateSR() may swap the r0-r7 banks; r8-r15 are unaffected
+			writeback_range(0,7);
+			push(o);
+			kill_range(0,7);
+			return;
+		}
+
+		case shop_pref:
+		{
+			if (is_const(o.rs1) && (cval(o.rs1)>>26)!=0x38)
+				return; //provably not a store-queue address: pref is a nop
+			locked=false; //an SQ flush stores to ram we can't see
+			fallback(o);
+			return;
+		}
+
+		default:
+			fallback(o);
+			return;
 		}
 	}
+};
+
+void constprop(RuntimeBlockInfo* blk, bool allow_memory_baking=true)
+{
+	constprop_pass cp{};
+
+	cp.blk=blk;
+	cp.allow_baking=allow_memory_baking;
+	cp.locked=true;
+	cp.baking_ok = IsOnRam(blk->addr) && !bm_RamPageHasData(blk->addr,blk->sh4_code_size);
+	cp.out.reserve(blk->oplist.size());
+
+	for (size_t i=0;i<blk->oplist.size();i++)
+	{
+		cp.cur_guest_offs=blk->oplist[i].guest_offs;
+		cp.step(blk->oplist[i]);
+	}
+
+	cp.writeback_range(0,15);
+
+	blk->oplist.swap(cp.out);
 
 	rw_related(blk);
 }
@@ -923,15 +1197,10 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 		puts("\n");
 	}
 	*/
+	constprop(blk, !settings.dynarec.safemode);
+
 	if (settings.dynarec.unstable_opt)
 		sq_pref(blk);
-	//constprop(blk); // crashes on ip
-#if HOST_CPU==CPU_X86
-//	rdgrp(blk);
-//	wtgrp(blk);
-	//constprop(blk);
-	
-#endif
 	bool last_op_sets_flags=!blk->has_jcond && blk->oplist.size() > 0 && 
 		blk->oplist[blk->oplist.size()-1].rd._reg==reg_sr_T;
 
