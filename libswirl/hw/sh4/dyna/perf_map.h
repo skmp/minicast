@@ -29,7 +29,25 @@
 		perf record -F 999 -g --tid <tid> ...
 		perf script -i perf.data -F ip,sym,dso > samples.txt
 		tools/symbolize_perf.py samples.txt /tmp/jit.map minicast.elf
+
+	MINICAST_SHOP_MAP additionally writes a second, finer map that splits each block
+	into its individual shil opcodes, so cost can be attributed per shop rather than
+	per block. This is not perf-map format and only symbolize_perf.py --by-shop
+	reads it:
+
+		block <runtime-start-hex> <size-hex> <guest-pc-hex> <relink-offs-hex>
+		op <host-offs-hex> <shop name>
+		op <host-offs-hex> <shop name>
+		...
+
+	The op offsets are relative to the block's runtime start and are sorted
+	ascending; an op runs until the next op's offset, the last until the relink
+	offset. Code before the first op (prologue) and from relink-offs to size
+	(block exit) belongs to no shop.
 */
+struct RuntimeBlockInfo;
+
 void perf_map_Init();
 void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr);
+void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block);
 void perf_map_Term();

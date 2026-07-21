@@ -4,6 +4,8 @@
 #include "license/bsd"
 
 #include "perf_map.h"
+#include "blockmanager.h"
+#include "shil.h"
 
 #if HOST_OS == OS_LINUX
 
@@ -12,9 +14,32 @@
 #include <unistd.h>
 
 static FILE* perf_map_file;
+static FILE* shop_map_file;
 
 void perf_map_Init()
 {
+	if (shop_map_file == NULL)
+	{
+		const char* shop_path = getenv("MINICAST_SHOP_MAP");
+
+		if (shop_path != NULL)
+		{
+			char shop_name[256];
+
+			if (shop_path[0] == '/')
+				sprintf(shop_name, "%.250s", shop_path);
+			else
+				sprintf(shop_name, "/tmp/shop-%d.map", getpid());
+
+			shop_map_file = fopen(shop_name, "w");
+
+			if (shop_map_file)
+				printf("perf_map: writing per-shop map to %s\n", shop_name);
+			else
+				printf("perf_map: failed to open %s\n", shop_name);
+		}
+	}
+
 	if (perf_map_file)
 		return;
 
@@ -57,8 +82,37 @@ void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr)
 	fflush(perf_map_file);
 }
 
+void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block)
+{
+	if (!shop_map_file)
+		return;
+
+	// relink_offset splits the block: everything from there to host_code_size is
+	// the block-exit/relink tail, which belongs to no shop
+	fprintf(shop_map_file, "block %lx %x %08X %x\n",
+		(unsigned long)code, host_code_size, block->addr, block->relink_offset);
+
+	// host_offs is relative to block->code, which is what the block line records,
+	// so the offsets need no adjustment here. They come out of the emitter in
+	// emission order, i.e. already ascending.
+	for (size_t i = 0; i < block->oplist.size(); i++)
+	{
+		shil_opcode& op = block->oplist[i];
+
+		fprintf(shop_map_file, "op %x %s\n", op.host_offs, shil_opcode_name(op.op));
+	}
+
+	fflush(shop_map_file);
+}
+
 void perf_map_Term()
 {
+	if (shop_map_file)
+	{
+		fclose(shop_map_file);
+		shop_map_file = NULL;
+	}
+
 	if (!perf_map_file)
 		return;
 
@@ -70,6 +124,7 @@ void perf_map_Term()
 
 void perf_map_Init() { }
 void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr) { }
+void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block) { }
 void perf_map_Term() { }
 
 #endif

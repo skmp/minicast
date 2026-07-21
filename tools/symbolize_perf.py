@@ -14,6 +14,13 @@ The map records *runtime* addresses; perf script reports offsets within the bina
 The two differ by a constant, which is recovered from the ELF rather than assumed:
 SH4_TCB's vaddr is known from the symbol table, and the map's addresses all fall
 inside SH4_TCB, so the lowest map address anchors the runtime base.
+
+With --by-shop the third argument is a shop map (MINICAST_SHOP_MAP) instead of a
+perf map, and cost is totalled per shil opcode across every block rather than per
+block:
+
+    MINICAST_SHOP_MAP=/tmp/shop.map ./minicast.elf ...
+    symbolize_perf.py --by-shop samples.txt /tmp/shop.map minicast.elf
 """
 
 import bisect
@@ -43,6 +50,73 @@ def read_map(path):
     return blocks
 
 
+def read_shop_map(path):
+    """Flatten a shop map's block/op lines into the same sorted block list.
+
+    Each op owns the host code from its own offset up to the next op's offset.
+    The two regions that belong to no op get their own synthetic names rather
+    than being folded into a neighbouring op: everything before the first op is
+    the block prologue (smc check, cycle counter, intc_sched call), and
+    everything after the last op is the relink/block-exit tail. Charging the
+    tail to whichever shop happened to end the block would inflate exactly the
+    branch-ish opcodes (jcond, jdyn) that tend to sit there.
+
+    The emitter records offsets in emission order, but a block whose ops all sit
+    at one offset (or a truncated final block from a kill -9) would otherwise
+    produce negative sizes, so degenerate entries are dropped rather than
+    trusted.
+    """
+    blocks = []
+    pending = []        # (offset, name) for the block being read
+    start = size = relink = None
+
+    def flush():
+        if not pending:
+            return
+
+        if pending[0][0] > 0:
+            blocks.append((start, pending[0][0], "<block prologue>"))
+
+        # ops stop at the relink tail, so a branchy final shop is not charged for
+        # the block-exit code that follows it
+        for j, (off, name) in enumerate(pending):
+            end = pending[j + 1][0] if j + 1 < len(pending) else relink
+            if end > off:
+                blocks.append((start + off, end - off, name))
+
+        if size > relink:
+            blocks.append((start + relink, size - relink, "<relink/block exit>"))
+
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+
+            if len(parts) == 5 and parts[0] == "block":
+                if start is not None:
+                    flush()
+                try:
+                    start = int(parts[1], 16)
+                    size = int(parts[2], 16)
+                    relink = int(parts[4], 16)
+                    # a truncated or nonsensical record must not swallow the block
+                    if not 0 < relink <= size:
+                        relink = size
+                except ValueError:
+                    start = None
+                pending = []
+            elif len(parts) == 3 and parts[0] == "op" and start is not None:
+                try:
+                    pending.append((int(parts[1], 16), parts[2]))
+                except ValueError:
+                    pass
+
+    if start is not None:
+        flush()
+
+    blocks.sort()
+    return blocks
+
+
 def sh4_tcb_range(elf):
     """(vaddr, size) of SH4_TCB from the ELF symbol table."""
     try:
@@ -63,12 +137,18 @@ def sh4_tcb_range(elf):
 
 
 def main():
-    if len(sys.argv) != 4:
+    argv = sys.argv[1:]
+
+    by_shop = "--by-shop" in argv
+    if by_shop:
+        argv.remove("--by-shop")
+
+    if len(argv) != 3:
         sys.exit(__doc__)
 
-    samples_path, map_path, elf_path = sys.argv[1:4]
+    samples_path, map_path, elf_path = argv
 
-    blocks = read_map(map_path)
+    blocks = read_shop_map(map_path) if by_shop else read_map(map_path)
     if not blocks:
         sys.exit("no usable entries in %s" % map_path)
 
@@ -98,9 +178,11 @@ def main():
             return name
 
         # inside the cache but not in any block: stale code from before a cache
-        # clear, or padding between blocks
+        # clear, or padding between blocks. In shop mode every byte of a live
+        # block is attributed (prologue and relink tail have their own buckets),
+        # so anything landing here is genuinely stale.
         if tcb_vaddr <= addr < tcb_vaddr + tcb_size:
-            return "sh4_<unmapped>"
+            return "<stale/unmapped>" if by_shop else "sh4_<unmapped>"
         return None
 
     counts = collections.Counter()
