@@ -875,6 +875,68 @@ static void t_f32_mov()
 	}
 }
 
+static void t_shift_chains()
+{
+	// shll16; shll8; shll2; shll -> one shl #27
+	mock_reset();
+	RuntimeBlockInfo b = mkblk();
+	static const u32 amounts[] = {16, 8, 2, 1};
+	for (u32 a : amounts)
+		b.oplist.push_back(OP(shop_shl, R(reg_r4), R(reg_r4), I(a)));
+	constprop(&b);
+	check_arm32_forms(b.oplist);
+	verify(count_op(b.oplist, shop_shl) == 1);
+	verify(find_op(b.oplist, shop_shl)->rs2._imm == 27);
+
+	// shll16 twice: everything shifted out, result is a constant zero
+	mock_reset();
+	RuntimeBlockInfo b2 = mkblk();
+	b2.oplist.push_back(OP(shop_shl, R(reg_r4), R(reg_r4), I(16)));
+	b2.oplist.push_back(OP(shop_shl, R(reg_r4), R(reg_r4), I(16)));
+	constprop(&b2);
+	check_arm32_forms(b2.oplist);
+	verify(count_op(b2.oplist, shop_shl) == 0);
+	verify(find_mov_imm(b2.oplist, reg_r4, 0) >= 0);
+
+	// arithmetic shifts saturate at 31 (sign fill)
+	mock_reset();
+	RuntimeBlockInfo b3 = mkblk();
+	b3.oplist.push_back(OP(shop_sar, R(reg_r4), R(reg_r4), I(20)));
+	b3.oplist.push_back(OP(shop_sar, R(reg_r4), R(reg_r4), I(20)));
+	constprop(&b3);
+	check_arm32_forms(b3.oplist);
+	verify(count_op(b3.oplist, shop_sar) == 1);
+	verify(find_op(b3.oplist, shop_sar)->rs2._imm == 31);
+
+	// a full rotation disappears entirely
+	mock_reset();
+	RuntimeBlockInfo b4 = mkblk();
+	b4.oplist.push_back(OP(shop_ror, R(reg_r4), R(reg_r4), I(16)));
+	b4.oplist.push_back(OP(shop_ror, R(reg_r4), R(reg_r4), I(16)));
+	constprop(&b4);
+	check_arm32_forms(b4.oplist);
+	verify(count_op(b4.oplist, shop_ror) == 0);
+
+	// an op in between reads the intermediate value: no merge
+	mock_reset();
+	RuntimeBlockInfo b5 = mkblk();
+	b5.oplist.push_back(OP(shop_shl, R(reg_r4), R(reg_r4), I(16)));
+	b5.oplist.push_back(OP(shop_add, R(reg_r5), R(reg_r4), I(1)));
+	b5.oplist.push_back(OP(shop_shl, R(reg_r4), R(reg_r4), I(8)));
+	constprop(&b5);
+	check_arm32_forms(b5.oplist);
+	verify(count_op(b5.oplist, shop_shl) == 2);
+
+	// mixed shift kinds never merge (shl16;shr16 is a zero-extend!)
+	mock_reset();
+	RuntimeBlockInfo b6 = mkblk();
+	b6.oplist.push_back(OP(shop_shl, R(reg_r4), R(reg_r4), I(16)));
+	b6.oplist.push_back(OP(shop_shr, R(reg_r4), R(reg_r4), I(16)));
+	constprop(&b6);
+	check_arm32_forms(b6.oplist);
+	verify(count_op(b6.oplist, shop_shl) == 1 && count_op(b6.oplist, shop_shr) == 1);
+}
+
 static void t_imm_literal_bake()
 {
 	// pc-relative literals arrive from the decoder with an immediate base;
@@ -1029,8 +1091,19 @@ struct Fuzz
 	void gen_op(RuntimeBlockInfo& b, const vector<u32>& lits)
 	{
 		u32 lit = lits[rnd(lits.size())];
-		switch (rnd(20))
+		switch (rnd(21))
 		{
+		case 20:
+		{
+			// in-place shift chain on one register, like sh4 wide shifts
+			static const shilop sh[] = {shop_shl, shop_shr, shop_sar, shop_ror};
+			shilop s = sh[rnd(4)];
+			Sh4RegType r = gp();
+			u32 n = 2 + rnd(3);
+			for (u32 i = 0; i < n; i++)
+				b.oplist.push_back(OP(s, R(r), R(r), I(1 + rnd(31))));
+			break;
+		}
 		case 0: // constants flowing in
 		case 1:
 			b.oplist.push_back(OP(shop_mov32, R(gp()), rnd(2) ? I(rnd(2) ? rnd(64) : r32()) : I(lit)));
@@ -1165,6 +1238,7 @@ int main(int argc, char** argv)
 	t_cmp_fold();
 	t_jdyn_offset();
 	t_f32_mov();
+	t_shift_chains();
 	t_imm_literal_bake();
 	t_rom_bake();
 	t_baking_disabled();

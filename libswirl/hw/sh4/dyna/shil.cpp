@@ -653,6 +653,62 @@ struct constprop_pass
 				set_or_mov32(o.rd,r);
 				return;
 			}
+
+			//merge shift chains: sh4 spells "shl #27" as shll16/shll8/
+			//shll2/shll.  Safe only when this op immediately follows the
+			//other half in the emitted stream and overwrites its dest, so
+			//the intermediate value is provably unobservable.
+			if (o.rs2.is_imm() && o.rd.is_r32i() &&
+			    o.rs1.is_r32i() && o.rs1._reg==o.rd._reg &&
+			    !out.empty())
+			{
+				shil_opcode& p=out.back();
+				if (p.op==o.op && p.rs2.is_imm() &&
+				    p.rd.is_r32i() && p.rd._reg==o.rd._reg)
+				{
+					u32 total=p.rs2._imm+o.rs2._imm;
+
+					if (o.op==shop_ror)
+					{
+						total&=31;
+						if (total==0)
+						{
+							//full rotation: the pair reduces to a move
+							cplog("ror chain: full rotation eliminated");
+							shil_opcode src=p;
+							out.pop_back();
+							if (!(src.rs1.is_r32i() && src.rs1._reg==o.rd._reg))
+							{
+								shil_opcode m{};
+								m.op=shop_mov32;
+								m.rd=o.rd;
+								m.rs1=src.rs1;
+								m.guest_offs=cur_guest_offs;
+								step(m);
+							}
+							return;
+						}
+					}
+					else if (o.op==shop_sar)
+					{
+						//sign fill saturates
+						if (total>31) total=31;
+					}
+					else if (total>=32)
+					{
+						//shl/shr: everything shifted out, result is zero
+						cplog("op%d chain: reg%d = 0",o.op,o.rd._reg);
+						out.pop_back();
+						set_or_mov32(o.rd,0);
+						return;
+					}
+
+					cplog("op%d chain merged: #%d + #%d -> #%d",o.op,p.rs2._imm,o.rs2._imm,total);
+					p.rs2._imm=total;
+					return;
+				}
+			}
+
 			fallback(o);
 			return;
 		}
