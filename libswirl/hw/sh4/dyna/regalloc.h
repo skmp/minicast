@@ -31,7 +31,11 @@ struct RegAlloc
 		AM_NONE,
 		AM_READ,
 		AM_WRITE,
-		AM_READWRITE
+		AM_READWRITE,
+		//a vector operand reads this reg from the context at this op: any
+		//dirty value is committed here (writeback at OpBegin), but the host
+		//register still holds it, so the span stays live across the op
+		AM_FLUSH
 	};
 
 	struct RegAccess
@@ -56,6 +60,7 @@ struct RegAlloc
 
 		bool aliased;
 		bool freed_early;
+		bool dirty;		//emission state: host reg holds a value ctx doesn't
 
 		vector<RegAccess> accesses;
 
@@ -70,6 +75,7 @@ struct RegAlloc
 
 			aliased=false;
 			freed_early=false;
+			dirty=false;
 
 			if (mode&AM_WRITE)
 				writeback=true;
@@ -183,6 +189,13 @@ struct RegAlloc
 		bool NeedsPL()
 		{
 			if (accesses[0].am&AM_READ)
+				return true;
+
+			//a span(-half) that begins at a vector-read flush point holds no
+			//value in its register yet; if anything is accessed after it, the
+			//register must be loaded. The context is current at a flush by
+			//construction, so preloading there is always sound.
+			if (accesses[0].am==AM_FLUSH && accesses.size()>1)
 				return true;
 
 			return false;
@@ -673,7 +686,7 @@ struct RegAlloc
 				}
 
 				iter=reg_rd.begin();
-				while( iter != reg_rd.end() ) 
+				while( iter != reg_rd.end() )
 				{
 					//r
 					if ((*iter).is_reg())
@@ -692,12 +705,15 @@ struct RegAlloc
 						}
 						else
 						{
+							//vector operand: the op reads these regs from the
+							//context, so any dirty span commits here (AM_FLUSH
+							//writes back at OpBegin) -- but the host register
+							//still holds the value, so the span stays live and
+							//later scalar reads skip the re-preload
 							for (u32 i=0; i<(*iter).count(); i++)
 							{
 								if (spans[(*iter)._reg+i]!=0)
-									spans[(*iter)._reg+i]->Flush();
-
-								spans[(*iter)._reg+i]=0;
+									spans[(*iter)._reg+i]->Access((int)opid,AM_FLUSH);
 							}
 						}
 					}
@@ -1095,6 +1111,7 @@ struct RegAlloc
 			last_nacc->trim_access();
 
 			spn->preload=spn->NeedsPL();
+			spn->writeback=spn->NeedsWB();
 			last_nacc->writeback=last_nacc->NeedsWB();
 
 			//add it to the span list !
@@ -1193,6 +1210,22 @@ struct RegAlloc
 					Preload(spn->regstart,spn->nreg);
 				}
 			}
+			else if (spn->cacc_am(current_opid)==AM_FLUSH && spn->dirty)
+			{
+				//a vector operand reads this reg from the context in the op
+				//body: commit the dirty value now, span stays live
+				if (spn->fpr)
+				{
+					writeback_fpu++;
+					Writeback_FPU(spn->regstart,spn->nregf);
+				}
+				else
+				{
+					writeback_gpr++;
+					Writeback(spn->regstart,spn->nreg);
+				}
+				spn->dirty=false;
+			}
 		}
 	}
 
@@ -1202,7 +1235,13 @@ struct RegAlloc
 		{
 			RegSpan* spn=all_spans[sid];
 
-			if (spn->ending(current_opid) && spn->writeback)
+			//the op body just ran: writes leave the host reg ahead of ctx
+			if (spn->cacc_am(current_opid)&AM_WRITE)
+				spn->dirty=true;
+
+			//skip the end writeback when an AM_FLUSH already committed the
+			//final value (dirty==false); Kill() still suppresses via writeback
+			if (spn->ending(current_opid) && spn->writeback && spn->dirty)
 			{
 				if (spn->fpr)
 				{
