@@ -932,6 +932,10 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 					case SZ_32F:
 						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
 						VLDR(reg.mapf(op->rd),r1,0);
+						//paired form (fuse_readm_pairs): rd2 = [addr+4],
+						//one address computation for both halves
+						if (op->rd2.is_r32f())
+							VLDR(reg.mapf(op->rd2),r1,1);
 						break;
 
 					case SZ_64F:
@@ -2177,6 +2181,8 @@ struct Arm32NGenBackend: NGenBackend
 		else
 		{
 			printf("fail raddr %08X {@%08X}:(\n",ptr[0].full,regs[1]);
+			//if this hits with a VLDR.32 whose imm is 1, a paired f32 readm
+			//(fuse_readm_pairs) faulted -- mmio pairs can't be rewritten
 			die("Invalid opcode: vmem fixup\n");
 		}
 		//from mem op

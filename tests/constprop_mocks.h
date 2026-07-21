@@ -282,6 +282,9 @@ inline u8 ReadMem8(u32 addr)
 	return mock_ram[addr & RAM_MASK];
 }
 
+// fuse_readm_pairs only runs with the nvmem fastpath available
+inline bool _nvmem_enabled() { return true; }
+
 inline bool bm_RamPageHasData(u32 guest_addr, u32 len)
 {
 	auto page_base = (guest_addr & RAM_MASK) / PAGE_SIZE;

@@ -106,6 +106,15 @@ static void check_arm32_forms(const vector<shil_opcode>& ops)
 			verify(size == 2 || size == 4);
 		}
 
+		// paired f32 loads: only the nvmem reg-base 32F form supports rd2
+		if (o.op == shop_readm && !o.rd2.is_null())
+		{
+			verify(o.rd.is_r32f() && o.rd2.is_r32f());
+			verify((o.flags & 0x7F) == 4);
+			verify(o.rs1.is_r32i());
+			verify(o.rs3.is_null());
+		}
+
 		if (o.op == shop_mov32 && o.rd.is_r32f() && o.rs1.is_imm())
 			verify(o.rs1._imm == 0 || o.rs1._imm == 0x3F800000);
 
@@ -183,7 +192,7 @@ struct Interp
 	void wrp(const shil_param& p, u32 v)
 	{
 		if (p.is_null()) return;
-		verify(p.is_r32i());
+		verify(p.is_r32());
 		regs[p._reg] = v;
 	}
 
@@ -343,8 +352,14 @@ struct Interp
 		}
 
 		case shop_readm:
-			wrp(o.rd, rdmem(rdp(o.rs1) + rdp0(o.rs3), o.flags & 0x7F));
+		{
+			u32 addr = rdp(o.rs1) + rdp0(o.rs3);
+			wrp(o.rd, rdmem(addr, o.flags & 0x7F));
+			// paired f32 form: rd2 = [addr+4], read after rd like the backend
+			if (!o.rd2.is_null())
+				wrp(o.rd2, rdmem(addr + 4, 4));
 			break;
+		}
 		case shop_writem:
 			wrmem(rdp(o.rs1) + rdp0(o.rs3), o.flags & 0x7F, rdp(o.rs2));
 			break;
@@ -937,6 +952,57 @@ static void t_shift_chains()
 	verify(count_op(b6.oplist, shop_shl) == 1 && count_op(b6.oplist, shop_shr) == 1);
 }
 
+static void t_readm_pair_fusion()
+{
+	// fmov.s @Rn+ x3 (a vertex fetch): first two loads pair up, their +4s
+	// combine, the odd load stays single
+	mock_reset();
+	RuntimeBlockInfo b = mkblk();
+	static const Sh4RegType frs[] = {reg_fr_0, reg_fr_1, reg_fr_2};
+	for (auto fr : frs)
+	{
+		b.oplist.push_back(OP(shop_readm, F(fr), R(reg_r8), P(), 4));
+		b.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(4)));
+	}
+	fuse_readm_pairs(&b);
+	check_arm32_forms(b.oplist);
+
+	verify(count_op(b.oplist, shop_readm) == 2);
+	verify(b.oplist[0].op == shop_readm);
+	verify(b.oplist[0].rd._reg == reg_fr_0 && b.oplist[0].rd2._reg == reg_fr_1);
+	verify(b.oplist[1].op == shop_add && b.oplist[1].rs2._imm == 8);
+	verify(b.oplist[2].op == shop_readm && b.oplist[2].rd2.is_null());
+	verify(b.oplist[3].op == shop_add && b.oplist[3].rs2._imm == 4);
+
+	// four loads: two pairs, two combined adds
+	mock_reset();
+	RuntimeBlockInfo b2 = mkblk();
+	static const Sh4RegType frs4[] = {reg_fr_0, reg_fr_1, reg_fr_2, reg_fr_3};
+	for (auto fr : frs4)
+	{
+		b2.oplist.push_back(OP(shop_readm, F(fr), R(reg_r8), P(), 4));
+		b2.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(4)));
+	}
+	fuse_readm_pairs(&b2);
+	check_arm32_forms(b2.oplist);
+	verify(count_op(b2.oplist, shop_readm) == 2);
+	verify(count_op(b2.oplist, shop_add) == 2);
+
+	// guards: different base, wrong add amount, i32 load, op in between
+	mock_reset();
+	RuntimeBlockInfo b3 = mkblk();
+	b3.oplist.push_back(OP(shop_readm, F(reg_fr_0), R(reg_r8), P(), 4));
+	b3.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(4)));
+	b3.oplist.push_back(OP(shop_readm, F(reg_fr_1), R(reg_r9), P(), 4)); // other base
+	b3.oplist.push_back(OP(shop_readm, R(reg_r0), R(reg_r8), P(), 4));  // i32
+	b3.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(8)));      // not +4
+	b3.oplist.push_back(OP(shop_readm, F(reg_fr_2), R(reg_r8), P(), 4));
+	fuse_readm_pairs(&b3);
+	check_arm32_forms(b3.oplist);
+	for (auto& o : b3.oplist)
+		verify(!(o.op == shop_readm) || o.rd2.is_null());
+}
+
 static void t_imm_literal_bake()
 {
 	// pc-relative literals arrive from the decoder with an immediate base;
@@ -1050,6 +1116,7 @@ struct Fuzz
 		size_t orig_size = orig_ops.size();
 
 		constprop(&b, allow_baking);
+		fuse_readm_pairs(&b);
 
 		verify(mock_bad_reads == 0);
 		check_arm32_forms(b.oplist);
@@ -1091,7 +1158,7 @@ struct Fuzz
 	void gen_op(RuntimeBlockInfo& b, const vector<u32>& lits)
 	{
 		u32 lit = lits[rnd(lits.size())];
-		switch (rnd(21))
+		switch (rnd(22))
 		{
 		case 20:
 		{
@@ -1102,6 +1169,21 @@ struct Fuzz
 			u32 n = 2 + rnd(3);
 			for (u32 i = 0; i < n; i++)
 				b.oplist.push_back(OP(s, R(r), R(r), I(1 + rnd(31))));
+			break;
+		}
+		case 21:
+		{
+			// fmov.s @Rn+ chain: f32 loads with +4 bumps, fusion fodder
+			Sh4RegType base = areg();
+			if (rnd(2))
+				b.oplist.push_back(OP(shop_mov32, R(base), I(lit)));
+			u32 n = 1 + rnd(4);
+			for (u32 i = 0; i < n; i++)
+			{
+				b.oplist.push_back(OP(shop_readm, F((Sh4RegType)(reg_fr_0 + rnd(8))), R(base), P(), 4));
+				if (i + 1 < n || rnd(2))
+					b.oplist.push_back(OP(shop_add, R(base), R(base), I(4)));
+			}
 			break;
 		}
 		case 0: // constants flowing in
@@ -1239,6 +1321,7 @@ int main(int argc, char** argv)
 	t_jdyn_offset();
 	t_f32_mov();
 	t_shift_chains();
+	t_readm_pair_fusion();
 	t_imm_literal_bake();
 	t_rom_bake();
 	t_baking_disabled();

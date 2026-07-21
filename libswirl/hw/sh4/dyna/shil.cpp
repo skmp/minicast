@@ -1017,6 +1017,72 @@ void constprop(RuntimeBlockInfo* blk, bool allow_memory_baking=true)
 	rw_related(blk);
 }
 
+//-----------------------------------------------------------------------------
+// fmov.s @Rn+ pair fusion
+//
+// The decoder spells a two-float fetch as
+//     readm frA, [rn] (f32);  add rn, rn, #4;  readm frB, [rn] (f32)
+// Fuse it into one readm with rd2 set -- the backend reads [addr] into rd and
+// [addr+4] into rd2 off a single address computation -- followed by the add.
+// When the second load had its own +4 the two adds become adjacent and are
+// combined.
+//
+// Only the nvmem fastpath emits the paired form, and a paired load that
+// faults (mmio) cannot be rewritten into handler calls, so this never runs
+// without nvmem; fmov.s from mmio does not happen in practice.
+//-----------------------------------------------------------------------------
+void fuse_readm_pairs(RuntimeBlockInfo* blk)
+{
+	if (!_nvmem_enabled())
+		return;
+
+	for (size_t i=0; i+2<blk->oplist.size(); i++)
+	{
+		shil_opcode& r1=blk->oplist[i];
+		shil_opcode& ad=blk->oplist[i+1];
+		shil_opcode& r2=blk->oplist[i+2];
+
+		if (r1.op!=shop_readm || ad.op!=shop_add || r2.op!=shop_readm)
+			continue;
+		if ((r1.flags&0x7F)!=4 || (r2.flags&0x7F)!=4)
+			continue;
+		if (!r1.rd.is_r32f() || !r1.rd2.is_null() || !r2.rd.is_r32f() || !r2.rd2.is_null())
+			continue;
+		if (!r1.rs1.is_r32i() || !r1.rs3.is_null() || !r2.rs3.is_null())
+			continue;
+		if (!r2.rs1.is_r32i() || r2.rs1._reg!=r1.rs1._reg)
+			continue;
+		//the middle op must be exactly rn += 4
+		if (!(ad.rd.is_r32i() && ad.rd._reg==r1.rs1._reg &&
+		      ad.rs1.is_r32i() && ad.rs1._reg==r1.rs1._reg &&
+		      ad.rs2.is_imm() && ad.rs2._imm==4))
+			continue;
+
+		if (constprop_verbose)
+			printf("fusem %08X+%X: readm pair f%d,f%d @ r%d\n",blk->addr,r1.guest_offs,
+				r1.rd._reg-reg_fr_0,r2.rd._reg-reg_fr_0,r1.rs1._reg);
+
+		r1.rd2=r2.rd;
+		blk->oplist.erase(blk->oplist.begin()+i+2);
+
+		//the pair's two +4s are adjacent now; combine them
+		if (i+2<blk->oplist.size())
+		{
+			shil_opcode& a1=blk->oplist[i+1];
+			shil_opcode& a2=blk->oplist[i+2];
+
+			if (a2.op==shop_add &&
+			    a2.rd.is_r32i() && a2.rd._reg==a1.rd._reg &&
+			    a2.rs1.is_r32i() && a2.rs1._reg==a1.rd._reg &&
+			    a2.rs2.is_imm())
+			{
+				a1.rs2._imm+=a2.rs2._imm;
+				blk->oplist.erase(blk->oplist.begin()+i+2);
+			}
+		}
+	}
+}
+
 //read_v4m3z1
 void read_v4m3z1(RuntimeBlockInfo* blk)
 {
@@ -1393,6 +1459,7 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 	}
 	*/
 	constprop(blk, !settings.dynarec.safemode);
+	fuse_readm_pairs(blk);
 
 	if (settings.dynarec.unstable_opt)
 		sq_pref(blk);
