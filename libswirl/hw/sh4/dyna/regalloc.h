@@ -398,9 +398,25 @@ struct RegAlloc
 		return is_fpr && (op->rd.count()>=2 || op->rd2.count()>=2 || op->rs1.count()>=2 ||  op->rs2.count()>=2 || op->rs3.count()>=2 );
 	}
 
-	void InsertRegs(set<shil_param>& l, const shil_param& regs)
+	//opt-in per-op explode of 4-wide fpu vectors into individually allocatable
+	//f32 spans. The backend must then access the elements via mapfv() in that
+	//op's emitter -- see ExplodeVec() overrides.
+	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
 	{
-		if (!explode_spans || (regs.count()==1 || regs.count()>2))
+		return false;
+	}
+
+	void InsertRegs(set<shil_param>& l, const shil_param& regs, shil_opcode* op)
+	{
+		bool explode;
+		if (regs.count()==2)
+			explode = explode_spans;
+		else if (regs.count()==4)
+			explode = regs.is_reg() && ExplodeVec(op,regs);
+		else
+			explode = false;
+
+		if (!explode)
 		{
 			l.insert(regs);
 		}
@@ -576,15 +592,15 @@ struct RegAlloc
 				set<shil_param> reg_rd;
 
 				//insert regs into sets ..
-				InsertRegs(reg_wt,op->rd);
-				
-				InsertRegs(reg_wt,op->rd2);
+				InsertRegs(reg_wt,op->rd,op);
 
-				InsertRegs(reg_rd,op->rs1);
-				
-				InsertRegs(reg_rd,op->rs2);
+				InsertRegs(reg_wt,op->rd2,op);
 
-				InsertRegs(reg_rd,op->rs3);
+				InsertRegs(reg_rd,op->rs1,op);
+
+				InsertRegs(reg_rd,op->rs2,op);
+
+				InsertRegs(reg_rd,op->rs3,op);
 
 				set<shil_param>::iterator iter=reg_wt.begin();
 				while( iter != reg_wt.end() ) 

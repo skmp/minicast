@@ -26,6 +26,13 @@ struct TestAlloc : RegAlloc<int, int, false>
 	virtual void Writeback(u32 reg, int nreg) { ctx[reg] = Rg[nreg]; }
 	virtual void Preload_FPU(u32 reg, int nreg) { Rf[nreg] = ctx[reg]; }
 	virtual void Writeback_FPU(u32 reg, int nreg) { ctx[reg] = Rf[nreg]; }
+
+	// mirror the arm32 backend: ftrv/fipr fv operands become 4 allocatable
+	// f32 spans; every other multi-reg param stays a memory operand
+	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
+	{
+		return (op->op == shop_ftrv || op->op == shop_fipr) && prm.count() == 4;
+	}
 };
 
 static u64 rng_state;
@@ -57,6 +64,14 @@ static shil_param mkimm(u32 v)
 	return p;
 }
 
+static shil_param mkvec(Sh4RegType r, u32 fmt)
+{
+	shil_param p;
+	p.type = fmt;
+	p._reg = r;
+	return p;
+}
+
 // pick `n` distinct regs from a pool (params of one op must fit in the host pool)
 static void pick_distinct(const Sh4RegType* pool, u32 pool_sz, u32 n, Sh4RegType* out)
 {
@@ -82,7 +97,39 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 	{
 		shil_opcode op;
 		Sh4RegType r[5];
-		u32 kind = rnd_below(10);
+		u32 kind = rnd_below(13);
+
+		if (kind == 10 && nfpr >= 4) // exploded vector op, like ftrv
+		{
+			// rd/rs1 in-place like the real thing; rs2 is a memory operand
+			Sh4RegType base = (rnd_below(2) && nfpr >= 8) ? reg_fr_4 : reg_fr_0;
+			op.op = shop_ftrv;
+			op.rd = mkvec(base, FMT_V4);
+			op.rs1 = mkvec(base, FMT_V4);
+			op.rs2 = mkvec(reg_xf_0, FMT_V16);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind == 11 && nfpr >= 4) // exploded reads, scalar rd aliasing rs1[3]
+		{
+			op.op = shop_fipr;
+			op.rs1 = mkvec(reg_fr_0, FMT_V4);
+			op.rs2 = mkvec(nfpr >= 8 && rnd_below(2) ? reg_fr_4 : reg_fr_0, FMT_V4);
+			op.rd = mkreg(reg_fr_3, true);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind == 12 && nfpr >= 2) // non-exploded vector: fpu spans must flush/die
+		{
+			op.op = shop_mov64;
+			u32 pairs = nfpr / 2;
+			op.rd = mkvec(fpr_pool[rnd_below(pairs) * 2], FMT_F64);
+			op.rs1 = mkvec(fpr_pool[rnd_below(pairs) * 2], FMT_F64);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind >= 10)
+			kind = rnd_below(10);
 
 		if (kind < 3) // mov32 reg-reg (i-i, f-f, or cross-file)
 		{
@@ -138,7 +185,7 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 
 static void dump_block(RuntimeBlockInfo* blk)
 {
-	static const char* fmt_names[] = { "null", "imm", "i32", "f32", "f64", "v2", "v4" };
+	static const char* fmt_names[] = { "null", "imm", "i32", "f32", "f64", "v2", "v4", "v16" };
 	for (size_t i = 0; i < blk->oplist.size(); i++)
 	{
 		shil_opcode* op = &blk->oplist[i];
@@ -209,11 +256,35 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 		for (int s = 0; s < 3; s++)
 		{
 			shil_param* p = srcs[s];
-			if (!p->is_r32())
-				continue;
-			u64 v = p->is_r32f() ? alloc->Rf[alloc->mapf(p->_reg)] : alloc->Rg[alloc->mapg(p->_reg)];
-			CHECK(v == arch[p->_reg], "op %zu reads r%d: host has %llx, arch has %llx\n",
-				opid, p->_reg, (unsigned long long)v, (unsigned long long)arch[p->_reg]);
+			if (p->is_r32())
+			{
+				u64 v = p->is_r32f() ? alloc->Rf[alloc->mapf(p->_reg)] : alloc->Rg[alloc->mapg(p->_reg)];
+				CHECK(v == arch[p->_reg], "op %zu reads r%d: host has %llx, arch has %llx\n",
+					opid, p->_reg, (unsigned long long)v, (unsigned long long)arch[p->_reg]);
+			}
+			else if (p->is_reg() && p->count() >= 2)
+			{
+				if (alloc->ExplodeVec(op, *p))
+				{
+					// exploded: every element must be mapped and current
+					for (u32 i = 0; i < p->count(); i++)
+					{
+						u64 v = alloc->Rf[alloc->mapf((Sh4RegType)(p->_reg + i))];
+						CHECK(v == arch[p->_reg + i], "op %zu reads vec elem r%d: host has %llx, arch has %llx\n",
+							opid, p->_reg + i, (unsigned long long)v, (unsigned long long)arch[p->_reg + i]);
+					}
+				}
+				else
+				{
+					// memory operand: dirty spans over it must have been
+					// written back before the op body runs
+					for (u32 i = 0; i < p->count(); i++)
+						CHECK(alloc->ctx[p->_reg + i] == arch[p->_reg + i],
+							"op %zu reads mem-vec elem r%d: ctx has %llx, arch has %llx\n",
+							opid, p->_reg + i, (unsigned long long)alloc->ctx[p->_reg + i],
+							(unsigned long long)arch[p->_reg + i]);
+				}
+			}
 		}
 
 		// then write dests
@@ -246,14 +317,40 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 			for (int d = 0; d < 2; d++)
 			{
 				shil_param* p = dsts[d];
-				if (!p->is_r32())
-					continue;
-				u64 v = next_val++;
-				arch[p->_reg] = v;
-				if (p->is_r32f())
-					alloc->Rf[alloc->mapf(p->_reg)] = v;
-				else
-					alloc->Rg[alloc->mapg(p->_reg)] = v;
+				if (p->is_r32())
+				{
+					u64 v = next_val++;
+					arch[p->_reg] = v;
+					if (p->is_r32f())
+						alloc->Rf[alloc->mapf(p->_reg)] = v;
+					else
+						alloc->Rg[alloc->mapg(p->_reg)] = v;
+				}
+				else if (p->is_reg() && p->count() >= 2)
+				{
+					if (alloc->ExplodeVec(op, *p))
+					{
+						// exploded: the op body writes the mapped elements
+						for (u32 i = 0; i < p->count(); i++)
+						{
+							u64 v = next_val++;
+							arch[p->_reg + i] = v;
+							alloc->Rf[alloc->mapf((Sh4RegType)(p->_reg + i))] = v;
+						}
+					}
+					else
+					{
+						// memory operand: the op body writes guest memory;
+						// overlapping spans must be dead (killed), so a later
+						// bogus writeback would corrupt this and be caught
+						for (u32 i = 0; i < p->count(); i++)
+						{
+							u64 v = next_val++;
+							arch[p->_reg + i] = v;
+							alloc->ctx[p->_reg + i] = v;
+						}
+					}
+				}
 			}
 		}
 
