@@ -82,6 +82,38 @@ void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr)
 	fflush(perf_map_file);
 }
 
+// memory ops take very different paths per access size and register file;
+// tag them so the per-shop breakdown separates readm.i32 from readm.f64 etc
+static const char* memop_kind(const shil_opcode& op)
+{
+	const shil_param& d = op.op == shop_readm ? op.rd : op.rs2;
+
+	switch (op.flags & 0x7F)
+	{
+	case 1: return "i8";
+	case 2: return "i16";
+	case 4: return d.is_r32f() ? "f32" : "i32";
+	case 8: return "f64";
+	default: return "v"; // grouped vector forms (rdgrp/wtgrp)
+	}
+}
+
+// movs range from a movw/movt pair (imm) through a possibly-elided reg-reg
+// copy to gpr<->vfp transfers; split them the same way
+static const char* mov32_kind(const shil_opcode& op)
+{
+	bool df = op.rd.is_r32f();
+
+	if (op.rs1.is_imm())
+		return df ? "immf" : "imm";
+
+	bool sf = op.rs1.is_r32f();
+	if (sf == df)
+		return df ? "f32" : "i32";
+
+	return sf ? "f2i" : "i2f";
+}
+
 void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block)
 {
 	if (!shop_map_file)
@@ -99,7 +131,14 @@ void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block)
 	{
 		shil_opcode& op = block->oplist[i];
 
-		fprintf(shop_map_file, "op %x %s\n", op.host_offs, shil_opcode_name(op.op));
+		if (op.op == shop_readm || op.op == shop_writem)
+			fprintf(shop_map_file, "op %x %s.%s%s\n", op.host_offs, shil_opcode_name(op.op),
+				memop_kind(op),
+				(op.op == shop_writem && op.flags2 == 0x1337) ? ".sq" : "");
+		else if (op.op == shop_mov32)
+			fprintf(shop_map_file, "op %x mov32.%s\n", op.host_offs, mov32_kind(op));
+		else
+			fprintf(shop_map_file, "op %x %s\n", op.host_offs, shil_opcode_name(op.op));
 	}
 
 	fflush(shop_map_file);
