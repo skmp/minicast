@@ -50,6 +50,7 @@ enum shil_param_type
 	FMT_F64,
 	FMT_V2,
 	FMT_V4,
+	FMT_V16,
 };
 
 enum shilop
@@ -67,6 +68,10 @@ enum shilop
 	shop_add,
 	shop_sbc,
 	shop_fadd,
+	// vector ops: the test allocator explodes their V4 params (like arm32
+	// does for the real ftrv/fipr); V16 stays a memory operand
+	shop_ftrv,
+	shop_fipr,
 };
 
 struct shil_param
@@ -89,6 +94,7 @@ struct shil_param
 		case FMT_I32: case FMT_F32: return 1;
 		case FMT_F64: case FMT_V2: return 2;
 		case FMT_V4: return 4;
+		case FMT_V16: return 16;
 		default: return 0;
 		}
 	}

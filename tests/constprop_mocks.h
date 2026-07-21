@@ -198,16 +198,22 @@ struct RuntimeBlockInfo
 
 // ---- controllable emulator state -------------------------------------------
 
+// dc boot rom: 2MB at physical 0
+#define BOOT_ROM_SIZE (2 * 1024 * 1024)
+
 // fake ram, indexed by physical offset
 extern u8 mock_ram[RAM_SIZE];
+// fake boot rom
+extern u8 mock_rom[BOOT_ROM_SIZE];
 // when true for a page, bm_RamPageHasData() reports it as data-containing
 extern bool mock_page_has_data[RAM_SIZE / PAGE_SIZE];
-// counts ReadMem* calls that fell outside ram -- must stay zero
+// counts ReadMem* calls that fell outside ram/rom -- must stay zero
 extern u32 mock_bad_reads;
 
 inline void mock_reset()
 {
 	memset(mock_ram, 0, sizeof(mock_ram));
+	memset(mock_rom, 0, BOOT_ROM_SIZE);
 	memset(mock_page_has_data, 0, sizeof(mock_page_has_data));
 	mock_bad_reads = 0;
 }
@@ -221,8 +227,20 @@ inline bool IsOnRam(u32 addr)
 	return false;
 }
 
+inline bool mock_on_rom(u32 addr)
+{
+	if (((addr >> 29) & 7) == 7) return false; // p4 / store queues
+	return (addr & 0x1FFFFFFF) < BOOT_ROM_SIZE;
+}
+
 inline u32 ReadMem32(u32 addr)
 {
+	if (mock_on_rom(addr))
+	{
+		u32 v;
+		memcpy(&v, &mock_rom[addr & 0x1FFFFFFF], 4);
+		return v;
+	}
 	if (!IsOnRam(addr))
 	{
 		// the real one would dispatch into an mmio handler here
@@ -236,6 +254,12 @@ inline u32 ReadMem32(u32 addr)
 
 inline u16 ReadMem16(u32 addr)
 {
+	if (mock_on_rom(addr))
+	{
+		u16 v;
+		memcpy(&v, &mock_rom[addr & 0x1FFFFFFF], 2);
+		return v;
+	}
 	if (!IsOnRam(addr))
 	{
 		mock_bad_reads++;
@@ -248,6 +272,8 @@ inline u16 ReadMem16(u32 addr)
 
 inline u8 ReadMem8(u32 addr)
 {
+	if (mock_on_rom(addr))
+		return mock_rom[addr & 0x1FFFFFFF];
 	if (!IsOnRam(addr))
 	{
 		mock_bad_reads++;

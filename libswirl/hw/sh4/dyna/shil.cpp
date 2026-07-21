@@ -409,10 +409,24 @@ void rw_related(RuntimeBlockInfo* blk)
 // the data mid-execution, like nullDC's is_writem_safe/shil_ce_is_locked.
 //-----------------------------------------------------------------------------
 
+//chatty by default; the host tests set this to false
+bool constprop_verbose=false;
+
+//TEST KNOB: when true, stores to unknown addresses don't stop baking.
+//UNSAFE in general -- a store through this very block's literal pool would
+//leave already-baked values stale for the rest of the execution.  Defaulted
+//on for the current experiment; flip back to false after.
+bool constprop_assume_stores_safe=true;
+
+//logs one transform and counts it for the per-block summary
+#define cplog(fmt, ...) do { changes++; if (constprop_verbose) \
+	printf("cprop %08X+%X: " fmt "\n", blk->addr, cur_guest_offs, ##__VA_ARGS__); } while (0)
+
 struct constprop_pass
 {
 	RuntimeBlockInfo* blk;
 	vector<shil_opcode> out;
+	u32 changes;
 
 	u32  val[16];     //known value, if konst
 	bool konst[16];
@@ -506,23 +520,46 @@ struct constprop_pass
 		return !(pl<bf || pf>bl);
 	}
 
+	//dc boot rom: 2MB at physical 0, immutable
+	static bool in_boot_rom(u32 addr, u32 size)
+	{
+		if (((addr>>29)&7)==7) return false;	//p4 / store queues
+		return (addr&0x1FFFFFFF)+size <= 0x00200000;
+	}
+
 	void step(shil_opcode o)
 	{
 		switch(o.op)
 		{
 		case shop_mov32:
 		{
-			bool known=false;
+			bool known=false, from_reg=false;
 			u32 v=0;
 			if (o.rs1.is_imm())          { known=true; v=o.rs1._imm; }
-			else if (is_const(o.rs1))    { known=true; v=cval(o.rs1); }
+			else if (is_const(o.rs1))    { known=true; from_reg=true; v=cval(o.rs1); }
 
 			if (known)
 			{
-				if (tracked(o.rd)) { set_const(o.rd,v); return; }
-				if (o.rd.is_r32i()) { o.rs1=mk_immp(v); push(o); return; }
+				if (tracked(o.rd))
+				{
+					if (from_reg)
+						cplog("mov32: r%d = r%d = %08X",o.rd._reg,o.rs1._reg,v);
+					set_const(o.rd,v);
+					return;
+				}
+				if (o.rd.is_r32i())
+				{
+					if (from_reg)
+						cplog("mov32: reg%d = #%08X",o.rd._reg,v);
+					o.rs1=mk_immp(v); push(o); return;
+				}
 				//f32 dest: arm32 can only load these two immediates
-				if (o.rd.is_r32f() && (v==0 || v==0x3F800000)) { o.rs1=mk_immp(v); push(o); return; }
+				if (o.rd.is_r32f() && (v==0 || v==0x3F800000))
+				{
+					if (from_reg)
+						cplog("mov32: f%d = #%08X",o.rd._reg-reg_fr_0,v);
+					o.rs1=mk_immp(v); push(o); return;
+				}
 			}
 			fallback(o);
 			return;
@@ -530,7 +567,11 @@ struct constprop_pass
 
 		case shop_add: case shop_sub: case shop_and: case shop_or: case shop_xor:
 		{
-			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs2))
+			{
+				cplog("op%d: rs2 r%d -> #%08X",o.op,o.rs2._reg,cval(o.rs2));
+				o.rs2=mk_immp(cval(o.rs2));
+			}
 			if (is_const(o.rs1) && o.rs2.is_imm() && o.rd.is_r32i())
 			{
 				u32 a=cval(o.rs1), b=o.rs2._imm, r;
@@ -542,6 +583,7 @@ struct constprop_pass
 				case shop_or:  r=a|b; break;
 				default:       r=a^b; break;
 				}
+				cplog("op%d folded: reg%d = %08X",o.op,o.rd._reg,r);
 				set_or_mov32(o.rd,r);
 				return;
 			}
@@ -549,6 +591,7 @@ struct constprop_pass
 			{
 				//commutative: move the constant into the imm slot
 				u32 a=cval(o.rs1);
+				cplog("op%d: commuted, r%d -> #%08X",o.op,o.rs1._reg,a);
 				o.rs1=o.rs2;
 				o.rs2=mk_immp(a);
 			}
@@ -571,7 +614,12 @@ struct constprop_pass
 				}
 				else if ((sh&0x1F)==0)
 				{
-					if (!arith) { set_or_mov32(o.rd,0); return; }
+					if (!arith)
+					{
+						cplog("shld by %d: reg%d = 0",sh,o.rd._reg);
+						set_or_mov32(o.rd,0);
+						return;
+					}
 					o.op=shop_sar;
 					o.rs2=mk_immp(31);
 				}
@@ -580,12 +628,17 @@ struct constprop_pass
 					o.op=arith?shop_sar:shop_shr;
 					o.rs2=mk_immp((-sh)&0x1F);
 				}
+				cplog("shld/shad by %d -> op%d #%d",sh,o.op,o.rs2._imm);
 			}
 			//fallthrough: maybe rs1 is known too
 		}
 		case shop_shl: case shop_shr: case shop_sar: case shop_ror:
 		{
-			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs2))
+			{
+				cplog("op%d: rs2 r%d -> #%08X",o.op,o.rs2._reg,cval(o.rs2));
+				o.rs2=mk_immp(cval(o.rs2));
+			}
 			if (is_const(o.rs1) && o.rs2.is_imm() && o.rd.is_r32i())
 			{
 				u32 a=cval(o.rs1), k=o.rs2._imm&0x1F, r;
@@ -596,6 +649,7 @@ struct constprop_pass
 				case shop_sar: r=(u32)((s32)a>>k); break;
 				default:       r=k?((a>>k)|(a<<(32-k))):a; break;
 				}
+				cplog("op%d folded: reg%d = %08X",o.op,o.rd._reg,r);
 				set_or_mov32(o.rd,r);
 				return;
 			}
@@ -618,6 +672,7 @@ struct constprop_pass
 				case shop_swaplb:  r=(a&0xFFFF0000)|((a&0xFF)<<8)|((a>>8)&0xFF); break;
 				default:           r=(a>>24)|((a>>16)&0xFF00)|((a&0xFF00)<<8)|(a<<24); break;
 				}
+				cplog("op%d folded: reg%d = %08X",o.op,o.rd._reg,r);
 				set_or_mov32(o.rd,r);
 				return;
 			}
@@ -636,6 +691,7 @@ struct constprop_pass
 				case shop_mul_s16: r=(u32)((s32)(s16)a*(s32)(s16)b); break;
 				default:           r=a*b; break;
 				}
+				cplog("op%d folded: reg%d = %08X",o.op,o.rd._reg,r);
 				set_or_mov32(o.rd,r);
 				return;
 			}
@@ -646,7 +702,11 @@ struct constprop_pass
 		case shop_test: case shop_seteq: case shop_setge: case shop_setgt:
 		case shop_setae: case shop_setab:
 		{
-			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs2))
+			{
+				cplog("op%d: rs2 r%d -> #%08X",o.op,o.rs2._reg,cval(o.rs2));
+				o.rs2=mk_immp(cval(o.rs2));
+			}
 			if (is_const(o.rs1) && o.rs2.is_imm() && o.rd.is_r32i())
 			{
 				u32 a=cval(o.rs1), b=o.rs2._imm, r;
@@ -659,6 +719,7 @@ struct constprop_pass
 				case shop_setae: r=a>=b; break;
 				default:         r=a>b; break;
 				}
+				cplog("op%d folded: T = %d",o.op,r);
 				set_or_mov32(o.rd,r);
 				return;
 			}
@@ -673,6 +734,7 @@ struct constprop_pass
 			{
 				u32 t=cval(o.rs1)^cval(o.rs2);
 				u32 r=!((t&0xFF000000)&&(t&0x00FF0000)&&(t&0x0000FF00)&&(t&0x000000FF));
+				cplog("setpeq folded: T = %d",r);
 				set_or_mov32(o.rd,r);
 				return;
 			}
@@ -682,46 +744,95 @@ struct constprop_pass
 
 		case shop_readm:
 		{
-			if (is_const(o.rs3)) o.rs3=mk_immp(cval(o.rs3));
+			if (is_const(o.rs3))
+			{
+				cplog("readm: rs3 r%d -> #%08X",o.rs3._reg,cval(o.rs3));
+				o.rs3=mk_immp(cval(o.rs3));
+			}
 			u32 size=o.flags&0x7F;
 
-			if (is_const(o.rs1))
+			//the address is known when the decoder already emitted an
+			//immediate base (pc-relative literals) or the base register is
+			//a tracked constant
+			bool addr_known=false, base_reg_const=false;
+			u32 addr=0;
+			if (o.rs3.is_null() || o.rs3.is_imm())
 			{
-				if (o.rs3.is_null() || o.rs3.is_imm())
+				u32 offs=o.rs3.is_imm()?o.rs3._imm:0;
+				if (o.rs1.is_imm())
 				{
-					u32 addr=cval(o.rs1)+(o.rs3.is_imm()?o.rs3._imm:0);
+					addr_known=true;
+					addr=o.rs1._imm+offs;
+				}
+				else if (is_const(o.rs1))
+				{
+					addr_known=true;
+					base_reg_const=true;
+					addr=cval(o.rs1)+offs;
+				}
+			}
 
-					if (allow_baking && baking_ok && locked &&
-					    (size==1||size==2||size==4) && on_block_pages(addr,size))
-					{
-						u32 data = size==1 ? (u32)(s32)(s8)ReadMem8(addr)
-						         : size==2 ? (u32)(s32)(s16)ReadMem16(addr)
-						         :           ReadMem32(addr);
-						if (tracked(o.rd))  { set_const(o.rd,data); return; }
-						if (o.rd.is_r32i()) { emit_mov32(o.rd,data); return; }
-						if (o.rd.is_r32f() && (data==0||data==0x3F800000)) { emit_mov32(o.rd,data); return; }
-						//other destinations: keep the load, imm address form below
-					}
+			if (addr_known)
+			{
+				//ram reads bake only while a write to them still discards
+				//this block; the boot rom can't change, so it always bakes
+				bool can_bake = (baking_ok && locked && on_block_pages(addr,size))
+				             || in_boot_rom(addr,size);
 
-					//address-imm form: 16/32-bit only.  arm32 has no 64-bit
-					//imm loads, and no 8-bit ones for direct-mapped regions
-					//(which we can't tell apart from handler regions here).
-					if ((size==2 || size==4) && o.rd.is_r32())
+				if (allow_baking && can_bake && (size==1||size==2||size==4))
+				{
+					u32 data = size==1 ? (u32)(s32)(s8)ReadMem8(addr)
+					         : size==2 ? (u32)(s32)(s16)ReadMem16(addr)
+					         :           ReadMem32(addr);
+					if (tracked(o.rd))
 					{
-						o.rs1=mk_immp(addr);
-						o.rs3=shil_param();
-						push(o);
-						kill(o.rd);
+						cplog("readm baked: [%08X] sz%d = %08X -> r%d",addr,size,data,o.rd._reg);
+						set_const(o.rd,data);
 						return;
 					}
+					if (o.rd.is_r32i())
+					{
+						cplog("readm baked: [%08X] sz%d = %08X -> reg%d",addr,size,data,o.rd._reg);
+						emit_mov32(o.rd,data);
+						return;
+					}
+					if (o.rd.is_r32f() && (data==0||data==0x3F800000))
+					{
+						cplog("readm baked: [%08X] sz%d = %08X -> f%d",addr,size,data,o.rd._reg-reg_fr_0);
+						emit_mov32(o.rd,data);
+						return;
+					}
+					//other destinations: keep the load, imm address form below
 				}
-				else if (o.rs3.is_r32i())
+
+				//address-imm form: 16/32-bit only.  arm32 has no 64-bit
+				//imm loads, and no 8-bit ones for direct-mapped regions
+				//(which we can't tell apart from handler regions here).
+				if (base_reg_const && (size==2 || size==4) && o.rd.is_r32())
 				{
-					//const base + reg offset: swap them, base becomes the imm offset
-					u32 base=cval(o.rs1);
-					o.rs1=o.rs3;
-					o.rs3=mk_immp(base);
+					cplog("readm promoted: [%08X] sz%d",addr,size);
+					o.rs1=mk_immp(addr);
+					o.rs3=shil_param();
+					push(o);
+					kill(o.rd);
+					return;
 				}
+
+				//already-imm base with an imm offset: fold to the canonical
+				//form the backend expects (imm rs1, null rs3)
+				if (o.rs1.is_imm() && o.rs3.is_imm())
+				{
+					o.rs1=mk_immp(addr);
+					o.rs3=shil_param();
+				}
+			}
+			else if (is_const(o.rs1) && o.rs3.is_r32i())
+			{
+				//const base + reg offset: swap them, base becomes the imm offset
+				u32 base=cval(o.rs1);
+				cplog("readm: const base r%d = %08X -> imm offset",o.rs1._reg,base);
+				o.rs1=o.rs3;
+				o.rs3=mk_immp(base);
 			}
 			fallback(o);
 			return;
@@ -729,7 +840,11 @@ struct constprop_pass
 
 		case shop_writem:
 		{
-			if (is_const(o.rs3)) o.rs3=mk_immp(cval(o.rs3));
+			if (is_const(o.rs3))
+			{
+				cplog("writem: rs3 r%d -> #%08X",o.rs3._reg,cval(o.rs3));
+				o.rs3=mk_immp(cval(o.rs3));
+			}
 
 			if (locked)
 			{
@@ -737,10 +852,14 @@ struct constprop_pass
 				{
 					u32 addr=cval(o.rs1)+(o.rs3.is_imm()?o.rs3._imm:0);
 					if (write_may_hit_block_pages(addr,o.flags&0x7F))
+					{
+						cplog("store may hit block pages [%08X]: baking off",addr);
 						locked=false;
+					}
 				}
-				else
+				else if (!constprop_assume_stores_safe)
 				{
+					cplog("store to unknown address: baking off");
 					locked=false; //unknown target: assume the worst
 				}
 			}
@@ -750,7 +869,11 @@ struct constprop_pass
 
 		case shop_jdyn:
 		{
-			if (is_const(o.rs2)) o.rs2=mk_immp(cval(o.rs2));
+			if (is_const(o.rs2))
+			{
+				cplog("jdyn: rs2 r%d -> #%08X",o.rs2._reg,cval(o.rs2));
+				o.rs2=mk_immp(cval(o.rs2));
+			}
 			if (is_const(o.rs1))
 			{
 				u32 target=cval(o.rs1)+(o.rs2.is_imm()?o.rs2._imm:0);
@@ -758,6 +881,7 @@ struct constprop_pass
 				{
 					blk->BranchBlock=target;
 					blk->BlockType = blk->BlockType==BET_DynamicJump ? BET_StaticJump : BET_StaticCall;
+					cplog("jdyn -> static %s %08X",blk->BlockType==BET_StaticJump?"jump":"call",target);
 					return; //dropped; pc_dyn no longer needed
 				}
 			}
@@ -767,10 +891,14 @@ struct constprop_pass
 
 		case shop_ifb:
 		{
+			if (locked)
+				cplog("ifb: baking off");
 			writeback_range(0,15);
 			push(o);
 			kill_range(0,15);
-			locked=false; //the interpreter can write anywhere
+			if (!constprop_assume_stores_safe) {
+				locked=false; //the interpreter can write anywhere
+			}
 			return;
 		}
 
@@ -786,8 +914,15 @@ struct constprop_pass
 		case shop_pref:
 		{
 			if (is_const(o.rs1) && (cval(o.rs1)>>26)!=0x38)
+			{
+				cplog("pref dropped: r%d = %08X is not sq",o.rs1._reg,cval(o.rs1));
 				return; //provably not a store-queue address: pref is a nop
-			locked=false; //an SQ flush stores to ram we can't see
+			}
+			if (!constprop_assume_stores_safe) {
+				if (locked)
+					cplog("pref: baking off");
+				locked=false; //an SQ flush stores to ram we can't see
+			}
 			fallback(o);
 			return;
 		}
@@ -816,6 +951,10 @@ void constprop(RuntimeBlockInfo* blk, bool allow_memory_baking=true)
 	}
 
 	cp.writeback_range(0,15);
+
+	if (constprop_verbose && cp.changes)
+		printf("cprop %08X: %u changes, %u -> %u ops\n",
+			blk->addr,cp.changes,(u32)blk->oplist.size(),(u32)cp.out.size());
 
 	blk->oplist.swap(cp.out);
 

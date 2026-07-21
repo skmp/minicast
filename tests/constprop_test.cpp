@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 u8 mock_ram[RAM_SIZE];
+u8 mock_rom[BOOT_ROM_SIZE];
 bool mock_page_has_data[RAM_SIZE / PAGE_SIZE];
 u32 mock_bad_reads;
 
@@ -874,6 +875,44 @@ static void t_f32_mov()
 	}
 }
 
+static void t_imm_literal_bake()
+{
+	// pc-relative literals arrive from the decoder with an immediate base;
+	// they must bake exactly like const-register bases
+	mock_reset();
+	wr_ram32(LIT, LITVAL);
+	RuntimeBlockInfo b = mkblk();
+	b.oplist.push_back(OP(shop_readm, R(reg_r0), I(LIT), P(), 4));
+	constprop(&b);
+	check_arm32_forms(b.oplist);
+	verify(count_op(b.oplist, shop_readm) == 0);
+	verify(find_mov_imm(b.oplist, reg_r0, LITVAL) >= 0);
+	verify(mock_bad_reads == 0);
+}
+
+static void t_rom_bake()
+{
+	// the boot rom is immutable: reads bake regardless of page locks,
+	// block location or preceding stores
+	mock_reset();
+	u32 rom_lit = 0x80000400; // p1-mapped boot rom
+	u32 val = 0x12345678;
+	memcpy(&mock_rom[0x400], &val, 4);
+
+	RuntimeBlockInfo b = mkblk();
+	mock_page_has_data[(BLK & RAM_MASK) / PAGE_SIZE] = true; // ram baking off
+	b.oplist.push_back(OP(shop_writem, P(), R(reg_r8), R(reg_r2), 4)); // unknown store
+	b.oplist.push_back(OP(shop_mov32, R(reg_r1), I(rom_lit)));
+	b.oplist.push_back(OP(shop_readm, R(reg_r0), R(reg_r1), P(), 4));
+	b.oplist.push_back(OP(shop_readm, R(reg_r3), I(rom_lit), P(), 4)); // decoder form
+	constprop(&b);
+	check_arm32_forms(b.oplist);
+	verify(count_op(b.oplist, shop_readm) == 0);
+	verify(find_mov_imm(b.oplist, reg_r0, val) >= 0);
+	verify(find_mov_imm(b.oplist, reg_r3, val) >= 0);
+	verify(mock_bad_reads == 0);
+}
+
 static void t_baking_disabled()
 {
 	// safemode: pure constprop still runs, memory is never read at compile time
@@ -1106,6 +1145,9 @@ int main(int argc, char** argv)
 	u32 seed = argc > 1 ? (u32)strtoul(argv[1], nullptr, 0) : 1;
 	u32 iters = argc > 2 ? (u32)strtoul(argv[2], nullptr, 0) : 5000;
 
+	constprop_verbose = false; // the fuzzer would print millions of lines
+	constprop_assume_stores_safe = false; // tests verify the safe behavior
+
 	t_bake_and_jdyn_promote();
 	t_rd2_kill();
 	t_no_bake_when_page_has_data();
@@ -1123,6 +1165,8 @@ int main(int argc, char** argv)
 	t_cmp_fold();
 	t_jdyn_offset();
 	t_f32_mov();
+	t_imm_literal_bake();
+	t_rom_bake();
 	t_baking_disabled();
 	printf("directed tests: ok\n");
 
