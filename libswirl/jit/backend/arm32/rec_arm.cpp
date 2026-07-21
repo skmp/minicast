@@ -2061,12 +2061,35 @@ struct Arm32NGenBackend: NGenBackend
 			cyc&=~3;
 		}
 
+		//only provably-backward static branches poll for interrupts (subs +
+		//blle intc_sched); everything else -- forward statics AND dynamic
+		//ends -- just pays the decrement with a plain sub.  Constprop-promoted
+		//static ends have a known target and are judged like any other static.
+		bool cycle_check=true;
+		if (settings.dynarec.cyclecheck_backwards_only)
+		{
+			switch(block->BlockType)
+			{
+			case BET_StaticJump:
+			case BET_StaticCall:
+			case BET_Cond_0:
+			case BET_Cond_1:	//NextBlock is always forward
+				cycle_check = block->BranchBlock<=block->addr;
+				break;
+
+			default:
+				cycle_check = false;	//dynamic ends: skip the poll
+				break;
+			}
+		}
+
 	#if HOST_OS == OS_DARWIN
-		SUB(r11,r11,cyc,true,CC_AL);
+		SUB(r11,r11,cyc,cycle_check,CC_AL);
 	#else
-		SUB(rfp_r9,rfp_r9,cyc,true,CC_AL);
+		SUB(rfp_r9,rfp_r9,cyc,cycle_check,CC_AL);
 	#endif
-		CALL((u32)intc_sched, CC_LE);
+		if (cycle_check)
+			CALL((u32)intc_sched, CC_LE);
 
 		//compile the block's opcodes
 		shil_opcode* op;

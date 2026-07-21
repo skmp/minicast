@@ -203,6 +203,7 @@ struct RuntimeBlockInfo
 	u32 BranchBlock = 0xFFFFFFFF;
 	u32 NextBlock = 0xFFFFFFFF;
 	BlockEndType BlockType = BET_StaticJump;
+	bool static_from_constprop = false;
 	u32 memops = 0;
 	u32 linkedmemops = 0;
 	vector<shil_opcode> oplist;

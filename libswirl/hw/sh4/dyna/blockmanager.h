@@ -55,6 +55,10 @@ struct RuntimeBlockInfo: RuntimeBlockInfo_Core
 
 	BlockEndType BlockType;
 	bool has_jcond;
+	// set when constprop turned a dynamic end into a static one. Such a block
+	// looks statically-targeted but stands in for an indirect jump, so the
+	// backwards-only cycle check must not treat it as provably forward.
+	bool static_from_constprop;
 
 	vector<shil_opcode> oplist;
 

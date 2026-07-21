@@ -280,6 +280,7 @@ void InitSettings()
     settings.dynarec.Enable = true;
     settings.dynarec.idleskip = true;
     settings.dynarec.unstable_opt = false;
+    settings.dynarec.cyclecheck_backwards_only = false;
     settings.dynarec.safemode = true;
     settings.dynarec.ScpuEnable = true;
     settings.dynarec.DspEnable = true;
@@ -382,6 +383,7 @@ void LoadSettings(bool game_specific)
     settings.dynarec.Enable = cfgLoadBool(config_section, "Dynarec.Enabled", settings.dynarec.Enable);
     settings.dynarec.idleskip = cfgLoadBool(config_section, "Dynarec.idleskip", settings.dynarec.idleskip);
     settings.dynarec.unstable_opt = cfgLoadBool(config_section, "Dynarec.unstable-opt", settings.dynarec.unstable_opt);
+    settings.dynarec.cyclecheck_backwards_only = cfgLoadBool(config_section, "Dynarec.cyclecheck-backwards-only", settings.dynarec.cyclecheck_backwards_only);
     settings.dynarec.safemode = cfgLoadBool(config_section, "Dynarec.safe-mode", settings.dynarec.safemode);
     settings.dynarec.SmcCheckLevel = (SmcCheckEnum)cfgLoadInt(config_section, "Dynarec.SmcCheckLevel", settings.dynarec.SmcCheckLevel);
     settings.dynarec.ScpuEnable = cfgLoadInt(config_section, "Dynarec.ScpuEnabled", settings.dynarec.ScpuEnable);
@@ -547,6 +549,7 @@ void SaveSettings()
     cfgSaveBool("config", "Dreamcast.FullMMU", settings.dreamcast.FullMMU);
     cfgSaveBool("config", "Dynarec.idleskip", settings.dynarec.idleskip);
     cfgSaveBool("config", "Dynarec.unstable-opt", settings.dynarec.unstable_opt);
+    cfgSaveBool("config", "Dynarec.cyclecheck-backwards-only", settings.dynarec.cyclecheck_backwards_only);
 
     cfgSaveBool("config", "SavePopup.isShown", settings.savepopup.isShown);
 

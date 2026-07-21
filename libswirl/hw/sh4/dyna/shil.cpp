@@ -937,6 +937,9 @@ struct constprop_pass
 				{
 					blk->BranchBlock=target;
 					blk->BlockType = blk->BlockType==BET_DynamicJump ? BET_StaticJump : BET_StaticCall;
+					//stands in for an indirect jump: the backwards-only
+					//cycle check must not treat it as provably forward
+					blk->static_from_constprop=true;
 					cplog("jdyn -> static %s %08X",blk->BlockType==BET_StaticJump?"jump":"call",target);
 					return; //dropped; pc_dyn no longer needed
 				}

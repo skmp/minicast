@@ -505,6 +505,7 @@ static void t_bake_and_jdyn_promote()
 
 	verify(b.BlockType == BET_StaticJump);
 	verify(b.BranchBlock == LITVAL);
+	verify(b.static_from_constprop); // must keep the backwards-only cycle check
 	verify(count_op(b.oplist, shop_readm) == 0);
 	verify(count_op(b.oplist, shop_jdyn) == 0);
 	// end-of-block writebacks keep the guest state architecturally correct
@@ -867,6 +868,7 @@ static void t_jdyn_offset()
 	check_arm32_forms(b.oplist);
 	verify(b.BlockType == BET_StaticCall);
 	verify(b.BranchBlock == 0x8C0100F8);
+	verify(b.static_from_constprop);
 	verify(count_op(b.oplist, shop_jdyn) == 0);
 }
 

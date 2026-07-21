@@ -501,6 +501,12 @@ struct settings_t
 		bool unstable_opt;
 		bool safemode;
 		bool disable_nvmem;
+		// only poll for interrupts (subs/blle intc_sched) on blocks that can
+		// branch backwards or whose exit target is unknown at compile time.
+		// Forward-only blocks cannot close a loop on their own, so they just
+		// decrement the counter (plain sub) -- a later backward/dynamic block
+		// always runs the check.
+		bool cyclecheck_backwards_only;
 		SmcCheckEnum SmcCheckLevel;
 		int ScpuEnable;
 		int DspEnable;
