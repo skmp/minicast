@@ -952,6 +952,65 @@ static void t_shift_chains()
 	verify(count_op(b6.oplist, shop_shl) == 1 && count_op(b6.oplist, shop_shr) == 1);
 }
 
+static void t_dse()
+{
+	// overwritten pure values die; the final write survives (live-out)
+	mock_reset();
+	RuntimeBlockInfo b = mkblk();
+	b.oplist.push_back(OP(shop_add, R(reg_r0), R(reg_r1), R(reg_r2)));
+	b.oplist.push_back(OP(shop_add, R(reg_r0), R(reg_r3), R(reg_r4)));
+	b.oplist.push_back(OP(shop_test, R(reg_sr_T), R(reg_r1), R(reg_r2)));
+	b.oplist.push_back(OP(shop_test, R(reg_sr_T), R(reg_r3), R(reg_r4)));
+	dead_value_elim(&b);
+	verify(b.oplist.size() == 2);
+	verify(b.oplist[0].rs1._reg == reg_r3);
+	verify(b.oplist[1].rs1._reg == reg_r3);
+
+	// a readm is never removed, but its write still kills the value before it
+	mock_reset();
+	RuntimeBlockInfo b2 = mkblk();
+	b2.oplist.push_back(OP(shop_mov32, R(reg_r0), R(reg_r5)));
+	b2.oplist.push_back(OP(shop_readm, R(reg_r0), R(reg_r8), P(), 4));
+	dead_value_elim(&b2);
+	verify(b2.oplist.size() == 1);
+	verify(b2.oplist[0].op == shop_readm);
+
+	// a barrier may read anything: both writes stay
+	mock_reset();
+	RuntimeBlockInfo b3 = mkblk();
+	b3.oplist.push_back(OP(shop_add, R(reg_r0), R(reg_r1), R(reg_r2)));
+	b3.oplist.push_back(OP(shop_ifb, P(), I(0), I(0x8C000000), 0, I(0)));
+	b3.oplist.push_back(OP(shop_add, R(reg_r0), R(reg_r3), R(reg_r4)));
+	dead_value_elim(&b3);
+	verify(count_op(b3.oplist, shop_add) == 2);
+
+	// two-dest op dies only when both results are dead
+	mock_reset();
+	RuntimeBlockInfo b4 = mkblk();
+	b4.oplist.push_back(OP(shop_mul_u64, R(reg_macl), R(reg_r1), R(reg_r2), 0, P(), R(reg_mach)));
+	b4.oplist.push_back(OP(shop_mov32, R(reg_macl), R(reg_r3)));
+	dead_value_elim(&b4);
+	verify(count_op(b4.oplist, shop_mul_u64) == 1); // mach still live
+
+	mock_reset();
+	RuntimeBlockInfo b5 = mkblk();
+	b5.oplist.push_back(OP(shop_mul_u64, R(reg_macl), R(reg_r1), R(reg_r2), 0, P(), R(reg_mach)));
+	b5.oplist.push_back(OP(shop_mov32, R(reg_macl), R(reg_r3)));
+	b5.oplist.push_back(OP(shop_mov32, R(reg_mach), R(reg_r4)));
+	dead_value_elim(&b5);
+	verify(count_op(b5.oplist, shop_mul_u64) == 0); // both dead now
+
+	// a dead value chain collapses: the consumer dies first, then its feeder
+	mock_reset();
+	RuntimeBlockInfo b6 = mkblk();
+	b6.oplist.push_back(OP(shop_add, R(reg_r0), R(reg_r1), R(reg_r2)));
+	b6.oplist.push_back(OP(shop_shl, R(reg_r0), R(reg_r0), I(4)));
+	b6.oplist.push_back(OP(shop_mov32, R(reg_r0), R(reg_r3)));
+	dead_value_elim(&b6);
+	verify(b6.oplist.size() == 1);
+	verify(b6.oplist[0].op == shop_mov32);
+}
+
 static void t_readm_pair_fusion()
 {
 	// fmov.s @Rn+ x3 (a vertex fetch): first two loads pair up, their +4s
@@ -1117,6 +1176,7 @@ struct Fuzz
 
 		constprop(&b, allow_baking);
 		fuse_readm_pairs(&b);
+		dead_value_elim(&b);
 
 		verify(mock_bad_reads == 0);
 		check_arm32_forms(b.oplist);
@@ -1321,6 +1381,7 @@ int main(int argc, char** argv)
 	t_jdyn_offset();
 	t_f32_mov();
 	t_shift_chains();
+	t_dse();
 	t_readm_pair_fusion();
 	t_imm_literal_bake();
 	t_rom_bake();

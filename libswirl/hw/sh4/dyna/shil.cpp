@@ -1083,6 +1083,97 @@ void fuse_readm_pairs(RuntimeBlockInfo* blk)
 	}
 }
 
+//-----------------------------------------------------------------------------
+// Dead value elimination
+//
+// Backward liveness over the block: an op with no side effects whose every
+// written register is overwritten later in the block before any read is dead.
+// Everything is live at block end -- the next block may read any register.
+// This generalizes srt_waw() from sr_T to the whole register file.
+//-----------------------------------------------------------------------------
+
+//ops that only compute register values -- removable when their outputs die.
+//Everything else (memory, branches, calls, frswap, debug) stays.
+static bool dse_pure(shilop op)
+{
+	switch(op)
+	{
+	case shop_mov32: case shop_mov64:
+	case shop_and: case shop_or: case shop_xor: case shop_not:
+	case shop_add: case shop_sub: case shop_neg:
+	case shop_shl: case shop_shr: case shop_sar: case shop_ror:
+	case shop_adc: case shop_sbc: case shop_rocl: case shop_rocr:
+	case shop_swaplb: case shop_swap: case shop_shld: case shop_shad:
+	case shop_ext_s8: case shop_ext_s16:
+	case shop_mul_u16: case shop_mul_s16: case shop_mul_i32:
+	case shop_mul_u64: case shop_mul_s64:
+	case shop_div32u: case shop_div32s: case shop_div32p2:
+	case shop_cvt_f2i_t: case shop_cvt_i2f_n: case shop_cvt_i2f_z:
+	case shop_test: case shop_seteq: case shop_setge: case shop_setgt:
+	case shop_setae: case shop_setab: case shop_setpeq:
+	case shop_fadd: case shop_fsub: case shop_fmul: case shop_fdiv:
+	case shop_fabs: case shop_fneg: case shop_fsqrt: case shop_fmac:
+	case shop_fsrra: case shop_fipr: case shop_ftrv: case shop_fsca:
+	case shop_fseteq: case shop_fsetgt:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void dead_value_elim(RuntimeBlockInfo* blk)
+{
+	bool live[sh4_reg_count];
+	memset(live,1,sizeof(live));
+
+	for (int i=(int)blk->oplist.size();i-->0;)
+	{
+		shil_opcode& o=blk->oplist[i];
+
+		//conservative barriers: may read and write any register
+		if (o.op==shop_ifb || o.op==shop_sync_sr || o.op==shop_sync_fpscr)
+		{
+			memset(live,1,sizeof(live));
+			continue;
+		}
+
+		const shil_param* wr[2]={&o.rd,&o.rd2};
+		const shil_param* rs[3]={&o.rs1,&o.rs2,&o.rs3};
+
+		if (dse_pure(o.op))
+		{
+			bool has_dest=false, any_live=false;
+			for (int p=0;p<2;p++)
+			{
+				if (!wr[p]->is_reg()) continue;
+				has_dest=true;
+				for (u32 c=0;c<wr[p]->count();c++)
+					any_live|=live[wr[p]->_reg+c];
+			}
+
+			if (has_dest && !any_live)
+			{
+				if (constprop_verbose)
+					printf("dse %08X+%X: op%d (reg%d) is dead\n",
+						blk->addr,o.guest_offs,o.op,o.rd._reg);
+				blk->oplist.erase(blk->oplist.begin()+i);
+				continue;
+			}
+		}
+
+		//the op stays: its writes kill, then its reads revive
+		for (int p=0;p<2;p++)
+			if (wr[p]->is_reg())
+				for (u32 c=0;c<wr[p]->count();c++)
+					live[wr[p]->_reg+c]=false;
+
+		for (int p=0;p<3;p++)
+			if (rs[p]->is_reg())
+				for (u32 c=0;c<rs[p]->count();c++)
+					live[rs[p]->_reg+c]=true;
+	}
+}
+
 //read_v4m3z1
 void read_v4m3z1(RuntimeBlockInfo* blk)
 {
@@ -1460,6 +1551,7 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 	*/
 	constprop(blk, !settings.dynarec.safemode);
 	fuse_readm_pairs(blk);
+	dead_value_elim(blk);
 
 	if (settings.dynarec.unstable_opt)
 		sq_pref(blk);

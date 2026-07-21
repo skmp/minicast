@@ -171,6 +171,18 @@ struct shil_param
 	bool is_r32() const { return is_r32i() || is_r32f(); }
 
 	bool is_imm_s16() const { return is_imm() && (s32)_imm >= -32768 && (s32)_imm <= 32767; }
+
+	u32 count() const
+	{
+		switch (type)
+		{
+		case FMT_I32: case FMT_F32: return 1;
+		case FMT_F64: case FMT_V2: return 2;
+		case FMT_V4: return 4;
+		case FMT_V16: return 16;
+		default: return 0;
+		}
+	}
 };
 
 struct shil_opcode
