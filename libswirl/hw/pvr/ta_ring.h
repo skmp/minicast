@@ -83,6 +83,21 @@ extern u8 pvr_regs_mtta[];
 #define TA_RING_DMB() __sync_synchronize()
 #endif
 
+// WFE/SEV pairing for the idle edges: a waiter parks in wfe instead of
+// hammering the shared cache lines (and heating a core the other thread
+// shares an L2 with); the other side sevs after publishing its index.
+// The event register makes check-then-wait race-free: a sev arriving
+// between the check and the wfe leaves the event pending, so the wfe
+// falls straight through and the loop re-checks. wfe also wakes on any
+// interrupt, so a lost sev can only cost one tick, never a hang.
+#if HOST_CPU == CPU_ARM || HOST_CPU == CPU_ARM64
+#define TA_RING_WFE() __asm__ __volatile__("wfe" ::: "memory")
+#define TA_RING_SEV() __asm__ __volatile__("sev" ::: "memory")
+#else
+#define TA_RING_WFE()
+#define TA_RING_SEV()
+#endif
+
 // Producer: copy one 32-byte block into the ring, spinning while full. No
 // barrier and no shared-index store here - just a plain copy + private cursor
 // bump. Call ta_ring_publish() to make the batch visible to the consumer.
@@ -90,14 +105,19 @@ static inline void ta_ring_push(const void* block)
 {
 	u32 wr = ta_ring.write_priv;
 
-	// Spin until there is room. Check against the cached read index first and
+	// Wait until there is room. Check against the cached read index first and
 	// only refresh from the shared line when the cache says we're full, so the
-	// common case never touches the consumer's cache line.
+	// common case never touches the consumer's cache line. A full ring parks
+	// in wfe; the consumer sevs after retiring each batch.
 	if ((wr - ta_ring.read_cache) >= TA_RING_BLOCKS)
 	{
-		do {
+		for (;;)
+		{
 			ta_ring.read_cache = ta_ring.read_pub;
-		} while ((wr - ta_ring.read_cache) >= TA_RING_BLOCKS);
+			if ((wr - ta_ring.read_cache) < TA_RING_BLOCKS)
+				break;
+			TA_RING_WFE();
+		}
 	}
 
 	memcpy(&ta_ring.data[(wr & TA_RING_MASK) * TA_RING_BLOCK], block, TA_RING_BLOCK);
@@ -111,6 +131,7 @@ static inline void ta_ring_push(const void* block)
 	{
 		TA_RING_DMB();
 		ta_ring.write_pub = wr;
+		TA_RING_SEV();
 	}
 }
 
@@ -122,16 +143,18 @@ static inline void ta_ring_publish()
 	{
 		TA_RING_DMB();
 		ta_ring.write_pub = ta_ring.write_priv;
+		TA_RING_SEV();
 	}
 }
 
-// Producer: publish, then spin until the consumer has drained everything.
+// Producer: publish, then wait until the consumer has drained everything.
 static inline void ta_ring_drain()
 {
 	ta_ring_publish();
 	while (ta_ring.read_pub != ta_ring.write_priv)
 	{
-		// wait for the consumer to drain the ring
+		// wait for the consumer to drain the ring; it sevs per retired batch
+		TA_RING_WFE();
 	}
 }
 

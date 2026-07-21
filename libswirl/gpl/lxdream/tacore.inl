@@ -1455,16 +1455,21 @@ void lxd_ta_write_burst( sh4addr_t addr, unsigned char *data )
     write_cache so an empty ring is detected without touching the producer's line.
 */
 static void* ta_ring_consumer_thread(void* /*param*/) {
-    ta_ring_pin_thread(1);
+    // cpu0 takes the system's IRQ load; the spin loop tolerates it,
+    // the sh4/jit thread (pinned to cpu1) does not
+    ta_ring_pin_thread(0);
 
     for (;;) {
         // Fast empty check against our private cache first.
         u32 rd = ta_ring.read_pub;
         if (rd == ta_ring.write_cache) {
-            // Refresh from the shared line; still empty -> spin.
+            // Refresh from the shared line; still empty -> park until the
+            // producer sevs a publish (or any interrupt wakes us).
             ta_ring.write_cache = ta_ring.write_pub;
-            if (rd == ta_ring.write_cache)
+            if (rd == ta_ring.write_cache) {
+                TA_RING_WFE();
                 continue;
+            }
 
             // New data was published: observe it after the index that announced it.
             TA_RING_DMB();
@@ -1477,9 +1482,11 @@ static void* ta_ring_consumer_thread(void* /*param*/) {
             rd++;
         }
 
-        // Retire the batch. One store, ordered after the reads above.
+        // Retire the batch. One store, ordered after the reads above; the sev
+        // wakes a producer parked on a full ring or in ta_ring_drain().
         TA_RING_DMB();
         ta_ring.read_pub = rd;
+        TA_RING_SEV();
     }
 
     return NULL;

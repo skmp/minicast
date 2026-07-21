@@ -751,8 +751,10 @@ struct Dreamcast_impl : VirtualDreamcast {
 #ifndef TARGET_DISPFRAME
     void MainLoop()
     {
-        // sh4/producer on cpu0; the mtta consumer pins itself to cpu1
-        ta_ring_pin_thread(0);
+        // sh4/producer on cpu1 -- linux routes IRQs/softirqs to cpu0 by
+        // default, and the jit is far more interference-sensitive than the
+        // spinning ta consumer, which pins itself to cpu0
+        ta_ring_pin_thread(1);
 
 #if FEAT_HAS_NIXPROF
         install_prof_handler(0);
