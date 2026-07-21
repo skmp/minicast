@@ -337,6 +337,18 @@ u32 blockno=0;
 map<shilop,ConditionCode> ccmap;
 map<shilop,ConditionCode> ccnmap;
 
+//a branch to the instruction right after itself is a fallthrough: emit a NOP
+//instead, saving the redirect when the target block sits physically next in
+//the code buffer. The slot stays 4 bytes, so a later Relink() can still turn
+//it back into a real branch (or an unlink stub call).
+static void JUMP_or_fallthrough(u32 target)
+{
+	if (target == (u32)EMIT_GET_PTR() + 4)
+		NOP();
+	else
+		JUMP(target);
+}
+
 u32 DynaRBI::Relink()
 {
 	verify(emit_ptr==0);
@@ -383,7 +395,7 @@ u32 DynaRBI::Relink()
 			CALL((u32)ngen_LinkBlock_cond_Branch_stub,CC);
 
 		if (pNextBlock)
-			JUMP((u32)pNextBlock->code);
+			JUMP_or_fallthrough((u32)pNextBlock->code);
 		else
 			CALL((u32)ngen_LinkBlock_cond_Next_stub);
 		break;
@@ -481,7 +493,7 @@ u32 DynaRBI::Relink()
 				CALL((u32)pBranchBlock->code);
 			else
 #endif
-				JUMP((u32)pBranchBlock->code);
+				JUMP_or_fallthrough((u32)pBranchBlock->code);
 		}
 		break;
 	}
