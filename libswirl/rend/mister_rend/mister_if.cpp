@@ -54,8 +54,10 @@ void rend_vblank() {
 // 500ms watchdog + AutoReset the blocking wait in rend_end_render has
 static uint64_t poll_deadline_ns;
 
+static std::atomic<bool> polly_gone;
+
 bool rend_render_done() {
-    if (polly2_done()) {
+    if (polly_gone && polly2_done()) {
         poll_deadline_ns = 0;
         return true;
     }
@@ -79,6 +81,7 @@ bool rend_render_done() {
 void startpolly() {
     __asm__ volatile("dsb sy" ::: "memory");
 
+    polly_gone = true;
     polly2_go();
 }
 
@@ -90,7 +93,7 @@ void rend_start_render(u8* vram) {
         // while (goal > ta_eol_interrupt_mark) {
         //     ;
         // }
-
+        polly_gone = false;
         DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
         (u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
         ring_op[2] = TA_RING_DECOUPLED_OP_STARTPOLLY;
@@ -122,7 +125,7 @@ void rend_end_render() {
     int timeout = 0;
     while (true)
     {
-        if (polly2_done()) {
+        if (polly_gone && polly2_done()) {
             break;
         }
 
