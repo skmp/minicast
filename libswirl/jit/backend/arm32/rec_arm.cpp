@@ -1699,12 +1699,34 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 				}
 				xmtrx_resident=true;
 
-				eFSReg vin[4];
-				for (int i=0;i<4;i++)
-					vin[i]=reg.mapfv(op->rs1,i);
+				//in-place transform: the outputs alias the inputs
+				verify(op->rd._reg==op->rs1._reg);
 
-				//out[i] = sum_j m[4j+i]*v[j], accumulated in the f28+ temps
-				//so every vin read happens before any rd write (rd aliases rs1)
+				eFSReg v[4];
+				for (int i=0;i<4;i++)
+					v[i]=reg.mapfv(op->rs1,i);
+
+				bool w0=(op->flags & FTRV_W_ZERO)!=0;
+				bool w1=(op->flags & FTRV_W_ONE)!=0;
+
+				//accumulate straight into the mapped outputs; the chains then
+				//END in their destination registers, with no result movs on
+				//the tail. Stage 0 overwrites the input registers, so v1..v3
+				//are copied aside first (head copies, hidden under the column
+				//load); v0 is fully consumed by stage 0 itself when its own
+				//register is written last, and a flagged w never reads v3.
+				eFSReg mul[4];
+				mul[0]=v[0];
+				for (int j=1;j<4;j++)
+				{
+					if (j==3 && (w0 || w1))
+						break;
+					mul[j]=(eFSReg)(f28+j);
+					VMOV(mul[j],v[j]);
+				}
+
+				//(all four columns still load when the matrix isn't resident,
+				//so xmtrx_resident stays truthful for the next ftrv)
 				for (int j=0;j<4;j++)
 				{
 					//prefetch the next column: the load retires in the LS
@@ -1712,17 +1734,31 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 					if (load_mtx && j<3)
 						VLDM((eFDReg)(d0+2*(j+1)),r2,2,j<2?1:0);
 
-					for (int i=0;i<4;i++)
+					//known w=0: the fourth column contributes nothing
+					if (j==3 && w0)
+						continue;
+
+					if (j==0)
 					{
-						if (j==0)
-							VMUL_VFP((eFSReg)(f28+i),(eFSReg)(f0+4*j+i),vin[j]);
-						else
-							VMLA_VFP((eFSReg)(f28+i),(eFSReg)(f0+4*j+i),vin[j]);
+						//all chains read v0; its own register goes last
+						VMUL_VFP(v[1],(eFSReg)(f0+1),mul[0]);
+						VMUL_VFP(v[2],(eFSReg)(f0+2),mul[0]);
+						VMUL_VFP(v[3],(eFSReg)(f0+3),mul[0]);
+						VMUL_VFP(v[0],(eFSReg)(f0+0),mul[0]);
+					}
+					else if (j==3 && w1)
+					{
+						//known w=1: plain add, and vadd retires ~4 cycles
+						//sooner than a dependent vmla at the chain tail
+						for (int i=0;i<4;i++)
+							VADD_VFP(v[i],v[i],(eFSReg)(f0+12+i));
+					}
+					else
+					{
+						for (int i=0;i<4;i++)
+							VMLA_VFP(v[i],(eFSReg)(f0+4*j+i),mul[j]);
 					}
 				}
-
-				for (int i=0;i<4;i++)
-					VMOV(reg.mapfv(op->rd,i),(eFSReg)(f28+i));
 			}
 			break;
 

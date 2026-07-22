@@ -1177,6 +1177,81 @@ void dead_value_elim(RuntimeBlockInfo* blk)
 	}
 }
 
+//-----------------------------------------------------------------------------
+// ftrv known-w detection
+//
+// Geometry code loads the transformed vector's w with fldi0/fldi1 right
+// before the ftrv (point vs direction transform), and the ftrv overwrites
+// the whole vector, so that constant has exactly one consumer. Flag the
+// ftrv (FTRV_W_ZERO/ONE) and drop the load; the emitter substitutes the
+// constant, skipping the fourth MAC stage entirely for w=0 and turning it
+// into a plain add for w=1.
+//
+// The flag means the w register's content is UNDEFINED at the ftrv --
+// only backends that honor it may run this pass.
+//-----------------------------------------------------------------------------
+
+static bool param_covers(const shil_param& p, u32 reg)
+{
+	return p.is_reg() && reg>=p._reg && reg<p._reg+p.count();
+}
+
+void ftrv_known_w(RuntimeBlockInfo* blk)
+{
+	for (size_t i=0;i<blk->oplist.size();i++)
+	{
+		{
+			shil_opcode& tr=blk->oplist[i];
+
+			if (tr.op!=shop_ftrv || tr.flags!=0)
+				continue;
+			//the mov is dead only because the ftrv overwrites its vector
+			if (!tr.rd.is_reg() || !tr.rs1.is_reg() || tr.rd._reg!=tr.rs1._reg)
+				continue;
+		}
+
+		u32 wreg=blk->oplist[i].rs1._reg+3;
+		size_t mov=(size_t)-1;
+		u32 w_imm=0;
+
+		for (size_t j=i;j-->0;)
+		{
+			shil_opcode& o=blk->oplist[j];
+
+			//fp state can change wholesale under these
+			if (o.op==shop_ifb || o.op==shop_sync_fpscr || o.op==shop_frswap)
+				break;
+
+			//another reader: the load must stay
+			if (param_covers(o.rs1,wreg) || param_covers(o.rs2,wreg) || param_covers(o.rs3,wreg))
+				break;
+
+			if (param_covers(o.rd,wreg) || param_covers(o.rd2,wreg))
+			{
+				if (o.op==shop_mov32 && o.rd.is_r32f() && o.rd._reg==wreg &&
+				    o.rs1.is_imm() && (o.rs1._imm==0 || o.rs1._imm==0x3F800000))
+				{
+					mov=j;
+					w_imm=o.rs1._imm;
+				}
+				break; //whatever wrote w, the search ends here
+			}
+		}
+
+		if (mov==(size_t)-1)
+			continue;
+
+		blk->oplist[i].flags |= w_imm==0 ? FTRV_W_ZERO : FTRV_W_ONE;
+
+		if (constprop_verbose)
+			printf("ftrvw %08X+%X: w = %s, load dropped\n",blk->addr,
+				blk->oplist[i].guest_offs, w_imm==0 ? "0" : "1");
+
+		blk->oplist.erase(blk->oplist.begin()+mov);
+		i--; //the ftrv shifted down by one
+	}
+}
+
 //read_v4m3z1
 void read_v4m3z1(RuntimeBlockInfo* blk)
 {
@@ -1555,6 +1630,10 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 	constprop(blk, !settings.dynarec.safemode);
 	fuse_readm_pairs(blk);
 	dead_value_elim(blk);
+#if HOST_CPU == CPU_ARM
+	//deletes the w load: only run for backends whose ftrv honors the flag
+	ftrv_known_w(blk);
+#endif
 
 	if (settings.dynarec.unstable_opt)
 		sq_pref(blk);

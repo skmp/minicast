@@ -145,6 +145,11 @@ struct shil_param
 	*/
 };
 
+//shop_ftrv flags: the input vector's w element holds a known constant and
+//the op that loaded it was removed -- the emitter must substitute it
+#define FTRV_W_ZERO	0x1
+#define FTRV_W_ONE	0x2
+
 struct shil_opcode
 {
 	shilop op;

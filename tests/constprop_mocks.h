@@ -185,6 +185,10 @@ struct shil_param
 	}
 };
 
+// shop_ftrv flags: known-constant w, the loading op was removed
+#define FTRV_W_ZERO 0x1
+#define FTRV_W_ONE  0x2
+
 struct shil_opcode
 {
 	shilop op = shop_add;

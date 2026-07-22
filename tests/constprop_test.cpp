@@ -27,6 +27,7 @@ static shil_param I(u32 v) { shil_param p; p.type = FMT_IMM; p._imm = v; return 
 static shil_param R(Sh4RegType r) { shil_param p; p.type = FMT_I32; p._reg = r; return p; }
 static shil_param F(Sh4RegType r) { shil_param p; p.type = FMT_F32; p._reg = r; return p; }
 static shil_param D(Sh4RegType r) { shil_param p; p.type = FMT_F64; p._reg = r; return p; }
+static shil_param V(Sh4RegType r, u32 fmt) { shil_param p; p.type = fmt; p._reg = r; return p; }
 
 static shil_opcode OP(shilop op, shil_param rd, shil_param rs1, shil_param rs2 = P(),
                       u32 flags = 0, shil_param rs3 = P(), shil_param rd2 = P())
@@ -1013,6 +1014,93 @@ static void t_dse()
 	verify(b6.oplist[0].op == shop_mov32);
 }
 
+static shil_opcode mk_ftrv(Sh4RegType fv)
+{
+	return OP(shop_ftrv, V(fv, FMT_V4), V(fv, FMT_V4), V(reg_xf_0, FMT_V16));
+}
+
+static void t_ftrv_known_w()
+{
+	// fldi1 into w right before the transform: flag + load removed
+	mock_reset();
+	RuntimeBlockInfo b = mkblk();
+	b.oplist.push_back(OP(shop_mov32, F(reg_fr_3), I(0x3F800000)));
+	b.oplist.push_back(mk_ftrv(reg_fr_0));
+	ftrv_known_w(&b);
+	verify(count_op(b.oplist, shop_mov32) == 0);
+	verify(find_op(b.oplist, shop_ftrv)->flags == FTRV_W_ONE);
+
+	// fldi0, with unrelated integer ops in between: still caught
+	mock_reset();
+	RuntimeBlockInfo b2 = mkblk();
+	b2.oplist.push_back(OP(shop_mov32, F(reg_fr_3), I(0)));
+	b2.oplist.push_back(OP(shop_add, R(reg_r0), R(reg_r1), I(4)));
+	b2.oplist.push_back(mk_ftrv(reg_fr_0));
+	ftrv_known_w(&b2);
+	verify(count_op(b2.oplist, shop_mov32) == 0);
+	verify(find_op(b2.oplist, shop_ftrv)->flags == FTRV_W_ZERO);
+
+	// a reader in between: the load must survive, no flag
+	mock_reset();
+	RuntimeBlockInfo b3 = mkblk();
+	b3.oplist.push_back(OP(shop_mov32, F(reg_fr_3), I(0x3F800000)));
+	b3.oplist.push_back(OP(shop_fadd, F(reg_fr_5), F(reg_fr_3), F(reg_fr_6)));
+	b3.oplist.push_back(mk_ftrv(reg_fr_0));
+	ftrv_known_w(&b3);
+	verify(count_op(b3.oplist, shop_mov32) == 1);
+	verify(find_op(b3.oplist, shop_ftrv)->flags == 0);
+
+	// non-constant w write in between: no flag
+	mock_reset();
+	RuntimeBlockInfo b4 = mkblk();
+	b4.oplist.push_back(OP(shop_mov32, F(reg_fr_3), I(0x3F800000)));
+	b4.oplist.push_back(OP(shop_fadd, F(reg_fr_3), F(reg_fr_5), F(reg_fr_6)));
+	b4.oplist.push_back(mk_ftrv(reg_fr_0));
+	ftrv_known_w(&b4);
+	verify(find_op(b4.oplist, shop_ftrv)->flags == 0);
+
+	// arbitrary float constant: not 0/1, no flag
+	mock_reset();
+	RuntimeBlockInfo b5 = mkblk();
+	b5.oplist.push_back(OP(shop_mov32, F(reg_fr_3), I(0x40490FDB)));
+	b5.oplist.push_back(mk_ftrv(reg_fr_0));
+	ftrv_known_w(&b5);
+	verify(count_op(b5.oplist, shop_mov32) == 1);
+	verify(find_op(b5.oplist, shop_ftrv)->flags == 0);
+
+	// fp barrier in between: conservative, no flag
+	mock_reset();
+	RuntimeBlockInfo b6 = mkblk();
+	b6.oplist.push_back(OP(shop_mov32, F(reg_fr_3), I(0x3F800000)));
+	b6.oplist.push_back(OP(shop_sync_fpscr, P(), P()));
+	b6.oplist.push_back(mk_ftrv(reg_fr_0));
+	ftrv_known_w(&b6);
+	verify(count_op(b6.oplist, shop_mov32) == 1);
+	verify(find_op(b6.oplist, shop_ftrv)->flags == 0);
+
+	// back-to-back transforms of the same vector: only the first sees the
+	// constant; the second reads the transformed w
+	mock_reset();
+	RuntimeBlockInfo b7 = mkblk();
+	b7.oplist.push_back(OP(shop_mov32, F(reg_fr_3), I(0x3F800000)));
+	b7.oplist.push_back(mk_ftrv(reg_fr_0));
+	b7.oplist.push_back(mk_ftrv(reg_fr_0));
+	ftrv_known_w(&b7);
+	verify(count_op(b7.oplist, shop_mov32) == 0);
+	verify(b7.oplist[0].flags == FTRV_W_ONE);
+	verify(b7.oplist[1].flags == 0);
+
+	// through constprop: fldi via a known-const gpr becomes an imm first
+	mock_reset();
+	RuntimeBlockInfo b8 = mkblk();
+	b8.oplist.push_back(OP(shop_mov32, R(reg_r0), I(0x3F800000)));
+	b8.oplist.push_back(OP(shop_mov32, F(reg_fr_3), R(reg_r0)));
+	b8.oplist.push_back(mk_ftrv(reg_fr_0));
+	constprop(&b8);
+	ftrv_known_w(&b8);
+	verify(find_op(b8.oplist, shop_ftrv)->flags == FTRV_W_ONE);
+}
+
 static void t_readm_pair_fusion()
 {
 	// fmov.s @Rn+ x3 (a vertex fetch): first two loads pair up, their +4s
@@ -1384,6 +1472,7 @@ int main(int argc, char** argv)
 	t_f32_mov();
 	t_shift_chains();
 	t_dse();
+	t_ftrv_known_w();
 	t_readm_pair_fusion();
 	t_imm_literal_bake();
 	t_rom_bake();
