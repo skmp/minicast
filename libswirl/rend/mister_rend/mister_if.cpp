@@ -28,8 +28,9 @@ static inline uint64_t now_ns(void) {
 }
 
 void SetREP(u32 render_end_pending_cycles);
-
+static u8* vram;
 void rend_init_renderer(u8* vram) {
+    ::vram = vram;
     // initialize renderer
     printf("rend_init_renderer\n");
 	
@@ -78,8 +79,12 @@ bool rend_render_done() {
     return false;
 }
 
+void do_vram_dump(u8* vram, u8* pvr_regs);
+
 void startpolly() {
     __asm__ volatile("dsb sy" ::: "memory");
+
+    do_vram_dump(vram, pvr_regs);
 
     polly_gone = true;
     polly2_go();
