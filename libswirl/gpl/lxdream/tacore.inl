@@ -210,7 +210,8 @@ struct pvr2_ta_status {
     int32_t state;
     int32_t width, height; /* Tile resolution, ie 20x15 */
     int32_t tilelist_dir; /* Growth direction of the tilelist, 0 = up, 1 = down */
-    uint32_t tilelist_size; /* Size of the tilelist segments */
+    /* (tilelist_size removed - devcast fix: ta_alloc_tilelist uses the
+     * per-list current_tile_size instead of one init-captured size) */
     uint32_t tilelist_start; /* Initial address of the tilelist */
     uint32_t polybuf_start; /* Initial bank address of the polygon buffer (ie &0x00F00000) */
     int32_t current_vertex_type;
@@ -301,13 +302,15 @@ void lxd_ta_init(u8* vram) {
     ta_status.clip.y2 = ta_status.height-1;
     uint32_t control = TA_ALLOC_CTRL; //MMIO_READ( PVR2, TA_TILECFG );
     ta_status.tilelist_dir = (control >> 20) & 0x01;
-    ta_status.tilelist_size = tilematrix_sizes[ (control & 0x03) ];
+    // NOTE: no global tilelist_size here (devcast fix): overflow OPB blocks
+    // are sized PER LIST TYPE (current_tile_size, from TA_ALLOC_CTRL at each
+    // list init) in ta_alloc_tilelist, and GROW_DOWN pre-decrements there -
+    // the old init-time plistpos adjustment + fixed size corrupted overflow
+    // lists whose alloc size differed from the init-captured one (MvC2
+    // pre-intro: TR text-sprite OPB spills -> missing letters).
     TA_ISP_CURRENT = TA_ISP_BASE;
     //MMIO_WRITE( PVR2, TA_POLYPOS, MMIO_READ( PVR2, TA_POLYBASE ) );
     uint32_t plistpos = TA_NEXT_OPB_INIT >> 2; //MMIO_READ( PVR2, TA_LISTBASE )
-    if( ta_status.tilelist_dir == TA_GROW_DOWN ) {
-        plistpos -= ta_status.tilelist_size;
-    }
     TA_NEXT_OPB = plistpos;
     //MMIO_WRITE( PVR2, TA_LISTPOS, plistpos );
     ta_status.tilelist_start = plistpos;
@@ -530,7 +533,8 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
     uint32_t limit = TA_OL_LIMIT >> 2;//MMIO_READ( PVR2, TA_LISTEND ) >> 2;
     uint32_t newposn;
     if( ta_status.tilelist_dir == TA_GROW_DOWN ) {
-        newposn = posn - ta_status.tilelist_size;
+        posn -= ta_status.current_tile_size;   // devcast: pre-decrement, PER-LIST size
+        newposn = posn;
         if( posn == limit ) {
             PVRRAM(posn<<2) = 0xF0000000;
             PVRRAM(reference) = 0xE0000000 | (posn<<2);
@@ -539,7 +543,7 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             PVRRAM(reference) = 0xE0000000 | (posn<<2);
             return TA_NO_ALLOC;
         } else if( newposn <= limit ) {
-        } else if( newposn <= (limit + ta_status.tilelist_size) ) {
+        } else if( newposn <= (limit + ta_status.current_tile_size) ) {
             if (settings.pvr.MultithreadedTA != TA_STTA) {
                 printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
             } else {
@@ -556,7 +560,7 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
         PVRRAM(reference) = 0xE0000000 | (posn<<2);
         return posn << 2;
     } else {
-        newposn = posn + ta_status.tilelist_size;
+        newposn = posn + ta_status.current_tile_size;   // devcast: PER-LIST size
         if( posn == limit ) {
             PVRRAM(posn<<2) = 0xF0000000;
             PVRRAM(reference) = 0xE0000000 | (posn<<2);
@@ -565,7 +569,7 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
             PVRRAM(reference) = 0xE0000000 | (posn<<2);
             return TA_NO_ALLOC;
         } else if( newposn >= limit ) {
-        } else if( newposn >= (limit - ta_status.tilelist_size) ) {
+        } else if( newposn >= (limit - ta_status.current_tile_size) ) {
             if (settings.pvr.MultithreadedTA != TA_STTA) {
                 printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
             } else {
