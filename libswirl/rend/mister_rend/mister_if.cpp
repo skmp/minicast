@@ -147,6 +147,10 @@ void rend_end_render() {
                 printf("polly2: Auto resetting!\n");
                 polly2_reset();
                 polly2_set_vram_base(0x32000000);
+                for (unsigned reg = 0 ; reg < pvr_RegSize; reg+=4)
+                {
+                    polly2_reg_write(reg, (u32&)pvr_regs[reg]);
+                }
                 polly2_go();
             }
         }
