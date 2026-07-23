@@ -639,8 +639,7 @@ u32 TexStride(u32 TexU, u32 StrideSel, u32 ScanOrder, u32 MipLevel) {
         return (8U << TexU) >> MipLevel;
 }
 
-u32 DecodeTextel(u32 PixelFmt, u32 PalSelect, u64 memtel, u32 offset) {
-    auto memtel_32 = (u32*)&memtel;
+u32 DecodeTextel(u32 PixelFmt, u32 PalSelect, u64 memtel, u32 offset, bool twiddled) {
     auto memtel_16 = (u16*)&memtel;
     auto memtel_8 = (u8*)&memtel;
 
@@ -654,9 +653,15 @@ u32 DecodeTextel(u32 PixelFmt, u32 PalSelect, u64 memtel, u32 offset) {
             return memtel_16[offset & 3]; break;
 
         case PixelYUV: {
-            auto memtel_yuv = memtel_32[offset & 1];
-            auto memtel_yuv8 = (u8*)&memtel_yuv;
-            return YUV422(memtel_yuv8[1 + (offset & 2)], memtel_yuv8[0], memtel_yuv8[2]);
+            // Y is the high byte of the texel's own 16-bit lane in both layouts.
+            // Chroma pairing differs: twiddled stores each 16-bit texel at its twiddle
+            // index, so a 64-bit word is a 2x2 quad [U|Y00][U'|Y01][V|Y10][V'|Y11]
+            // (offset bit0 = y parity picks the row's U/V lane); planar is raster UYVY
+            // (offset bit1 picks which 32-bit pair).
+            u8 y = memtel_8[2 * (offset & 3) + 1];
+            u8 yu = twiddled ? memtel_8[2 * (offset & 1)]     : memtel_8[2 * (offset & 2)];
+            u8 yv = twiddled ? memtel_8[2 * (offset & 1) + 4] : memtel_8[2 * (offset & 2) + 2];
+            return YUV422(y, yu, yv);
             }
 
         case PixelPal4: {
@@ -730,7 +735,7 @@ static Color TextureFetch(TSP tsp, TCW tcw, int u, int v, u32 MipLevel) {
         memtel = VQLookup(start_address, memtel, offset * fbpp / 16);
     }
 
-    u32 textel = DecodeTextel(PixelFmt, tcw.PalSelect, memtel, offset);
+    u32 textel = DecodeTextel(PixelFmt, tcw.PalSelect, memtel, offset, tcw.VQ_Comp || !ScanOrder);
 
     u32 expand_format = GetExpandFormat(PixelFmt);
 
