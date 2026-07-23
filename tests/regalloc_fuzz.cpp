@@ -46,7 +46,8 @@ static u64 rnd()
 static u32 rnd_below(u32 n) { return (u32)(rnd() % n); }
 
 static const Sh4RegType gpr_pool[] = { reg_r0, reg_r1, reg_r2, reg_r3, reg_r4, reg_r5, reg_r6, reg_r7 };
-static const Sh4RegType fpr_pool[] = { reg_fr_0, reg_fr_1, reg_fr_2, reg_fr_3, reg_fr_4, reg_fr_5, reg_fr_6, reg_fr_7 };
+static const Sh4RegType fpr_pool[] = { reg_fr_0, reg_fr_1, reg_fr_2, reg_fr_3, reg_fr_4, reg_fr_5, reg_fr_6, reg_fr_7,
+                                       reg_fr_8, reg_fr_9, reg_fr_10, reg_fr_11, reg_fr_12, reg_fr_13, reg_fr_14, reg_fr_15 };
 
 static shil_param mkreg(Sh4RegType r, bool fpr)
 {
@@ -91,18 +92,19 @@ static void pick_distinct(const Sh4RegType* pool, u32 pool_sz, u32 n, Sh4RegType
 
 static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 {
-	u32 nops = 1 + rnd_below(40);
+	// mostly real-block sized, sometimes long (sprite loops unroll far)
+	u32 nops = rnd_below(4) ? 1 + rnd_below(40) : 1 + rnd_below(100);
 
 	for (u32 i = 0; i < nops; i++)
 	{
 		shil_opcode op;
 		Sh4RegType r[5];
-		u32 kind = rnd_below(13);
+		u32 kind = rnd_below(14);
 
 		if (kind == 10 && nfpr >= 4) // exploded vector op, like ftrv
 		{
-			// rd/rs1 in-place like the real thing; rs2 is a memory operand
-			Sh4RegType base = (rnd_below(2) && nfpr >= 8) ? reg_fr_4 : reg_fr_0;
+			// rd/rs1 in-place like the real thing (any FVn); rs2 is a memory operand
+			Sh4RegType base = (Sh4RegType)(reg_fr_0 + rnd_below(4) * 4);
 			op.op = shop_ftrv;
 			op.rd = mkvec(base, FMT_V4);
 			op.rs1 = mkvec(base, FMT_V4);
@@ -110,21 +112,30 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 			blk->oplist.push_back(op);
 			continue;
 		}
-		if (kind == 11 && nfpr >= 4) // exploded reads, scalar rd aliasing rs1[3]
+		if (kind == 11 && nfpr >= 4) // fipr FVm,FVn: rd = rs1[3] (DM_fiprOp), any bases
 		{
+			u32 n = rnd_below(4) * 4;
+			u32 m = nfpr >= 8 ? rnd_below(4) * 4 : n;
 			op.op = shop_fipr;
-			op.rs1 = mkvec(reg_fr_0, FMT_V4);
-			op.rs2 = mkvec(nfpr >= 8 && rnd_below(2) ? reg_fr_4 : reg_fr_0, FMT_V4);
-			op.rd = mkreg(reg_fr_3, true);
+			op.rs1 = mkvec((Sh4RegType)(reg_fr_0 + n), FMT_V4);
+			op.rs2 = mkvec((Sh4RegType)(reg_fr_0 + m), FMT_V4);
+			op.rd = mkreg((Sh4RegType)(reg_fr_0 + n + 3), true);
 			blk->oplist.push_back(op);
 			continue;
 		}
 		if (kind == 12 && nfpr >= 2) // non-exploded vector: fpu spans must flush/die
 		{
 			op.op = shop_mov64;
-			u32 pairs = nfpr / 2;
-			op.rd = mkvec(fpr_pool[rnd_below(pairs) * 2], FMT_F64);
-			op.rs1 = mkvec(fpr_pool[rnd_below(pairs) * 2], FMT_F64);
+			op.rd = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
+			op.rs1 = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind == 13 && nfpr >= 2) // fsca-like: F64 pair write from a gpr source
+		{
+			op.op = shop_fsca;
+			op.rd = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
+			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
 			blk->oplist.push_back(op);
 			continue;
 		}
@@ -137,8 +148,8 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 			bool df = cls & 1, sf = cls & 2;
 			if ((df || sf) && nfpr < 1) { df = sf = false; }
 			op.op = shop_mov32;
-			Sh4RegType dr = df ? fpr_pool[rnd_below(8)] : gpr_pool[rnd_below(8)];
-			Sh4RegType sr = sf ? fpr_pool[rnd_below(8)] : gpr_pool[rnd_below(8)];
+			Sh4RegType dr = df ? fpr_pool[rnd_below(16)] : gpr_pool[rnd_below(8)];
+			Sh4RegType sr = sf ? fpr_pool[rnd_below(16)] : gpr_pool[rnd_below(8)];
 			op.rd = mkreg(dr, df);
 			op.rs1 = mkreg(sr, sf);
 		}
@@ -151,7 +162,7 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 		else if (kind == 4 && nfpr >= 3) // fpu binary
 		{
 			op.op = shop_fadd;
-			pick_distinct(fpr_pool, 8, 3, r);
+			pick_distinct(fpr_pool, 16, 3, r);
 			op.rd = mkreg(r[0], true);
 			op.rs1 = mkreg(r[1], true);
 			op.rs2 = mkreg(r[2], true);
@@ -367,13 +378,15 @@ int main(int argc, char** argv)
 	u64 base_seed = argc > 1 ? strtoull(argv[1], 0, 0) : 1;
 	u32 iters = argc > 2 ? (u32)strtoul(argv[2], 0, 0) : 5000;
 
-	struct { u32 ngpr, nfpr; } pools[] = { {5, 4}, {3, 2}, {2, 2}, {6, 8} };
+	// {5,12} mirrors the real arm32 temps-mode pools (r5/r6/r7/r10/r11, f16-f27)
+	struct { u32 ngpr, nfpr; } pools[] = { {5, 4}, {3, 2}, {2, 2}, {6, 8}, {5, 12} };
+	const u32 npools = sizeof(pools) / sizeof(pools[0]);
 
 	for (int alias = 0; alias <= 1; alias++)
 	for (int reuse = 0; reuse <= 1; reuse++)
 	{
 		g_elided = g_movs = g_spills = 0;
-		for (u32 pi = 0; pi < 4; pi++)
+		for (u32 pi = 0; pi < npools; pi++)
 		{
 			TestAlloc alloc;
 			alloc.opt_alias_mov = alias != 0;

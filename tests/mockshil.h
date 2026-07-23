@@ -72,6 +72,7 @@ enum shilop
 	// does for the real ftrv/fipr); V16 stays a memory operand
 	shop_ftrv,
 	shop_fipr,
+	shop_fsca,	// F64 pair write from a scalar source, never exploded
 };
 
 struct shil_param
