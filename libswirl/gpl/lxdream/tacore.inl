@@ -1463,6 +1463,9 @@ static void* ta_ring_consumer_thread(void* /*param*/) {
     // the sh4/jit thread (pinned to cpu1) does not
     ta_ring_pin_thread(0);
 
+    extern void enable_runfast();
+    enable_runfast();
+
     for (;;) {
         // Fast empty check against our private cache first.
         u32 rd = ta_ring.read_pub;
