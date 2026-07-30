@@ -324,8 +324,11 @@ int kbhit(void) {
 // If emu.cfg has no [inputN] sections, the legacy /dev/input/js0 mapping
 // below is used instead.
 //
-// Multiple mapped devices merge into port 0: buttons are logically OR'd,
-// for axes the value with the biggest absolute value wins.
+// Each device feeds the maple port its [inputN] `Port` key selects (0..3 =
+// A..D, default 0/A). Devices sharing a port merge: buttons are logically
+// OR'd, for axes the value with the biggest absolute value wins. The
+// matching maple bus must have a controller ([input] deviceN = 0;
+// DreamSTer.sh enables it for every port in use).
 //
 // ESC on any evdev device (mapped or not) is a hardcoded exit; Print Screen
 // queues an spg_screenshot the same way (taken at the next SPG vblank).
@@ -398,6 +401,7 @@ static bool decode_mapping(const char* text, InMapping* m) {
 struct EvdevPad {
 	int fd;
 	std::string path, id;
+	int port;                  // maple port 0..3 this device feeds
 	InMapping map[TGT_COUNT];
 
 	int absLo[ABS_CODES], absHi[ABS_CODES];
@@ -445,7 +449,7 @@ static bool evdev_path_less(const std::string& a, const std::string& b) {
 
 static void evdev_init() {
 	// device id -> mappings, from [input0]..[inputN]
-	struct CfgPad { InMapping map[TGT_COUNT]; bool any; };
+	struct CfgPad { InMapping map[TGT_COUNT]; bool any; int port; };
 	std::map<std::string, CfgPad> cfgpads;
 	for (int n = 0; ; n++) {
 		char section[32];
@@ -458,6 +462,9 @@ static void evdev_init() {
 			continue;
 		CfgPad pad;
 		pad.any = false;
+		pad.port = cfgLoadInt(section, "Port", 0);
+		if (pad.port < 0 || pad.port > 3)
+			pad.port = 0;
 		for (int t = 0; t < TGT_COUNT; t++) {
 			pad.map[t].kind = InMapping::NONE;
 			std::string val = cfgLoadStr(section, TARGET_CFG_KEYS[t], "");
@@ -512,9 +519,11 @@ static void evdev_init() {
 		pad.fd = fd;
 		pad.path = paths[i];
 		pad.id = id;
+		pad.port = 0;
 		for (int t = 0; t < TGT_COUNT; t++)
 			pad.map[t].kind = InMapping::NONE;
 		if (mapped) {
+			pad.port = it->second.port;
 			memcpy(pad.map, it->second.map, sizeof(pad.map));
 			for (int t = 0; t < TGT_COUNT; t++) {
 				const InMapping& m = pad.map[t];
@@ -535,8 +544,11 @@ static void evdev_init() {
 		while (read(fd, drain, sizeof(drain)) > 0)
 			;
 		g_evdev_pads.push_back(pad);
-		printf("evdev: %s %s [%s]\n", mapped ? "mapped" : "monitoring",
-			   pad.path.c_str(), id.c_str());
+		if (mapped)
+			printf("evdev: mapped %s [%s] -> port %c\n",
+				   pad.path.c_str(), id.c_str(), 'A' + pad.port);
+		else
+			printf("evdev: monitoring %s [%s]\n", pad.path.c_str(), id.c_str());
 	}
 }
 
@@ -648,9 +660,13 @@ static void evdev_read_pad(EvdevPad& p) {
 	}
 }
 
-static void evdev_update(u32 port) {
-	u16 buttons = 0xFFFF;
-	int ax = 0, ay = 0, l = 0, r = 0;
+// Reads every pad once and refreshes ALL FOUR maple ports (each device
+// lands on its configured port; devices sharing one merge). Called from
+// UpdateInputState(0) only - maple polls ports in bus order, so ports 1..3
+// consume the state this pass just wrote.
+static void evdev_update() {
+	u16 buttons[4] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
+	int ax[4] = {0}, ay[4] = {0}, l[4] = {0}, r[4] = {0};
 
 	for (size_t i = 0; i < g_evdev_pads.size(); i++) {
 		EvdevPad& p = g_evdev_pads[i];
@@ -671,21 +687,24 @@ static void evdev_update(u32 port) {
 		p.actPrev[0] = p.held[TGT_BTN_EXIT];
 		p.actPrev[1] = p.held[TGT_BTN_SCREENSHOT];
 
-		// buttons OR across devices; biggest absolute axis value wins
+		// buttons OR across same-port devices; biggest absolute axis wins
+		int q = p.port & 3;
 		for (int t = 0; t < TGT_COUNT; t++)
 			if (TARGET_BTN_BIT[t] && p.held[t])
-				buttons &= ~TARGET_BTN_BIT[t];
-		if (abs(p.analog[0]) > abs(ax)) ax = p.analog[0];
-		if (abs(p.analog[1]) > abs(ay)) ay = p.analog[1];
-		if (p.trig[0] > l) l = p.trig[0];
-		if (p.trig[1] > r) r = p.trig[1];
+				buttons[q] &= ~TARGET_BTN_BIT[t];
+		if (abs(p.analog[0]) > abs(ax[q])) ax[q] = p.analog[0];
+		if (abs(p.analog[1]) > abs(ay[q])) ay[q] = p.analog[1];
+		if (p.trig[0] > l[q]) l[q] = p.trig[0];
+		if (p.trig[1] > r[q]) r[q] = p.trig[1];
 	}
 
-	kcode[port] = buttons;
-	joyx[port] = (s8)std::max(-128, std::min(127, ax));
-	joyy[port] = (s8)std::max(-128, std::min(127, ay));
-	lt[port] = (u8)l;
-	rt[port] = (u8)r;
+	for (int q = 0; q < 4; q++) {
+		kcode[q] = buttons[q];
+		joyx[q] = (s8)std::max(-128, std::min(127, ax[q]));
+		joyy[q] = (s8)std::max(-128, std::min(127, ay[q]));
+		lt[q] = (u8)l[q];
+		rt[q] = (u8)r[q];
+	}
 }
 
 void UpdateInputState(u32 port) {
@@ -730,7 +749,7 @@ void UpdateInputState(u32 port) {
 		evdev_init();
 	}
 	if (g_evdev_mode) {
-		evdev_update(port);
+		evdev_update();   // refreshes all four ports
 		return;
 	}
 
