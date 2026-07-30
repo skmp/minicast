@@ -245,9 +245,9 @@ void ReportRendererStats(double wait_ms, u32 cycles)
 //   * bottom band (lines 510..539): black for now (its renderer lands soon).
 // The line stride mirrors sys_top's fb_disp_stride (640 px x 2/2/3/4 bytes
 // by depth, halved by pixel_double) - NOT FB_R_SIZE.
-// Output: 24bpp BMP at /media/fat/games/Dreamcast/<datetime>.bmp.
+// Output: 24bpp BMP at /media/fat/screenshot/Dreamcast/<datetime>.bmp.
 
-#define SHOT_DIR       "/media/fat/games/Dreamcast"
+#define SHOT_DIR       "/media/fat/screenshot/Dreamcast"
 #define SHOT_W         640
 #define SHOT_H         540
 #define SHOT_Y0        30            /* game window y 30..509 */
@@ -375,7 +375,19 @@ static void spg_screenshot(const u8* vram)
 	}
 
 	/* ---- write the BMP (24bpp BGR, bottom-up; 1920*3 is 4-aligned) ---- */
-	mkdir(SHOT_DIR, 0777);      /* usually exists; EEXIST is fine */
+	{	/* mkdir -p SHOT_DIR; existing components (the usual case) are fine */
+		char dir[] = SHOT_DIR;
+		for (char* p = dir + 1; ; p++) {
+			if (*p == '/' || *p == 0) {
+				char c = *p;
+				*p = 0;
+				mkdir(dir, 0777);
+				*p = c;
+				if (c == 0)
+					break;
+			}
+		}
+	}
 	time_t t = time(NULL);
 	struct tm tmv;
 	localtime_r(&t, &tmv);
