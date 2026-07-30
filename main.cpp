@@ -17,14 +17,14 @@
 
 #include "hw/pvr/pvr_regs.h"
 
-static std::atomic<bool> vram_dump_pending;
+std::atomic<bool> vram_dump_pending;
 static unsigned vram_dump_number;
 
 u32 pvr_map32(u32 offset32);
 
 void do_vram_dump(u8* vram, u8* pvr_regs) {
 	if (vram_dump_pending.exchange(false)) {
-		FILE* f = fopen(("vram_dump_" + std::to_string(vram_dump_number) + ".bin").c_str(), "wb");
+		FILE* f = fopen(("vram_" + std::to_string(vram_dump_number) + ".bin").c_str(), "wb");
 		if (!f) {
 			printf("Failed to open vram_dump.bin\n");
 			return;
@@ -48,6 +48,8 @@ void do_vram_dump(u8* vram, u8* pvr_regs) {
 			return;
 		}
 		fclose(f);
+		printf("Frame dumped -> vram_%d.bin/pvr_regs_%d.bin\n", vram_dump_number);
+		vram_dump_number++;
 	}
 }
 

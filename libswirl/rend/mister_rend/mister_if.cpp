@@ -57,6 +57,9 @@ static uint64_t poll_deadline_ns;
 
 static std::atomic<bool> polly_gone;
 
+extern std::atomic<bool> vram_dump_pending;
+extern void do_vram_dump(u8* vram, u8* pvr_regs);
+
 bool rend_render_done() {
     if (polly_gone && polly2_done()) {
         poll_deadline_ns = 0;
@@ -69,17 +72,24 @@ bool rend_render_done() {
         poll_deadline_ns = 0;
         printf("polly2: Timeout waiting for Frame Done!\n");
 
+        if (settings.polly2.DumpOnLockup) {
+            vram_dump_pending = true;
+            do_vram_dump(vram, pvr_regs);
+        }
+
         if (settings.polly2.AutoReset) {
             printf("polly2: Auto resetting!\n");
             polly2_reset();
             polly2_set_vram_base(0x32000000);
+            for (unsigned reg = 0; reg < pvr_RegSize; reg+=4)
+            {
+                polly2_reg_write(reg, (u32&)pvr_regs[reg]);
+            }
             polly2_go();
         }
     }
     return false;
 }
-
-void do_vram_dump(u8* vram, u8* pvr_regs);
 
 void startpolly() {
     __asm__ volatile("dsb sy" ::: "memory");
@@ -142,6 +152,11 @@ void rend_end_render() {
         if (timeout>=5000) {
             timeout = 0;
             printf("polly2: Timeout waiting for Frame Done!\n");
+
+            if (settings.polly2.DumpOnLockup) {
+                vram_dump_pending = true;
+                do_vram_dump(vram, pvr_regs);
+            }
 
             if (settings.polly2.AutoReset) {
                 printf("polly2: Auto resetting!\n");

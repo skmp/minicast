@@ -269,6 +269,7 @@ void InitSettings()
     settings.pvr.FPSTarget = 66;
 
     settings.polly2.AutoReset = true;
+    settings.polly2.DumpOnLockup = false;
     settings.polly2.ClockSel = 0;   // Default to no OC
 
     settings.freerunning = false;
@@ -333,6 +334,7 @@ void LoadSettings(bool game_specific)
     settings.pvr.FPSTarget = cfgLoadInt(config_section, "pvr.FPSTarget", settings.pvr.FPSTarget);
 
     settings.polly2.AutoReset = cfgLoadBool(config_section, "polly2.AutoReset", settings.polly2.AutoReset);
+    settings.polly2.DumpOnLockup = cfgLoadBool(config_section, "polly2.DumpOnLockup", settings.polly2.DumpOnLockup);
     settings.polly2.ClockSel = cfgLoadInt(config_section, "polly2.ClockSel", settings.polly2.ClockSel);
 
     settings.freerunning = cfgLoadBool(config_section, "Freerunning", settings.freerunning);
@@ -421,6 +423,7 @@ void SaveSettings()
     cfgSaveBool("config", "Dynarec.opt_cyclecheck_backwards_only", settings.dynarec.opt_cyclecheck_backwards_only);
 	cfgSaveBool("config", "Dynarec.opt_div1_som", settings.dynarec.opt_div1_som);
 	cfgSaveBool("config", "Dynarec.opt_sqw_on_pref", settings.dynarec.opt_sqw_on_pref);
+    cfgSaveBool("config", "Dynarec.opt_sqw_rewrite", settings.dynarec.opt_sqw_rewrite);
 	cfgSaveInt("config", "Dynarec.opt_constprop", settings.dynarec.opt_constprop);
 	cfgSaveBool("config", "Dynarec.opt_readm_pairs", settings.dynarec.opt_readm_pairs);
 	cfgSaveBool("config", "Dynarec.opt_fipr_w", settings.dynarec.opt_fipr_w);
@@ -435,6 +438,7 @@ void SaveSettings()
     cfgSaveInt("config", "pvr.FPSTarget", settings.pvr.FPSTarget);
 
     cfgSaveBool("config", "polly2.AutoReset", settings.polly2.AutoReset);
+    cfgSaveBool("config", "polly2.DumpOnLockup", settings.polly2.DumpOnLockup);
     cfgSaveInt("config", "polly2.ClockSel", settings.polly2.ClockSel);
 
     cfgSaveBool("config", "Freerunning", settings.freerunning);

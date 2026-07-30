@@ -531,6 +531,7 @@ struct settings_t
 	{
 		u32 ClockSel;
 		bool AutoReset;
+		bool DumpOnLockup;
 	} polly2;
 
 	// slave the sh4 scheduler to wall clock time (CycloneV A9 global timer)
