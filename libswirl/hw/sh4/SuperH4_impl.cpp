@@ -17,14 +17,18 @@
 #if HOST_OS == OS_LINUX
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #endif
 
 /*
     Freerunning mode: instead of advancing emulated time per executed
     timeslice, slave the scheduler to wall clock time read from the CycloneV
-    A9 global timer. It runs at mpu_periph_clk = mpu_clk/4 = 200MHz on the
-    DE10-Nano, so one timer tick == one SH4 cycle.
+    A9 global timer. It runs at mpu_periph_clk = mpu_clk/4 - 200MHz at the
+    stock 800MHz mpu_clk (one tick == one SH4 cycle), but the CPU clock is
+    not fixed (e.g. DreamSTer's 1GHz overclock -> 250MHz timer), so init
+    reads cpufreq and freerun_now() rescales raw ticks into the SH4's
+    200MHz cycle domain.
 */
 
 #define CV_GLOBALTMR_PHYS 0xFFFEC000u   /* A9 private peripheral space */
@@ -32,14 +36,25 @@
 #define CV_GLOBALTMR_CTRL 0x208u        /* bit0: timer enable */
 
 // never advance more this
-#define FREERUN_MAX_BEHIND (200000000u / 60)
+#define FREERUN_MAX_BEHIND (SH4_MAIN_CLOCK / 60)
 
 static volatile u8* freerun_gt;
 static u32 freerun_last;
 
+static u32 freerun_raw_last;                  /* last raw timer read */
+static u32 freerun_scale_q24 = 1u << 24;      /* timer ticks -> SH4 cycles */
+static u32 freerun_frac;                      /* Q24 scaling remainder */
+static u32 freerun_cycles;                    /* virtual 200MHz counter */
+
 static inline u32 freerun_now()
 {
-    return *(volatile u32*)(freerun_gt + CV_GLOBALTMR_LO);
+    u32 raw = *(volatile u32*)(freerun_gt + CV_GLOBALTMR_LO);
+    u32 d = raw - freerun_raw_last;
+    freerun_raw_last = raw;
+    u64 s = (u64)d * freerun_scale_q24 + freerun_frac;
+    freerun_frac = (u32)s & ((1u << 24) - 1);
+    freerun_cycles += (u32)(s >> 24);
+    return freerun_cycles;
 }
 
 static bool freerun_init()
@@ -67,6 +82,28 @@ static bool freerun_init()
     if (!(*ctrl & 1))
         *ctrl |= 1;     /* linux normally has it enabled already */
 
+    /* the timer ticks at mpu_clk/4; mpu_clk from cpufreq (kHz, 800000 at
+       stock). Q24 ratio of that to the SH4's 200MHz. */
+    u32 cpu_khz = 800000;
+    int cf = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+                  O_RDONLY | O_CLOEXEC);
+    if (cf >= 0) {
+        char buf[32];
+        ssize_t n = read(cf, buf, sizeof(buf) - 1);
+        close(cf);
+        if (n > 0) {
+            buf[n] = 0;
+            u32 v = (u32)strtoul(buf, NULL, 10);
+            if (v)
+                cpu_khz = v;
+        }
+    }
+    u64 timer_hz = (u64)cpu_khz * 250;   /* kHz * 1000 / 4 */
+    freerun_scale_q24 = (u32)(((u64)SH4_MAIN_CLOCK << 24) / timer_hz);
+    printf("freerunning: cpu %u kHz -> global timer %u Hz, scale %.6f\n",
+           cpu_khz, (u32)timer_hz, freerun_scale_q24 / (double)(1u << 24));
+
+    freerun_raw_last = *(volatile u32*)(freerun_gt + CV_GLOBALTMR_LO);
     freerun_last = freerun_now();
     state = 1;
     return true;
