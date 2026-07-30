@@ -534,6 +534,12 @@ struct settings_t
 		bool DumpOnLockup;
 	} polly2;
 
+	struct {
+		// FillReadBuffer on the high-priority worker thread; off = legacy
+		// synchronous disc reads on the sh4 thread
+		bool async_dma;
+	} gdrom;
+
 	// slave the sh4 scheduler to wall clock time (CycloneV A9 global timer)
 	// instead of advancing it per executed timeslice
 	bool freerunning;

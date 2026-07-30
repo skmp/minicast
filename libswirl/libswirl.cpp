@@ -272,6 +272,8 @@ void InitSettings()
     settings.polly2.DumpOnLockup = false;
     settings.polly2.ClockSel = 0;   // Default to no OC
 
+    settings.gdrom.async_dma = true;
+
     settings.freerunning = false;
 
     settings.debug.SerialConsole = false;
@@ -336,6 +338,8 @@ void LoadSettings(bool game_specific)
     settings.polly2.AutoReset = cfgLoadBool(config_section, "polly2.AutoReset", settings.polly2.AutoReset);
     settings.polly2.DumpOnLockup = cfgLoadBool(config_section, "polly2.DumpOnLockup", settings.polly2.DumpOnLockup);
     settings.polly2.ClockSel = cfgLoadInt(config_section, "polly2.ClockSel", settings.polly2.ClockSel);
+
+    settings.gdrom.async_dma = cfgLoadBool(config_section, "gdrom.AsyncDMA", settings.gdrom.async_dma);
 
     settings.freerunning = cfgLoadBool(config_section, "Freerunning", settings.freerunning);
     
@@ -440,6 +444,8 @@ void SaveSettings()
     cfgSaveBool("config", "polly2.AutoReset", settings.polly2.AutoReset);
     cfgSaveBool("config", "polly2.DumpOnLockup", settings.polly2.DumpOnLockup);
     cfgSaveInt("config", "polly2.ClockSel", settings.polly2.ClockSel);
+
+    cfgSaveBool("config", "gdrom.AsyncDMA", settings.gdrom.async_dma);
 
     cfgSaveBool("config", "Freerunning", settings.freerunning);
 
