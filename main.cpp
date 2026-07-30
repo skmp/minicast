@@ -329,6 +329,8 @@ int kbhit(void) {
 //
 // ESC on any evdev device (mapped or not) is a hardcoded exit; Print Screen
 // queues an spg_screenshot the same way (taken at the next SPG vblank).
+// ButtonExit / ButtonScreenshot in an [inputN] section additionally map a
+// per-device button (or key) to the same two actions.
 
 #include <linux/input.h>
 #include <sys/ioctl.h>
@@ -345,6 +347,9 @@ enum InTarget {
 	TGT_DPAD_UP, TGT_DPAD_DOWN, TGT_DPAD_LEFT, TGT_DPAD_RIGHT,
 	TGT_BTN_A, TGT_BTN_B, TGT_BTN_X, TGT_BTN_Y, TGT_BTN_START,
 	TGT_ANALOG_X, TGT_ANALOG_Y, TGT_TRIG_L, TGT_TRIG_R,
+	// emulator actions (no DC pad bit): exit + screenshot, mappable per
+	// device via DreamSTer.sh, IN ADDITION to the hardcoded ESC / SYSRQ
+	TGT_BTN_EXIT, TGT_BTN_SCREENSHOT,
 	TGT_COUNT
 };
 
@@ -352,12 +357,14 @@ static const char* TARGET_CFG_KEYS[TGT_COUNT] = {
 	"DpadUp", "DpadDown", "DpadLeft", "DpadRight",
 	"ButtonA", "ButtonB", "ButtonX", "ButtonY", "ButtonStart",
 	"AxisX", "AxisY", "TriggerL", "TriggerR",
+	"ButtonExit", "ButtonScreenshot",
 };
 
 static const u16 TARGET_BTN_BIT[TGT_COUNT] = {
 	DC_DPAD_UP, DC_DPAD_DOWN, DC_DPAD_LEFT, DC_DPAD_RIGHT,
 	DC_BTN_A, DC_BTN_B, DC_BTN_X, DC_BTN_Y, DC_BTN_START,
 	0, 0, 0, 0,
+	0, 0,
 };
 
 struct InMapping {
@@ -397,6 +404,7 @@ struct EvdevPad {
 	bool absValid[ABS_CODES];
 
 	bool held[TGT_COUNT];      // dpad_*/btn_* targets currently pressed
+	bool actPrev[2];           // TGT_BTN_EXIT/SCREENSHOT state last update
 	int analog[2];             // TGT_ANALOG_X/Y, -128..127
 	int trig[2];               // TGT_TRIG_L/R, 0..255
 	bool kpNeg[2], kpPos[2];   // keypair halves per analog axis
@@ -500,6 +508,7 @@ static void evdev_init() {
 		memset(&pad.kpPos, 0, sizeof(pad.kpPos));
 		memset(&pad.relDriven, 0, sizeof(pad.relDriven));
 		memset(&pad.relAccum, 0, sizeof(pad.relAccum));
+		memset(&pad.actPrev, 0, sizeof(pad.actPrev));
 		pad.fd = fd;
 		pad.path = paths[i];
 		pad.id = id;
@@ -539,7 +548,8 @@ static void evdev_feed(EvdevPad& p, u16 type, u16 code, s32 value) {
 			if (m.kind == InMapping::KEY && m.code == (int)code) {
 				if (t == TGT_TRIG_L || t == TGT_TRIG_R)
 					p.trig[t - TGT_TRIG_L] = value ? 255 : 0;
-				else if (TARGET_BTN_BIT[t])
+				else if (TARGET_BTN_BIT[t] || t == TGT_BTN_EXIT
+				                           || t == TGT_BTN_SCREENSHOT)
 					p.held[t] = value != 0;
 			} else if (m.kind == InMapping::KEYPAIR &&
 					   (t == TGT_ANALOG_X || t == TGT_ANALOG_Y)) {
@@ -648,6 +658,18 @@ static void evdev_update(u32 port) {
 		if (p.fd < 0)
 			continue;
 		evdev_tick(p);
+
+		// mapped emulator actions, on the PRESS edge (in addition to the
+		// hardcoded ESC exit / SYSRQ screenshot in evdev_read_pad)
+		if (p.held[TGT_BTN_EXIT] && !p.actPrev[0]) {
+			printf("evdev: exit button pressed on %s, exiting\n", p.path.c_str());
+			fflush(stdout);
+			_exit(0); // Ungraceful termination, as the hardcoded ESC
+		}
+		if (p.held[TGT_BTN_SCREENSHOT] && !p.actPrev[1])
+			QueueScreenshot();
+		p.actPrev[0] = p.held[TGT_BTN_EXIT];
+		p.actPrev[1] = p.held[TGT_BTN_SCREENSHOT];
 
 		// buttons OR across devices; biggest absolute axis value wins
 		for (int t = 0; t < TGT_COUNT; t++)
