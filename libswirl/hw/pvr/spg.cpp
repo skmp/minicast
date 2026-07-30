@@ -50,9 +50,20 @@ u32 fskip = 0;
 
 extern u32 PVR_VTXC;
 
+static bool hasrep;
 void SetREP(u32 render_end_pending_cycles)
 {
+    verify(hasrep == false);
+    hasrep = true;
     sh4_sched_request(render_end_schid, render_end_pending_cycles);
+}
+
+void CancelREP() {
+    if (hasrep) {
+        rend_end_render();
+        sh4_sched_request(render_end_schid, -1);
+        hasrep = false;
+    }
 }
 
 struct SPG_impl final : SPG {

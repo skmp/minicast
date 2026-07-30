@@ -37,7 +37,7 @@ void rend_init_renderer(u8* vram) {
 	polly2_mmio_init();
     polly2_reset();
     polly2_set_vram_base(0x32000000);
-    printf("polly2: ClockSel set to %u", (unsigned)settings.polly2.ClockSel);
+    printf("polly2: ClockSel set to %u\n", (unsigned)settings.polly2.ClockSel);
     polly2_set_clock(settings.polly2.ClockSel);
 }
 
@@ -64,32 +64,32 @@ extern void do_vram_dump(u8* vram, u8* pvr_regs);
 
 bool rend_render_done() {
     if (polly_gone && polly2_done()) {
-        poll_deadline_ns = 0;
         return true;
     }
 
-    if (!poll_deadline_ns) {
-        poll_deadline_ns = now_ns() + 500000000ULL;
-    } else if (now_ns() > poll_deadline_ns) {
-        poll_deadline_ns = 0;
-        printf("polly2: Timeout waiting for Frame Done!\n");
+    if(polly_gone) {
+        if (now_ns() > poll_deadline_ns) {
+            poll_deadline_ns = now_ns() + 500000000ULL;
+            printf("polly2: Timeout waiting for Frame Done!\n");
 
-        if (settings.polly2.DumpOnLockup) {
-            vram_dump_pending = true;
-            do_vram_dump(vram, pvr_regs);
-        }
-
-        if (settings.polly2.AutoReset) {
-            printf("polly2: Auto resetting!\n");
-            polly2_reset();
-            polly2_set_vram_base(0x32000000);
-            for (unsigned reg = 0; reg < pvr_RegSize; reg+=4)
-            {
-                polly2_reg_write(reg, (u32&)pvr_regs[reg]);
+            if (settings.polly2.DumpOnLockup) {
+                vram_dump_pending = true;
+                do_vram_dump(vram, pvr_regs);
             }
-            polly2_go();
+
+            if (settings.polly2.AutoReset) {
+                printf("polly2: Auto resetting!\n");
+                polly2_reset();
+                polly2_set_vram_base(0x32000000);
+                for (unsigned reg = 0; reg < pvr_RegSize; reg+=4)
+                {
+                    polly2_reg_write(reg, (u32&)pvr_regs[reg]);
+                }
+                polly2_go();
+            }
         }
     }
+
     return false;
 }
 
@@ -98,8 +98,9 @@ void startpolly() {
 
     do_vram_dump(vram, pvr_regs);
 
-    polly_gone = true;
+    poll_deadline_ns = now_ns() + 500000000ULL;
     polly2_go();
+    polly_gone = true;
 }
 
 void rend_start_render(u8* vram) {
@@ -121,7 +122,6 @@ void rend_start_render(u8* vram) {
     // freerunning: REP polls for real completion; FPSTarget pacing only
     // applies when emulated time is decoupled from wall time
     if (settings.freerunning) {
-        poll_deadline_ns = 0;
         SetREP(REND_DONE_POLL_CYCLES);
     } else {
         SetREP(200000000/settings.pvr.FPSTarget);
@@ -139,7 +139,6 @@ void rend_end_render() {
     // "Wait for FPGA frame done" flag...
     uint64_t WaitTime = now_ns();
 
-    int timeout = 0;
     while (true)
     {
         if (polly_gone && polly2_done()) {
@@ -150,9 +149,8 @@ void rend_end_render() {
         uint64_t start = now_ns();
         while ((now_ns() - start) < 100000ULL) { }
 
-        timeout++;
-        if (timeout>=5000) {
-            timeout = 0;
+        if (polly_gone && (now_ns() > poll_deadline_ns)) {
+            poll_deadline_ns = now_ns() + 500000000ULL;
             printf("polly2: Timeout waiting for Frame Done!\n");
 
             if (settings.polly2.DumpOnLockup) {

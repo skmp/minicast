@@ -361,6 +361,11 @@ struct PVRDevice : MMIODevice {
                         lxd_ta_reset();
                     }
                 }
+                if (data & 2) {
+                    void CancelREP();
+                    CancelREP();
+                    printf("PowerVR CORE: SoftReset\n");
+                }
                 data = 0;
             }
         }
