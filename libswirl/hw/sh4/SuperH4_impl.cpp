@@ -3,6 +3,8 @@
 */
 #include "license/bsd"
 
+#include "../../../polly2-rtl/driver/polly2_mmio.h"
+
 
 #include "SuperH4_impl.h"
 #include "sh4_interpreter.h"
@@ -122,6 +124,12 @@ int UpdateSystem()
     if (settings.freerunning)
     {
         u32 elapsed = freerun_now() - freerun_last;
+
+        // if buffer is nearly full, don't generate more audio / update timers
+        if (polly2_audio_space() < 128) {
+            freerun_last = freerun_now();
+            return Sh4cntx.interrupt_pend | (sh4_int_bCpuRun == false);
+        }
 
         if (elapsed > FREERUN_MAX_BEHIND) {
             freerun_last += elapsed - FREERUN_MAX_BEHIND;
@@ -289,6 +297,7 @@ SuperH4_impl::SuperH4_impl() {
 
 bool SuperH4_impl::Init()
 {
+    verify(polly2_mmio_init() == 0);
     verify(freerun_init() == true);
 
     verify(sizeof(Sh4cntx) == 448);
