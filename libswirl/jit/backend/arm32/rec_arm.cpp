@@ -2104,7 +2104,7 @@ struct Arm32NGenBackend: NGenBackend
 		//ends -- just pays the decrement with a plain sub.  Constprop-promoted
 		//static ends have a known target and are judged like any other static.
 		bool cycle_check=true;
-		if (settings.dynarec.cyclecheck_backwards_only)
+		if (settings.dynarec.opt_cyclecheck_backwards_only)
 		{
 			switch(block->BlockType)
 			{
@@ -2306,7 +2306,7 @@ struct Arm32NGenBackend: NGenBackend
 			verify((fault_offs==0) || fault_offs==(0x1FFFFFFF&sh4_addr));
 		#endif
 
-		if (settings.dynarec.unstable_opt && is_sq) //THPS2 uses cross area SZ_32F so this is disabled for now
+		if (settings.dynarec.opt_sqw_rewrite && is_sq) //THPS2 uses cross area SZ_32F so this is disabled for now
 		{
 			//SQ !
 			s32 sq_offs=sq_both-sh4_ctr;

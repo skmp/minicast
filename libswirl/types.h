@@ -471,15 +471,16 @@ struct settings_t
 	{
 		bool Enable;
 		bool idleskip;
-		bool unstable_opt;
-		bool safemode;
 		bool disable_nvmem;
-		// only poll for interrupts (subs/blle intc_sched) on blocks that can
-		// branch backwards or whose exit target is unknown at compile time.
-		// Forward-only blocks cannot close a loop on their own, so they just
-		// decrement the counter (plain sub) -- a later backward/dynamic block
-		// always runs the check.
-		bool cyclecheck_backwards_only;
+		
+		bool opt_cyclecheck_backwards_only;	// only poll for interrupts on blocks that can backwards
+		bool opt_div1_som;		// match div1 for div32u/s
+		bool opt_sqw_on_pref;	// on write before pref, assume SQW
+		bool opt_sqw_rewrite;	// On rewrite to SQW, always assume SQW
+		int opt_constprop;		// 0 = 0ff, 1 = safe, 2 = include page constant
+		bool opt_readm_pairs; 	// fuse +0 and +4 addresses on same base reg
+		bool opt_fipr_w;		// simplify fipr if w is provably 0 or 1
+
 		SmcCheckEnum SmcCheckLevel;
 		int ScpuEnable;
 		int DspEnable;

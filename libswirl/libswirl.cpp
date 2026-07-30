@@ -169,8 +169,8 @@ void LoadSpecialSettings()
         // Surf Rocket Racers
         || !strncmp("T40216N", reios_product_number, 7))
     {
-        printf("Enabling Dynarec safe mode for game %s\n", reios_product_number);
-        settings.dynarec.safemode = 1;
+        printf("Disabling div1_som for game %s\n", reios_product_number);
+        settings.dynarec.opt_div1_som = 0;
         safemode_game = true;
     }
 
@@ -242,9 +242,15 @@ void InitSettings()
 {
     settings.dynarec.Enable = true;
     settings.dynarec.idleskip = true;
-    settings.dynarec.unstable_opt = false;
-    settings.dynarec.cyclecheck_backwards_only = false;
-    settings.dynarec.safemode = true;
+    
+    settings.dynarec.opt_cyclecheck_backwards_only = false;
+    settings.dynarec.opt_div1_som = true;  
+    settings.dynarec.opt_sqw_on_pref = false;
+    settings.dynarec.opt_sqw_rewrite = false;
+    settings.dynarec.opt_constprop = 1;
+    settings.dynarec.opt_readm_pairs = 0;
+    settings.dynarec.opt_fipr_w = 1;
+
     settings.dynarec.ScpuEnable = true;
     settings.dynarec.DspEnable = true;
     settings.dynarec.SmcCheckLevel = FullCheck;
@@ -299,9 +305,15 @@ void LoadSettings(bool game_specific)
 
     settings.dynarec.Enable = cfgLoadBool(config_section, "Dynarec.Enabled", settings.dynarec.Enable);
     settings.dynarec.idleskip = cfgLoadBool(config_section, "Dynarec.idleskip", settings.dynarec.idleskip);
-    settings.dynarec.unstable_opt = cfgLoadBool(config_section, "Dynarec.unstable-opt", settings.dynarec.unstable_opt);
-    settings.dynarec.cyclecheck_backwards_only = cfgLoadBool(config_section, "Dynarec.cyclecheck-backwards-only", settings.dynarec.cyclecheck_backwards_only);
-    settings.dynarec.safemode = cfgLoadBool(config_section, "Dynarec.safe-mode", settings.dynarec.safemode);
+    
+    settings.dynarec.opt_cyclecheck_backwards_only = cfgLoadBool(config_section, "Dynarec.opt_cyclecheck_backwards_only", settings.dynarec.opt_cyclecheck_backwards_only);
+    settings.dynarec.opt_div1_som = cfgLoadBool(config_section, "Dynarec.opt_div1_som", settings.dynarec.opt_div1_som);
+    settings.dynarec.opt_sqw_on_pref = cfgLoadBool(config_section, "Dynarec.opt_sqw_on_pref", settings.dynarec.opt_sqw_on_pref);
+    settings.dynarec.opt_sqw_rewrite = cfgLoadBool(config_section, "Dynarec.opt_sqw_rewrite", settings.dynarec.opt_sqw_rewrite);
+    settings.dynarec.opt_constprop = cfgLoadInt(config_section, "Dynarec.opt_constprop", settings.dynarec.opt_constprop);
+    settings.dynarec.opt_readm_pairs = cfgLoadBool(config_section, "Dynarec.opt_readm_pairs", settings.dynarec.opt_readm_pairs);
+    settings.dynarec.opt_fipr_w = cfgLoadBool(config_section, "Dynarec.opt_fipr_w", settings.dynarec.opt_fipr_w);
+
     settings.dynarec.SmcCheckLevel = (SmcCheckEnum)cfgLoadInt(config_section, "Dynarec.SmcCheckLevel", settings.dynarec.SmcCheckLevel);
     settings.dynarec.ScpuEnable = cfgLoadInt(config_section, "Dynarec.ScpuEnabled", settings.dynarec.ScpuEnable);
     settings.dynarec.DspEnable = cfgLoadInt(config_section, "Dynarec.DspEnabled", settings.dynarec.DspEnable);
@@ -406,11 +418,12 @@ void SaveSettings()
     cfgSaveInt("config", "Dreamcast.Broadcast", settings.dreamcast.broadcast);
     cfgSaveBool("config", "Dreamcast.FullMMU", settings.dreamcast.FullMMU);
     cfgSaveBool("config", "Dynarec.idleskip", settings.dynarec.idleskip);
-    cfgSaveBool("config", "Dynarec.unstable-opt", settings.dynarec.unstable_opt);
-    cfgSaveBool("config", "Dynarec.cyclecheck-backwards-only", settings.dynarec.cyclecheck_backwards_only);
-
-    if (!safemode_game || !settings.dynarec.safemode)
-        cfgSaveBool("config", "Dynarec.safe-mode", settings.dynarec.safemode);
+    cfgSaveBool("config", "Dynarec.opt_cyclecheck_backwards_only", settings.dynarec.opt_cyclecheck_backwards_only);
+	cfgSaveBool("config", "Dynarec.opt_div1_som", settings.dynarec.opt_div1_som);
+	cfgSaveBool("config", "Dynarec.opt_sqw_on_pref", settings.dynarec.opt_sqw_on_pref);
+	cfgSaveInt("config", "Dynarec.opt_constprop", settings.dynarec.opt_constprop);
+	cfgSaveBool("config", "Dynarec.opt_readm_pairs", settings.dynarec.opt_readm_pairs);
+	cfgSaveBool("config", "Dynarec.opt_fipr_w", settings.dynarec.opt_fipr_w);
     cfgSaveInt("config", "Dynarec.SmcCheckLevel", (int)settings.dynarec.SmcCheckLevel);
 
     cfgSaveInt("config", "Dreamcast.Language", settings.dreamcast.language);

@@ -1627,16 +1627,24 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 		puts("\n");
 	}
 	*/
-	constprop(blk, !settings.dynarec.safemode);
-	fuse_readm_pairs(blk);
+	if (settings.dynarec.opt_constprop) {
+		constprop(blk, settings.dynarec.opt_constprop >= 2);
+	}
+	if (settings.dynarec.opt_readm_pairs) {
+		fuse_readm_pairs(blk);
+	}
 	dead_value_elim(blk);
 #if HOST_CPU == CPU_ARM
 	//deletes the w load: only run for backends whose ftrv honors the flag
-	ftrv_known_w(blk);
+	if (settings.dynarec.opt_fipr_w) {
+		ftrv_known_w(blk);
+	}
 #endif
 
-	if (settings.dynarec.unstable_opt)
+	if (settings.dynarec.opt_sqw_on_pref) {
 		sq_pref(blk);
+	}
+	
 	bool last_op_sets_flags=!blk->has_jcond && blk->oplist.size() > 0 && 
 		blk->oplist[blk->oplist.size()-1].rd._reg==reg_sr_T;
 
