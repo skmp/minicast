@@ -22,12 +22,17 @@
 #include "types.h"
 #include "mister_support.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
+#include "../../hw/pvr/pvr_regs.h"
 #include "../../../../polly2-rtl/driver/polly2_mmio.h"
 
 /* Physical DDR home of the band FB: the first 128-byte-aligned byte after
@@ -128,12 +133,31 @@ static const u8* glyph(char c)
 
 // ------------------------------------------------------------- drawing ---
 
-static void draw_text(int x, int y, const char* text, u16 color)
+/* the OSD stats line, from the CURRENT accumulation window (shared by the
+ * band redraw and the screenshot band re-render; only UpdateStatsOSD
+ * resets the window) */
+static void format_stats_line(char* buf, size_t n)
+{
+	u32 hz = polly2_clock_hz();
+
+	double render_max_ms = stats.cycles_max * 1e3 / hz;
+	double rps_polly2 = stats.cycles_total ?
+		(double)stats.frames * hz / (double)stats.cycles_total :
+		0;
+
+	snprintf(buf, n,
+	         "S %5.1f%% V %4.1f R %4.1f %s WT %4.1f RT %4.1f PS %4.1f",
+	         stats.speed_pct, stats.vbs, stats.rps, stats.mode,
+	         stats.wait_max_ms, render_max_ms, rps_polly2);
+}
+
+
+static void draw_text(volatile u16* dst, int x, int y, const char* text, u16 color)
 {
 	for (; *text && x <= (int)POLLY2_BAND_W - 8; text++, x += 8) {
 		const u8* g = glyph(*text);
 		for (int r = 0; r < 8; r++) {
-			volatile u16* line = stats_fb + (y + r) * POLLY2_BAND_W + x;
+			volatile u16* line = dst + (y + r) * POLLY2_BAND_W + x;
 			for (int b = 0; b < 8; b++)
 				if (g[r] & (0x80u >> b)) line[b] = color;
 		}
@@ -202,26 +226,211 @@ void ReportRendererStats(double wait_ms, u32 cycles)
 	if (cycles > stats.cycles_max)   stats.cycles_max  = cycles;
 }
 
+// ---------------------------------------------------------- screenshot ---
+// spg_screenshot: software replica of the polly2 SPG scanout (spg.sv) at
+// SOURCE resolution - a 640x540 image, no 2x doubling and no side borders:
+//   * top band    (lines   0..29 ): the stats OSD, RE-RENDERED into a local
+//     640x30 RGB565 band fb (same clear + draw_text as UpdateStatsOSD, from
+//     the current stats window - nothing is read back from DDR), then
+//     MSB-replicated 565->888, 1:1. Always present, even when the on-screen
+//     band is disabled.
+//   * game window (lines  30..509): the 640x480 FB_R_SOF1 framebuffer
+//     through the split-VRAM layout (FB 32-bit word W -> DDR byte
+//     W*8 + SOF1[22]*4), all four FB_R_CTRL fb_depth formats with
+//     fb_concat appended below the 5/6-bit channels (refsw2 Present
+//     semantics). A VO_CONTROL.pixel_double 320-wide source fills the 640
+//     width at 2x; an FB_R_CTRL.fb_line_double 240-line source fills the
+//     480 height at 2x (half the SPG's 4x, since this canvas is half its
+//     1280x960 window). fb_enable=0 blanks the window (bands unaffected).
+//   * bottom band (lines 510..539): black for now (its renderer lands soon).
+// The line stride mirrors sys_top's fb_disp_stride (640 px x 2/2/3/4 bytes
+// by depth, halved by pixel_double) - NOT FB_R_SIZE.
+// Output: 24bpp BMP at /media/fat/games/Dreamcast/<datetime>.bmp.
+
+#define SHOT_DIR       "/media/fat/games/Dreamcast"
+#define SHOT_W         640
+#define SHOT_H         540
+#define SHOT_Y0        30            /* game window y 30..509 */
+#define SHOT_Y1        510
+
+static std::atomic<bool> screenshot_pending;
+
+void QueueScreenshot() { screenshot_pending = true; }
+
+/* one FB-view byte of the game framebuffer through the split-VRAM layout
+ * (pvr_map32 with the line's fixed 32-bit half): view byte v lives at VRAM
+ * byte (v/4)*8 + half*4 + (v&3). */
+static inline u8 shot_fb_byte(const u8* vram, u32 view, u32 half)
+{
+	u32 off = ((view >> 2) << 3) | (half << 2) | (view & 3u);
+	return vram[off & VRAM_MASK];
+}
+
+/* render one game source line into a 640-wide RGB strip (pixel_double
+ * sources are 320 wide and repeat 2x) */
+static void shot_game_line(const u8* vram, u32 sof1, u32 sy, u32 depth,
+                           u32 concat, bool pixdbl, u8* strip /* 640*3 */)
+{
+	static const u32 bpp_by_depth[4] = { 2, 2, 3, 4 };
+	u32 bpp    = bpp_by_depth[depth];
+	u32 stride = (depth == 2) ? 1920u : (depth == 3) ? 2560u : 1280u;
+	if (pixdbl) stride >>= 1;
+	u32 half   = (sof1 >> 22) & 1u;
+	u32 base   = (sof1 & 0x3FFFFCu) + sy * stride;   /* SOF1[1:0] dropped, as HW */
+	u32 srcw   = pixdbl ? 320u : 640u;
+	u32 rep    = pixdbl ? 2u : 1u;
+
+	for (u32 sx = 0; sx < srcw; sx++) {
+		u32 v = base + sx * bpp;
+		u32 p32 = shot_fb_byte(vram, v, half)
+		        | ((u32)shot_fb_byte(vram, v + 1, half) << 8)
+		        | ((bpp > 2) ? ((u32)shot_fb_byte(vram, v + 2, half) << 16) : 0)
+		        | ((bpp > 3) ? ((u32)shot_fb_byte(vram, v + 3, half) << 24) : 0);
+		u32 p16 = p32 & 0xFFFFu;
+		u8 r8, g8, b8;
+		switch (depth) {
+		case 0:                       /* 0555, fb_concat appended */
+			r8 = (u8)((((p16 >> 10) & 0x1F) << 3) | concat);
+			g8 = (u8)((((p16 >>  5) & 0x1F) << 3) | concat);
+			b8 = (u8)((( p16        & 0x1F) << 3) | concat);
+			break;
+		case 1:                       /* 565, fb_concat appended */
+			r8 = (u8)((((p16 >> 11) & 0x1F) << 3) | concat);
+			g8 = (u8)((((p16 >>  5) & 0x3F) << 2) | (concat >> 1));
+			b8 = (u8)((( p16        & 0x1F) << 3) | concat);
+			break;
+		default:                      /* 888 packed / 0888: R,G,B = bytes 2,1,0 */
+			r8 = (u8)(p32 >> 16);
+			g8 = (u8)(p32 >> 8);
+			b8 = (u8)p32;
+			break;
+		}
+		u8* d = strip + (u32)(sx * rep) * 3u;
+		for (u32 k = 0; k < rep; k++) { d[0] = r8; d[1] = g8; d[2] = b8; d += 3; }
+	}
+}
+
+/* one line of a local 640x30 RGB565 band fb -> RGB strip (MSB-replicated) */
+static void shot_band_line(const u16* band, u32 sy, u8* strip /* 640*3 */)
+{
+	const u16* src = band + sy * POLLY2_BAND_W;
+	for (u32 sx = 0; sx < 640; sx++) {
+		u32 p16 = src[sx];
+		u8* d = strip + sx * 3u;
+		d[0] = (u8)((((p16 >> 11) & 0x1F) << 3) | ((p16 >> 13) & 0x7));
+		d[1] = (u8)((((p16 >>  5) & 0x3F) << 2) | ((p16 >>  9) & 0x3));
+		d[2] = (u8)((( p16        & 0x1F) << 3) | ((p16 >>  2) & 0x7));
+	}
+}
+
+static void spg_screenshot(const u8* vram)
+{
+	if (!vram)
+		return;
+
+	/* display registers, exactly as sys_top feeds the spg */
+	u32  sof1    = FB_R_SOF1;
+	u32  rctrl   = FB_R_CTRL.full;
+	bool enable  = (rctrl >> 0) & 1;
+	bool linedbl = (rctrl >> 1) & 1;
+	u32  depth   = (rctrl >> 2) & 3;
+	u32  concat  = (rctrl >> 4) & 7;
+	bool pixdbl  = VO_CONTROL.pixel_double;
+
+	/* Bands are RE-RENDERED into local band fbs, not read back from DDR, so
+	 * they are always part of the screenshot even with the on-screen band
+	 * disabled. Top = the stats OSD (same clear + draw_text as
+	 * UpdateStatsOSD, from the current stats window - which is NOT reset
+	 * here); bottom = black for now, its renderer lands soon. */
+	static u16 top_band[POLLY2_BAND_W * POLLY2_BAND_H];
+	static u16 bot_band[POLLY2_BAND_W * POLLY2_BAND_H];
+	memset(top_band, 0, sizeof top_band);
+	memset(bot_band, 0, sizeof bot_band);
+	if (polly2_mmio || polly2_mmio_init() == 0) {   /* clock_hz needs MMIO */
+		char line[POLLY2_BAND_W / 8 + 1];
+		format_stats_line(line, sizeof line);
+		draw_text(top_band, 2, 11, line, 0xFFFF);
+	}
+
+	u8* frame = (u8*)calloc(1, (size_t)SHOT_W * SHOT_H * 3);   /* black borders */
+	if (!frame) return;
+
+	u8  strip[SHOT_W * 3];
+	int cur_rgn = -1;           /* {region, src line} strip cache (line_double) */
+	u32 cur_src = ~0u;
+	for (u32 oy = 0; oy < SHOT_H; oy++) {
+		int rgn; u32 src; bool on;
+		if (oy < SHOT_Y0)      { rgn = 0; src = oy;                                  on = true;   }
+		else if (oy < SHOT_Y1) { rgn = 1; src = (oy - SHOT_Y0) >> (linedbl ? 1 : 0); on = enable; }
+		else                   { rgn = 2; src = oy - SHOT_Y1;                        on = true;   }
+		if (!on) continue;      /* fb_enable=0: game window stays black */
+
+		if (rgn != cur_rgn || src != cur_src) {
+			if (rgn == 0)      shot_band_line(top_band, src, strip);
+			else if (rgn == 2) shot_band_line(bot_band, src, strip);
+			else               shot_game_line(vram, sof1, src, depth, concat, pixdbl, strip);
+			cur_rgn = rgn; cur_src = src;
+		}
+		memcpy(frame + (size_t)oy * SHOT_W * 3, strip, sizeof strip);
+	}
+
+	/* ---- write the BMP (24bpp BGR, bottom-up; 1920*3 is 4-aligned) ---- */
+	mkdir(SHOT_DIR, 0777);      /* usually exists; EEXIST is fine */
+	time_t t = time(NULL);
+	struct tm tmv;
+	localtime_r(&t, &tmv);
+	char path[128];
+	snprintf(path, sizeof path, SHOT_DIR "/%04d-%02d-%02d_%02d-%02d-%02d.bmp",
+	         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+	         tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+
+	FILE* f = fopen(path, "wb");
+	if (f) {
+		u32 img = (u32)SHOT_W * SHOT_H * 3, fsz = 54 + img;
+		u8 hdr[54] = { 'B','M' };
+		memcpy(hdr +  2, &fsz, 4);
+		hdr[10] = 54;                                  /* pixel data offset */
+		hdr[14] = 40;                                  /* BITMAPINFOHEADER  */
+		u32 w = SHOT_W, h = SHOT_H;
+		memcpy(hdr + 18, &w, 4);
+		memcpy(hdr + 22, &h, 4);
+		hdr[26] = 1; hdr[28] = 24;                     /* planes, bpp */
+		memcpy(hdr + 34, &img, 4);
+		fwrite(hdr, 1, sizeof hdr, f);
+		for (int y = SHOT_H - 1; y >= 0; y--) {        /* bottom-up, RGB->BGR */
+			u8 row[SHOT_W * 3];
+			const u8* s = frame + (size_t)y * SHOT_W * 3;
+			for (u32 x = 0; x < SHOT_W; x++) {
+				row[x * 3 + 0] = s[x * 3 + 2];
+				row[x * 3 + 1] = s[x * 3 + 1];
+				row[x * 3 + 2] = s[x * 3 + 0];
+			}
+			fwrite(row, 1, sizeof row, f);
+		}
+		fclose(f);
+		printf("mister_support: screenshot -> %s\n", path);
+	} else {
+		printf("mister_support: cannot write %s\n", path);
+	}
+	free(frame);
+}
+
+void ScreenshotVBlank(const u8* vram)
+{
+	if (screenshot_pending.exchange(false))
+		spg_screenshot(vram);
+}
+
 void UpdateStatsOSD()
 {
 	if (!osd_init())
 		return;
 
-	u32 hz = polly2_clock_hz();
-
-	double render_max_ms = stats.cycles_max * 1e3 / hz;
-	double rps_polly2 = stats.cycles_total ?
-		(double)stats.frames * hz / (double)stats.cycles_total :
-		0;
-
 	char line[POLLY2_BAND_W / 8 + 1];
-	snprintf(line, sizeof(line),
-	         "S %5.1f%% V %4.1f R %4.1f %s WT %4.1f RT %4.1f PS %4.1f",
-	         stats.speed_pct, stats.vbs, stats.rps, stats.mode,
-	         stats.wait_max_ms, render_max_ms, rps_polly2);
+	format_stats_line(line, sizeof line);
 
 	for (u32 i = 0; i < POLLY2_BAND_W * POLLY2_BAND_H; i++) stats_fb[i] = 0;
-	draw_text(2, 11, line, 0xFFFF);
+	draw_text(stats_fb, 2, 11, line, 0xFFFF);
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	reset_render_window();   // next OSD update covers exactly this gap

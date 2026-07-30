@@ -22,6 +22,15 @@
 #include "hw/sh4/sh4_mmr.h"
 #include "hw/sh4/sh4_sched.h"
 
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <semaphore.h>
+#include <pthread.h>
+#include <signal.h>
+#include <errno.h>
+#include <unistd.h>
+
 #include "hw/sh4/sh4_sched.h"
 void nilprintf(...) {}
 
@@ -77,6 +86,22 @@ struct GDRomV3_impl final : MMIODevice {
     ByteCount_t ByteCount = { 0 };
 
     //end
+
+    // Async disc reads: FillReadBuffer runs on its own high-priority thread
+    // so SD-card latency never stalls the sh4 thread mid-DMA. Protocol:
+    // FillReadBufferAsync() kicks the worker; read_buff/read_params must not
+    // be touched until the fill retires (poll FillReadBufferBusy, or block in
+    // FillReadBufferSync). The handoff is a semaphore + atomics on purpose:
+    // both are EINTR/signal-safe, unlike condvars on this glibc (a signal
+    // landing mid pthread_cond_wait made the noexcept std:: wrapper
+    // terminate). disc_io_mtx serializes g_GDRDisc access against the emu
+    // thread's CDDA/PIO reads.
+    std::thread fill_thread;
+    sem_t fill_kick;
+    std::atomic<bool> fill_pending{false};
+    std::atomic<bool> fill_exit{false};
+    std::mutex disc_io_mtx;
+
     void FillReadBuffer()
     {
         read_buff.cache_index = 0;
@@ -91,9 +116,50 @@ struct GDRomV3_impl final : MMIODevice {
 
         read_buff.cache_size = count * read_params.sector_type;
 
-        g_GDRDisc->ReadSector(read_buff.cache, read_params.start_sector, count, read_params.sector_type);
+        {
+            std::lock_guard<std::mutex> lk(disc_io_mtx);
+            g_GDRDisc->ReadSector(read_buff.cache, read_params.start_sector, count, read_params.sector_type);
+        }
         read_params.start_sector += count;
         read_params.remaining_sectors -= count;
+    }
+
+    void FillReadBufferAsync()
+    {
+        fill_pending.store(true, std::memory_order_release);
+        sem_post(&fill_kick);
+    }
+
+    bool FillReadBufferBusy()
+    {
+        return fill_pending.load(std::memory_order_acquire);
+    }
+
+    void FillReadBufferSync()
+    {
+        while (FillReadBufferBusy())
+            usleep(50);
+    }
+
+    void fill_thread_main()
+    {
+        // no signal may interrupt this thread's blocking waits (the polly2
+        // kernel module SIGUSR1s every /dev/polly2 holder, nixprof SIGPROFs)
+        sigset_t all;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, NULL);
+
+        for (;;)
+        {
+            while (sem_wait(&fill_kick) != 0 && errno == EINTR)
+                ;
+            if (fill_exit.load(std::memory_order_acquire))
+                return;
+            if (!fill_pending.load(std::memory_order_acquire))
+                continue;
+            FillReadBuffer();
+            fill_pending.store(false, std::memory_order_release);
+        }
     }
 
 
@@ -178,7 +244,10 @@ struct GDRomV3_impl final : MMIODevice {
                 next_state = gds_readsector_pio;
             }
 
-            g_GDRDisc->ReadSector((u8*)&pio_buff.data[0], read_params.start_sector, sector_count, read_params.sector_type);
+            {
+                std::lock_guard<std::mutex> lk(disc_io_mtx);
+                g_GDRDisc->ReadSector((u8*)&pio_buff.data[0], read_params.start_sector, sector_count, read_params.sector_type);
+            }
             read_params.start_sector += sector_count;
             read_params.remaining_sectors -= sector_count;
 
@@ -187,7 +256,10 @@ struct GDRomV3_impl final : MMIODevice {
         break;
 
         case gds_readsector_dma:
-            FillReadBuffer();
+            if (settings.gdrom.async_dma)
+                FillReadBufferAsync();
+            else
+                FillReadBuffer();
             break;
 
         case gds_pio_end:
@@ -485,6 +557,8 @@ struct GDRomV3_impl final : MMIODevice {
 
             u32 start_sector = GetFAD(&readcmd.b[2], readcmd.prmtype);
             u32 sector_count = (readcmd.b[8] << 16) | (readcmd.b[9] << 8) | (readcmd.b[10]);
+
+            FillReadBufferSync();   // a stale in-flight fill must retire before re-arming
 
             read_params.start_sector = start_sector;
             read_params.remaining_sectors = sector_count;
@@ -989,12 +1063,19 @@ struct GDRomV3_impl final : MMIODevice {
     }
 
     bool Init() {
-        
+
         sb->RegisterRIO(this, SB_GDST_addr, RIO_WF, 0, STATIC_FORWARD(GDRomV3_impl, DmaStart));
 
         sb->RegisterRIO(this, SB_GDEN_addr, RIO_WF, 0, STATIC_FORWARD(GDRomV3_impl, DmaEnable));
 
         gdrom_schid = sh4_sched_register(this, 0, STATIC_FORWARD(GDRomV3_impl, Update));
+
+        sem_init(&fill_kick, 0, 0);
+        fill_thread = std::thread([this] { fill_thread_main(); });
+        struct sched_param sp = {};
+        sp.sched_priority = 2;
+        if (pthread_setschedparam(fill_thread.native_handle(), SCHED_FIFO, &sp) != 0)
+            printf("gdrom: fill thread SCHED_FIFO unavailable, keeping default priority\n");
 
         gd_setdisc();
 
@@ -1010,7 +1091,16 @@ struct GDRomV3_impl final : MMIODevice {
     ASIC* asic;
     SuperH4Mmr* sh4mmr;
     GDRomV3_impl(SuperH4Mmr* sh4mmr, SystemBus* sb, ASIC* asic) : sh4mmr(sh4mmr), sb(sb), asic(asic) {
-       
+
+    }
+
+    ~GDRomV3_impl() {
+        if (fill_thread.joinable()) {
+            fill_exit.store(true, std::memory_order_release);
+            sem_post(&fill_kick);
+            fill_thread.join();
+            sem_destroy(&fill_kick);
+        }
     }
 
     int getGDROMTicks()
@@ -1030,7 +1120,10 @@ struct GDRomV3_impl final : MMIODevice {
         //silence ! :p
         if (cdda.playing)
         {
-            g_GDRDisc->ReadSector((u8*)sector, cdda.CurrAddr.FAD, 1, 2352);
+            {
+                std::lock_guard<std::mutex> lk(disc_io_mtx);
+                g_GDRDisc->ReadSector((u8*)sector, cdda.CurrAddr.FAD, 1, 2352);
+            }
             cdda.CurrAddr.FAD++;
             if (cdda.CurrAddr.FAD == cdda.EndAddr.FAD)
             {
@@ -1057,6 +1150,7 @@ struct GDRomV3_impl final : MMIODevice {
     }
 
     void serialize(void** data, unsigned int* total_size) {
+        FillReadBufferSync();   // read_buff/read_params must be at rest
 
         REICAST_S(sns_asc);
         REICAST_S(sns_ascq);
@@ -1085,6 +1179,7 @@ struct GDRomV3_impl final : MMIODevice {
     }
 
     void unserialize(void** data, unsigned int* total_size) {
+        FillReadBufferSync();   // read_buff/read_params must be at rest
         
         REICAST_US(sns_asc);
         REICAST_US(sns_ascq);
@@ -1114,6 +1209,11 @@ struct GDRomV3_impl final : MMIODevice {
 
     int Update(int i, int c, int j)
     {
+        // disc read in flight: read_buff/read_params are the worker's, come
+        // back once the fill has retired
+        if (FillReadBufferBusy())
+            return 50000;
+
         if (!(SB_GDST & 1) || !(SB_GDEN & 1) || (read_buff.cache_size == 0 && read_params.remaining_sectors == 0))
         {
             return 0;
@@ -1154,6 +1254,7 @@ struct GDRomV3_impl final : MMIODevice {
         }
 
         u32 len_backup = len;
+        bool refill_kicked = false;
         if (1 == SB_GDDIR)
         {
             while (len)
@@ -1162,8 +1263,18 @@ struct GDRomV3_impl final : MMIODevice {
                 if (buff_size == 0)
                 {
                     verify(read_params.remaining_sectors > 0);
-                    //buffer is empty , fill it :)
+                    if (settings.gdrom.async_dma)
+                    {
+                        //buffer is empty: refill on the worker thread; the
+                        //rest of this DMA resumes on a later Update once the
+                        //data is in
+                        FillReadBufferAsync();
+                        refill_kicked = true;
+                        break;
+                    }
+                    //legacy path: blocking refill on the sh4 thread
                     FillReadBuffer();
+                    continue;
                 }
 
                 //transfer up to len bytes
@@ -1186,8 +1297,9 @@ struct GDRomV3_impl final : MMIODevice {
         //SB_GDLEN = 0x00000000; //13/5/2k7 -> according to docs these regs are not updated by hardware
         //SB_GDSTAR = (src + len_backup);
 
-        SB_GDLEND += len_backup;
-        SB_GDSTARD += len_backup;//(src + len_backup)&0x1FFFFFFF;
+        u32 transferred = len_backup - len;
+        SB_GDLEND += transferred;
+        SB_GDSTARD += transferred;
 
         if (SB_GDLEND == SB_GDLEN)
         {
@@ -1196,8 +1308,8 @@ struct GDRomV3_impl final : MMIODevice {
             // The DMA end interrupt flag
             asic->RaiseInterrupt(holly_GDROM_DMA);
         }
-        //Read ALL sectors
-        if (read_params.remaining_sectors == 0)
+        //Read ALL sectors (read_buff/read_params are off limits after a kick)
+        if (!refill_kicked && read_params.remaining_sectors == 0)
         {
             //And all buffer :p
             if (read_buff.cache_size == 0)
