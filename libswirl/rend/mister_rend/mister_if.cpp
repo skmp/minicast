@@ -48,7 +48,9 @@ void rend_term_renderer() {
 
 void rend_vblank() {
     // present framebuffer to video out
-    // printf("rend_vblank\n");
+    // take a queued Print Screen screenshot at the vblank boundary, when the
+    // scanout registers describe a coherent displayed frame
+    ScreenshotVBlank(vram);
 }
 
 // freerunning REP poll: report the FPGA's actual completion, with the same

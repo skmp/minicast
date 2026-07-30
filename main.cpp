@@ -16,6 +16,7 @@
 #include <atomic>
 
 #include "hw/pvr/pvr_regs.h"
+#include "rend/mister_rend/mister_support.h"
 
 std::atomic<bool> vram_dump_pending;
 static unsigned vram_dump_number;
@@ -326,7 +327,8 @@ int kbhit(void) {
 // Multiple mapped devices merge into port 0: buttons are logically OR'd,
 // for axes the value with the biggest absolute value wins.
 //
-// ESC on any evdev device (mapped or not) is a hardcoded exit.
+// ESC on any evdev device (mapped or not) is a hardcoded exit; Print Screen
+// queues an spg_screenshot the same way (taken at the next SPG vblank).
 
 #include <linux/input.h>
 #include <sys/ioctl.h>
@@ -625,6 +627,11 @@ static void evdev_read_pad(EvdevPad& p) {
 			}
 			if (ev[e].type == EV_KEY && ev[e].code == KEY_0 && ev[e].value == 1) {
 				vram_dump_pending = true;
+			}
+			if (ev[e].type == EV_KEY && ev[e].code == KEY_SYSRQ && ev[e].value == 1) {
+				// Print Screen: queue a screenshot; taken at the next SPG
+				// vblank (rend_vblank -> ScreenshotVBlank -> spg_screenshot)
+				QueueScreenshot();
 			}
 			evdev_feed(p, ev[e].type, ev[e].code, ev[e].value);
 		}
