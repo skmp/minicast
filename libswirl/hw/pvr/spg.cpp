@@ -337,6 +337,7 @@ struct SPG_impl final : SPG {
         if (settings.freerunning && !rend_render_done())
             return REND_DONE_POLL_CYCLES;
 
+        hasrep = false;
         asic->RaiseInterrupt(holly_RENDER_DONE);
         asic->RaiseInterrupt(holly_RENDER_DONE_isp);
         asic->RaiseInterrupt(holly_RENDER_DONE_vd);
