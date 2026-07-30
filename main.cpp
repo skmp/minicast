@@ -512,6 +512,9 @@ struct EvdevPad {
 	int absLo[ABS_CODES], absHi[ABS_CODES];
 	bool absValid[ABS_CODES];
 
+	bool ffRumble;             // supports FF_RUMBLE, fd is open read-write
+	int ffEffect;              // uploaded rumble effect id, -1 = none yet
+
 	bool held[TGT_COUNT];      // dpad_*/btn_* targets currently pressed
 	bool actPrev[2];           // TGT_BTN_EXIT/SCREENSHOT state last update
 	int analog[2];             // TGT_ANALOG_X/Y, -128..127
@@ -609,6 +612,24 @@ static void evdev_init() {
 		std::map<std::string, CfgPad>::iterator it = cfgpads.find(id);
 		bool mapped = it != cfgpads.end() && it->second.any;
 
+		// rumble (purupuru pack): mapped controllers advertising FF_RUMBLE are
+		// reopened read-write so effects can be uploaded and played
+		bool ffRumble = false;
+		if (mapped) {
+			unsigned long ffbits[(FF_MAX + 8 * sizeof(unsigned long)) /
+			                     (8 * sizeof(unsigned long))] = {0};
+			if (ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffbits)), ffbits) >= 0 &&
+				(ffbits[FF_RUMBLE / (8 * sizeof(unsigned long))] >>
+				 (FF_RUMBLE % (8 * sizeof(unsigned long)))) & 1) {
+				int rw = open(paths[i].c_str(), O_RDWR | O_NONBLOCK);
+				if (rw >= 0) {
+					close(fd);
+					fd = rw;
+					ffRumble = true;
+				}
+			}
+		}
+
 		EvdevPad pad;
 		memset(&pad.absLo, 0, sizeof(pad.absLo));
 		memset(&pad.absHi, 0, sizeof(pad.absHi));
@@ -625,6 +646,8 @@ static void evdev_init() {
 		pad.path = paths[i];
 		pad.id = id;
 		pad.port = 0;
+		pad.ffRumble = ffRumble;
+		pad.ffEffect = -1;
 		pad.feedKb = false;
 		pad.feedMouse = false;
 		if (it != cfgpads.end()) {
@@ -663,8 +686,9 @@ static void evdev_init() {
 				   pad.path.c_str(), id.c_str(), 'A' + pad.port,
 				   pad.feedKb ? "keyboard" : "mouse");
 		else if (mapped)
-			printf("evdev: mapped %s [%s] -> port %c\n",
-				   pad.path.c_str(), id.c_str(), 'A' + pad.port);
+			printf("evdev: mapped %s [%s] -> port %c%s\n",
+				   pad.path.c_str(), id.c_str(), 'A' + pad.port,
+				   ffRumble ? ", rumble" : "");
 		else
 			printf("evdev: monitoring %s [%s]\n", pad.path.c_str(), id.c_str());
 	}
@@ -883,8 +907,46 @@ void UpdateInputState(u32 port) {
 		evdev_read_pad(g_evdev_pads[i]);
 }
 
+// purupuru pack rumble -> evdev force feedback, for every FF_RUMBLE-capable
+// device mapped to the port. inclination (fade slope) has no evdev
+// equivalent; the peak power is played for the whole duration.
 void UpdateVibration(u32 port, float power, float inclination, u32 duration_ms) {
+	for (size_t i = 0; i < g_evdev_pads.size(); i++) {
+		EvdevPad& p = g_evdev_pads[i];
+		if (!p.ffRumble || (p.port & 3) != (int)port)
+			continue;
 
+		struct input_event ie;
+		memset(&ie, 0, sizeof(ie));
+		ie.type = EV_FF;
+
+		if (power <= 0.0f) {
+			if (p.ffEffect >= 0) {   // stop
+				ie.code = p.ffEffect;
+				ie.value = 0;
+				if (write(p.fd, &ie, sizeof(ie)) != sizeof(ie))
+					;   // device gone; next evdev read notices
+			}
+			continue;
+		}
+
+		u16 mag = (u16)(std::min(power, 1.0f) * 0xFFFF);
+		struct ff_effect ef;
+		memset(&ef, 0, sizeof(ef));
+		ef.type = FF_RUMBLE;
+		ef.id = p.ffEffect;   // -1 allocates, else updates in place
+		ef.u.rumble.strong_magnitude = mag;
+		ef.u.rumble.weak_magnitude = mag;
+		ef.replay.length = duration_ms > 0xFFFF ? 0xFFFF : (u16)duration_ms;
+		if (ioctl(p.fd, EVIOCSFF, &ef) < 0)
+			continue;
+		p.ffEffect = ef.id;
+
+		ie.code = p.ffEffect;
+		ie.value = 1;
+		if (write(p.fd, &ie, sizeof(ie)) != sizeof(ie))
+			;
+	}
 }
 
 #if HOST_OS == OS_XIL_BARE
