@@ -253,8 +253,8 @@ void push_vmu_screen(int, int, unsigned char*) {
 
 }
 
-void get_mic_data(unsigned char*) {
-
+int get_mic_data(unsigned char*) {  // no microphone on this build
+	return 0;
 }
 
 bool bios_loaded;
@@ -395,6 +395,109 @@ static bool decode_mapping(const char* text, InMapping* m) {
 	return m->kind != InMapping::NONE;
 }
 
+// ------------------------------------------------------------------------
+// maple keyboard / mouse feeding: a device whose configured port carries a
+// DC keyboard or mouse ([input] deviceN = 4/5, set by DreamSTer.sh's
+// Peripherals page) drives the maple device state polled by maple_devs.cpp
+// (this is the only writer on the MiSTer build - the libswirl/input and
+// linux-dist frontends that normally feed these globals are compiled out).
+
+#include "hw/maple/maple_devs.h"   // MDT_* device types
+
+extern u8 kb_key[6];      // DC keyboard matrix: up to 6 held keys (HID codes)
+extern u8 kb_shift;       // DC keyboard modifier bitmask (HID byte)
+extern u32 mo_buttons;    // DC mouse buttons, active low
+extern f32 mo_x_delta, mo_y_delta, mo_wheel_delta;
+
+// linux evdev keycode -> DC (USB HID) keyboard usage code; modifiers are
+// handled separately via dc_kbd_input, 0 = no DC equivalent
+static const u8 LINUX_TO_DC_KEY[128] = {
+	/*   0 */ 0,    0x29, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, // ESC, 1..6
+	/*   8 */ 0x24, 0x25, 0x26, 0x27, 0x2D, 0x2E, 0x2A, 0x2B, // 7..0 - = BS TAB
+	/*  16 */ 0x14, 0x1A, 0x08, 0x15, 0x17, 0x1C, 0x18, 0x0C, // Q..I
+	/*  24 */ 0x12, 0x13, 0x2F, 0x30, 0x28, 0,    0x04, 0x16, // O P [ ] RET, A S
+	/*  32 */ 0x07, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F, 0x33, // D..L ;
+	/*  40 */ 0x34, 0x35, 0,    0x31, 0x1D, 0x1B, 0x06, 0x19, // ' ` \ Z X C V
+	/*  48 */ 0x05, 0x11, 0x10, 0x36, 0x37, 0x38, 0,    0x55, // B N M , . / KP*
+	/*  56 */ 0,    0x2C, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, // SPC CAPS F1..F5
+	/*  64 */ 0x3F, 0x40, 0x41, 0x42, 0x43, 0x53, 0x47, 0x5F, // F6..F10 NUM SCR KP7
+	/*  72 */ 0x60, 0x61, 0x56, 0x5C, 0x5D, 0x5E, 0x57, 0x59, // KP8 KP9 KP- KP4..6 KP+ KP1
+	/*  80 */ 0x5A, 0x5B, 0x62, 0x63, 0,    0,    0x64, 0x44, // KP2 KP3 KP0 KP. 102ND F11
+	/*  88 */ 0x45, 0,    0,    0,    0,    0,    0,    0,    // F12
+	/*  96 */ 0x58, 0,    0x54, 0x46, 0,    0,    0x4A, 0x52, // KPRET KP/ PRTSC HOME UP
+	/* 104 */ 0x4B, 0x50, 0x4F, 0x4D, 0x51, 0x4E, 0x49, 0x4C, // PGUP LEFT RIGHT END DOWN PGDN INS DEL
+	/* 112 */ 0,    0,    0,    0,    0,    0,    0,    0x48, // PAUSE
+	/* 120 */ 0,    0,    0,    0,    0,    0,    0,    0,
+};
+
+static void dc_kbd_input(u16 code, bool pressed) {
+	u8 mod = 0;
+	switch (code) {
+	case KEY_LEFTCTRL:   mod = 0x01; break;
+	case KEY_LEFTSHIFT:  mod = 0x02; break;
+	case KEY_LEFTALT:    mod = 0x04; break;
+	case KEY_LEFTMETA:   mod = 0x08; break;   // S1
+	case KEY_RIGHTCTRL:  mod = 0x10; break;
+	case KEY_RIGHTSHIFT: mod = 0x20; break;
+	case KEY_RIGHTALT:   mod = 0x40; break;
+	case KEY_RIGHTMETA:  mod = 0x80; break;   // S2
+	}
+	if (mod) {
+		if (pressed)
+			kb_shift |= mod;
+		else
+			kb_shift &= ~mod;
+		return;
+	}
+	u8 dc = code < 128 ? LINUX_TO_DC_KEY[code] : 0;
+	if (!dc)
+		return;
+	if (pressed) {  // 6-key rollover, ignore re-press/autorepeat
+		for (int i = 0; i < 6; i++)
+			if (kb_key[i] == dc)
+				return;
+		for (int i = 0; i < 6; i++)
+			if (kb_key[i] == 0) {
+				kb_key[i] = dc;
+				return;
+			}
+	} else {
+		for (int i = 0; i < 6; i++)
+			if (kb_key[i] == dc) {
+				for (; i < 5; i++)
+					kb_key[i] = kb_key[i + 1];
+				kb_key[5] = 0;
+				return;
+			}
+	}
+}
+
+static void dc_mouse_input(u16 type, u16 code, s32 value) {
+	if (type == EV_REL) {
+		float sens = settings.input.MouseSensitivity / 100.0f;
+		if (code == REL_X)
+			mo_x_delta += value * sens;
+		else if (code == REL_Y)
+			mo_y_delta += value * sens;
+		else if (code == REL_WHEEL)
+			mo_wheel_delta -= value * 16;   // wheel up = negative, as x11.cpp
+	} else if (type == EV_KEY) {
+		u32 mask = 0;
+		if (code == BTN_LEFT)
+			mask = 1 << 2;
+		else if (code == BTN_RIGHT)
+			mask = 1 << 1;
+		else if (code == BTN_MIDDLE)
+			mask = 1 << 3;
+		if (mask) {
+			if (value)
+				mo_buttons &= ~mask;
+			else
+				mo_buttons |= mask;
+		}
+	}
+}
+
 #define EVDEV_REL_GAIN       4.0f  // mouse counts -> analog deflection
 #define ABS_CODES            64    // ABS_MAX + 1
 
@@ -402,6 +505,8 @@ struct EvdevPad {
 	int fd;
 	std::string path, id;
 	int port;                  // maple port 0..3 this device feeds
+	bool feedKb;               // port carries a DC keyboard: feed kb_key/kb_shift
+	bool feedMouse;            // port carries a DC mouse: feed mo_*
 	InMapping map[TGT_COUNT];
 
 	int absLo[ABS_CODES], absHi[ABS_CODES];
@@ -520,6 +625,15 @@ static void evdev_init() {
 		pad.path = paths[i];
 		pad.id = id;
 		pad.port = 0;
+		pad.feedKb = false;
+		pad.feedMouse = false;
+		if (it != cfgpads.end()) {
+			// known device: if its port carries a maple keyboard/mouse
+			// (Peripherals page), its events feed that device's state
+			pad.port = it->second.port;
+			pad.feedKb = settings.input.maple_devices[pad.port & 3] == MDT_Keyboard;
+			pad.feedMouse = settings.input.maple_devices[pad.port & 3] == MDT_Mouse;
+		}
 		for (int t = 0; t < TGT_COUNT; t++)
 			pad.map[t].kind = InMapping::NONE;
 		if (mapped) {
@@ -544,7 +658,11 @@ static void evdev_init() {
 		while (read(fd, drain, sizeof(drain)) > 0)
 			;
 		g_evdev_pads.push_back(pad);
-		if (mapped)
+		if (pad.feedKb || pad.feedMouse)
+			printf("evdev: mapped %s [%s] -> port %c (DC %s)\n",
+				   pad.path.c_str(), id.c_str(), 'A' + pad.port,
+				   pad.feedKb ? "keyboard" : "mouse");
+		else if (mapped)
 			printf("evdev: mapped %s [%s] -> port %c\n",
 				   pad.path.c_str(), id.c_str(), 'A' + pad.port);
 		else
@@ -553,6 +671,13 @@ static void evdev_init() {
 }
 
 static void evdev_feed(EvdevPad& p, u16 type, u16 code, s32 value) {
+	// maple keyboard/mouse ports consume the raw events; pad mappings are
+	// still processed below (harmless: a kb/mouse port has no controller)
+	if (p.feedKb && type == EV_KEY)
+		dc_kbd_input(code, value != 0);
+	if (p.feedMouse)
+		dc_mouse_input(type, code, value);
+
 	switch (type) {
 	case EV_KEY:
 		for (int t = 0; t < TGT_COUNT; t++) {
