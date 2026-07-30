@@ -136,16 +136,21 @@ void* _vmem_get_ptr2(u32 addr,u32& mask)
 	return ptr;
 }
 
-void* _vmem_read_const(u32 addr,bool& ismem,u32 sz)
+void* _vmem_read_const(u32 addr,bool& ismem,u32 sz,void** ctx_out)
 {
 	u32   page=addr>>24;
 	unat  iirf=(unat)_vmem_MemInfo_ptr[page];
 	void* ptr=(void*)(iirf&~HANDLER_MAX);
 
+	if (ctx_out)
+		*ctx_out=nullptr;
+
 	if (ptr==0)
 	{
 		ismem=false;
 		const unat id=iirf;
+		if (ctx_out)
+			*ctx_out=_vmem_CTX[id/4];
 		if (sz==1)
 		{
 			return (void*)_vmem_RF8[id/4];

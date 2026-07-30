@@ -472,6 +472,12 @@ struct PVRDevice : MMIODevice {
         SCALER_CTL.full = 0x00000400;
         FB_BURSTCTRL = 0x00090639;
         PT_ALPHA_REF = 0x000000FF;
+
+        // flush reseted context to polly2
+        for (unsigned reg = 0 ; reg < pvr_RegSize; reg+=4)
+        {
+            polly2_reg_write(reg, (u32&)pvr_regs[reg]);
+        }
     }
 
 };

@@ -55,6 +55,15 @@ struct RuntimeBlockInfo: RuntimeBlockInfo_Core
 
 	BlockEndType BlockType;
 	bool has_jcond;
+	// set when constprop turned a dynamic end into a static one. Such a block
+	// looks statically-targeted but stands in for an indirect jump, so the
+	// backwards-only cycle check must not treat it as provably forward.
+	bool static_from_constprop;
+
+	// op 0's regalloc preloads are emitted before the smc/cycle-check code;
+	// this range lets the shop map attribute them (per-shop profiling only)
+	u16 host_preload0;
+	u16 host_preload0_end;
 
 	vector<shil_opcode> oplist;
 

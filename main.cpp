@@ -13,6 +13,44 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
+
+#include "hw/pvr/pvr_regs.h"
+
+static std::atomic<bool> vram_dump_pending;
+static unsigned vram_dump_number;
+
+u32 pvr_map32(u32 offset32);
+
+void do_vram_dump(u8* vram, u8* pvr_regs) {
+	if (vram_dump_pending.exchange(false)) {
+		FILE* f = fopen(("vram_dump_" + std::to_string(vram_dump_number) + ".bin").c_str(), "wb");
+		if (!f) {
+			printf("Failed to open vram_dump.bin\n");
+			return;
+		}
+		for (unsigned i = 0; i < VRAM_SIZE; i+=4) {
+			if (fwrite(&vram[pvr_map32(i)], 4, 1, f) != 1) {
+				printf("Failed to write vram_dump.bin\n");
+				fclose(f);
+				return;
+			}
+		}
+		fclose(f);
+		f = fopen(("pvr_regs_" + std::to_string(vram_dump_number) + ".bin").c_str(), "wb");
+		if (!f) {
+			printf("Failed to open pvr_regs.bin\n");
+			return;
+		}
+		if (fwrite(pvr_regs, pvr_RegSize, 1, f) != 1) {
+			printf("Failed to write pvr_regs.bin\n");
+			fclose(f);
+			return;
+		}
+		fclose(f);
+	}
+}
+
 int main(int argc, char* argv[])
 {
 	#if HOST_OS == OS_LINUX
@@ -582,6 +620,9 @@ static void evdev_read_pad(EvdevPad& p) {
 				printf("evdev: ESC pressed on %s, exiting\n", p.path.c_str());
 				fflush(stdout);
 				_exit(0); // Ungraceful termination
+			}
+			if (ev[e].type == EV_KEY && ev[e].code == KEY_0 && ev[e].value == 1) {
+				vram_dump_pending = true;
 			}
 			evdev_feed(p, ev[e].type, ev[e].code, ev[e].value);
 		}

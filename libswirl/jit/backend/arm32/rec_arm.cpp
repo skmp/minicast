@@ -266,6 +266,15 @@ eReg alloc_regs[]={r5,r6,r7,r10,r11,(eReg)-1};
 eFSReg alloc_fpu[]={f16,f17,f18,f19,f20,f21,f22,f23,
 					f24,f25,f26,f27,f28,f29,f30,f31,(eFSReg)-1};
 
+//blocks with ftrv/fipr reserve f28..f31 as backend scratch ("fpu temps"):
+//accumulators for the vector ops, and a scratch bank that lets the other
+//emitters stay out of s0-s15, where the xmtrx may be cached
+eFSReg alloc_fpu_temps[]={f16,f17,f18,f19,f20,f21,f22,f23,
+					f24,f25,f26,f27,(eFSReg)-1};
+
+bool fpu_temps_avail;	//f28-f31 are backend scratch for this block
+bool xmtrx_resident;	//s0-s15 currently hold xf0-xf15
+
 struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 {
 	arm_reg_alloc()
@@ -274,6 +283,13 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 		//any mapped dest, so dests may share a host reg with a dying source
 		opt_alias_mov=true;
 		opt_reuse_dead=true;
+	}
+
+	//ftrv/fipr consume their fv operands element-wise via mapfv(); their
+	//emitters require this (no memory fallback), see shop_ftrv/shop_fipr
+	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
+	{
+		return (op->op==shop_ftrv || op->op==shop_fipr) && prm.count()==4;
 	}
 
 	virtual eFSReg FpuMap(u32 reg)
@@ -337,6 +353,18 @@ u32 blockno=0;
 map<shilop,ConditionCode> ccmap;
 map<shilop,ConditionCode> ccnmap;
 
+//a branch to the instruction right after itself is a fallthrough: emit a NOP
+//instead, saving the redirect when the target block sits physically next in
+//the code buffer. The slot stays 4 bytes, so a later Relink() can still turn
+//it back into a real branch (or an unlink stub call).
+static void JUMP_or_fallthrough(u32 target)
+{
+	if (target == (u32)EMIT_GET_PTR() + 4)
+		NOP();
+	else
+		JUMP(target);
+}
+
 u32 DynaRBI::Relink()
 {
 	verify(emit_ptr==0);
@@ -383,7 +411,7 @@ u32 DynaRBI::Relink()
 			CALL((u32)ngen_LinkBlock_cond_Branch_stub,CC);
 
 		if (pNextBlock)
-			JUMP((u32)pNextBlock->code);
+			JUMP_or_fallthrough((u32)pNextBlock->code);
 		else
 			CALL((u32)ngen_LinkBlock_cond_Next_stub);
 		break;
@@ -481,7 +509,7 @@ u32 DynaRBI::Relink()
 				CALL((u32)pBranchBlock->code);
 			else
 #endif
-				JUMP((u32)pBranchBlock->code);
+				JUMP_or_fallthrough((u32)pBranchBlock->code);
 		}
 		break;
 	}
@@ -574,7 +602,7 @@ struct CC_PS
 };
 vector<CC_PS> CC_pars;
 
-void* _vmem_read_const(u32 addr,bool& ismem,u32 sz);
+void* _vmem_read_const(u32 addr,bool& ismem,u32 sz,void** ctx_out);
 void* _vmem_page_info(u32 addr,bool& ismem,u32 sz,u32& page_sz, bool rw);
 
 
@@ -717,10 +745,7 @@ void vmem_slowpath(eReg raddr, eReg rt, eFSReg ft, eFDReg fd, mem_op_type optp, 
 		else if (optp == SZ_64F) VMOV(r2, r3, fd);
 	}
 
-	if (fd != d0 && optp == SZ_64F)
-	{
-		die("BLAH");
-	}
+	verify(optp != SZ_64F || fd == d0 || fd == d14);
 
 	u32 funct = 0;
 
@@ -794,7 +819,8 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 			if (op->rs1.is_imm())
 			{
 				bool isram=false;
-				void* ptr=_vmem_read_const(op->rs1._imm,isram,memop_bytes(optp));
+				void* handler_ctx=nullptr;
+				void* ptr=_vmem_read_const(op->rs1._imm,isram,memop_bytes(optp),&handler_ctx);
 				
 				verify(optp!=SZ_64F);
 
@@ -868,9 +894,11 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 						break;
 					}
 				} 
-				else 
+				else
 				{
-					MOV32(r0, (uintptr_t)sh4_cpu);
+					//handlers take (ctx, addr); ctx is whatever the region
+					//was registered with (mmr, vram, ...), NOT sh4_cpu
+					MOV32(r0, (uintptr_t)handler_ctx);
 					MOV32(r1,op->rs1._imm);
 
 					switch(optp)
@@ -917,37 +945,45 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 					case SZ_32F:
 						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
 						VLDR(reg.mapf(op->rd),r1,0);
+						//paired form (fuse_readm_pairs): rd2 = [addr+4],
+						//one address computation for both halves
+						if (op->rd2.is_r32f())
+							VLDR(reg.mapf(op->rd2),r1,1);
 						break;
 
 					case SZ_64F:
+					{
+						eFDReg d64=fpu_temps_avail?d14:d0;
 						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
-						VLDR(d0,r1,0);	//TODO: use reg alloc
+						VLDR(d64,r1,0);	//TODO: use reg alloc
 
-						VSTR(d0,r8,op->rd.reg_nofs()/4);
+						VSTR(d64,r8,op->rd.reg_nofs()/4);
 						break;
 					}
+					}
 				} else {
+					eFDReg d64=fpu_temps_avail?d14:d0;
 					switch(optp)
 					{
-					case SZ_8:	
-						vmem_slowpath(raddr, reg.mapg(op->rd), f0, d0, optp, true);
+					case SZ_8:
+						vmem_slowpath(raddr, reg.mapg(op->rd), f0, d64, optp, true);
 						break;
 
-					case SZ_16: 
-						vmem_slowpath(raddr, reg.mapg(op->rd), f0, d0, optp, true);
+					case SZ_16:
+						vmem_slowpath(raddr, reg.mapg(op->rd), f0, d64, optp, true);
 						break;
 
-					case SZ_32I: 
-						vmem_slowpath(raddr, reg.mapg(op->rd), f0, d0, optp, true);
+					case SZ_32I:
+						vmem_slowpath(raddr, reg.mapg(op->rd), f0, d64, optp, true);
 						break;
 
 					case SZ_32F:
-						vmem_slowpath(raddr, r0, reg.mapf(op->rd), d0, optp, true);
+						vmem_slowpath(raddr, r0, reg.mapf(op->rd), d64, optp, true);
 						break;
 
 					case SZ_64F:
-						vmem_slowpath(raddr, r0, f0, d0, optp, true);
-						VSTR(d0,r8,op->rd.reg_nofs()/4);
+						vmem_slowpath(raddr, r0, f0, d64, optp, true);
+						VSTR(d64,r8,op->rd.reg_nofs()/4);
 						break;
 					}
 				}
@@ -959,12 +995,13 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 		case shop_writem:
 		{
 			mem_op_type optp=memop_type(op);
+			eFDReg d64=fpu_temps_avail?d14:d0;
 
 			eReg raddr=GenMemAddr(op);
-			
+
 			//TODO: use reg alloc
 			if (optp == SZ_64F)
-				VLDR(d0,r8,op->rs2.reg_nofs()/4);
+				VLDR(d64,r8,op->rs2.reg_nofs()/4);
 
 			if (_nvmem_enabled()) {
 				BIC(r1,raddr,0xE0000000);
@@ -1013,14 +1050,14 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 					if (op->flags2!=0x1337)
 					{
 						ADD(r1,r1,r8);	//3 opcodes: there's no [REG+REG] VLDR, also required for SQ
-						VSTR(d0,r1,0);	//TODO: use reg alloc
+						VSTR(d64,r1,0);	//TODO: use reg alloc
 					}
 					else
 					{
 						emit_Skip(-4);
 						AND(r1,raddr,0x3F);
 						ADD(r1,r1,r8);
-						VSTR(d0,r1,sq_offs/4);
+						VSTR(d64,r1,sq_offs/4);
 					}
 					break;
 				}
@@ -1028,23 +1065,23 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 				switch(optp)
 				{
 				case SZ_8:
-					vmem_slowpath(raddr, reg.mapg(op->rs2), f0, d0, optp, false);
+					vmem_slowpath(raddr, reg.mapg(op->rs2), f0, d64, optp, false);
 					break;
 
 				case SZ_16:
-					vmem_slowpath(raddr, reg.mapg(op->rs2), f0, d0, optp, false);
+					vmem_slowpath(raddr, reg.mapg(op->rs2), f0, d64, optp, false);
 					break;
 
 				case SZ_32I:
-					vmem_slowpath(raddr, reg.mapg(op->rs2), f0, d0, optp, false);
+					vmem_slowpath(raddr, reg.mapg(op->rs2), f0, d64, optp, false);
 					break;
 
 				case SZ_32F:
-					vmem_slowpath(raddr, r0, reg.mapf(op->rs2), d0, optp, false);
+					vmem_slowpath(raddr, r0, reg.mapf(op->rs2), d64, optp, false);
 					break;
 
 				case SZ_64F:
-					vmem_slowpath(raddr, r0, f0, d0, optp, false);
+					vmem_slowpath(raddr, r0, f0, d64, optp, false);
 					break;
 				}
 			}
@@ -1144,11 +1181,10 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 		case shop_mov64:
 		{
 			verify(op->rs1.is_r64() && op->rd.is_r64());
-			//LoadSh4Reg64(r0,op->rs1);
-			//StoreSh4Reg64(r0,op->rd);
-			
-			VLDR(d0,r8,op->rs1.reg_nofs()/4);
-			VSTR(d0,r8,op->rd.reg_nofs()/4);
+
+			eFDReg t=fpu_temps_avail?d14:d0;
+			VLDR(t,r8,op->rs1.reg_nofs()/4);
+			VSTR(t,r8,op->rd.reg_nofs()/4);
 			break;
 		}
 
@@ -1551,10 +1587,14 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 		case shop_fsrra:
 			{
-				VMOV(f1,fpu_imm_1);
-				VSQRT_VFP(f0,reg.mapfs(op->rs1));
+				//scratch out of s0-s15 when the xmtrx may be cached there
+				eFSReg t0=fpu_temps_avail?f28:f0;
+				eFSReg t1=fpu_temps_avail?f29:f1;
 
-				VDIV_VFP(reg.mapfs(op->rd),f1,f0);
+				VMOV(t1,fpu_imm_1);
+				VSQRT_VFP(t0,reg.mapfs(op->rs1));
+
+				VDIV_VFP(reg.mapfs(op->rd),t1,t0);
 			}
 			break;
 
@@ -1615,141 +1655,110 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 				//LSL(r0,r0,3);
 				//ADD(r0,r1,r0); //EMITTER: Todo, add with shifted !
 				ADD(r0,r1,r0, S_LSL, 3);
-				
-				VLDR(/*reg.mapf(op->rd,0)*/d0,r0,0);
-				VSTR(d0,r8,op->rd.reg_nofs()/4);
+
+				eFDReg t=fpu_temps_avail?d14:d0;
+				VLDR(t,r0,0);
+				VSTR(t,r8,op->rd.reg_nofs()/4);
 			}
 			break;
 
 		case shop_fipr:
 			{
-				
-				eFQReg _r1=q0;
-				eFQReg _r2=q0;
+				//operands are exploded to allocated singles (ExplodeVec);
+				//accumulate in a temp: rd aliases rs1[3]
+				verify(fpu_temps_avail);
 
-				SUB(r0,r8,op->rs1.reg_aofs());
-				if (op->rs2.reg_aofs()==op->rs1.reg_aofs())
+				eFSReg a[4],b[4];
+				for (int i=0;i<4;i++)
 				{
-					reg.preload_fpu+=4;
-					VLDM(d0,r0,2);
-				}
-				else
-				{
-					reg.preload_fpu+=8;
-					SUB(r1,r8,op->rs2.reg_aofs());
-					VLDM(d0,r0,2);
-					VLDM(d2,r1,2);
-					_r2=q1;
+					a[i]=reg.mapfv(op->rs1,i);
+					b[i]=reg.mapfv(op->rs2,i);
 				}
 
-#if 1
-				//VFP
-				eFSReg fs2=_r2==q0?f0:f4;
-
-				VMUL_VFP(reg.mapfs(op->rd),f0,(eFSReg)(fs2+0));
-				VMLA_VFP(reg.mapfs(op->rd),f1,(eFSReg)(fs2+1));
-				VMLA_VFP(reg.mapfs(op->rd),f2,(eFSReg)(fs2+2));
-				VMLA_VFP(reg.mapfs(op->rd),f3,(eFSReg)(fs2+3));
-#else			
-				VMUL_F32(q0,_r1,_r2);
-				VPADD_F32(d0,d0,d1);
-				VADD_VFP(reg.mapfs(op->rd),f0,f1);
-#endif
+				VMUL_VFP(f28,a[0],b[0]);
+				VMLA_VFP(f28,a[1],b[1]);
+				VMLA_VFP(f28,a[2],b[2]);
+				VMLA_VFP(f28,a[3],b[3]);
+				VMOV(reg.mapfs(op->rd),f28);
 			}
 			break;
 
 		case shop_ftrv:
 			{
-				reg.preload_fpu+=4;
-				reg.writeback_fpu+=4;
+				//in/out vector elements are register allocated (ExplodeVec);
+				//the matrix lives in s0-s15 and stays resident until an op
+				//that calls out / may fault / writes the back bank kills it.
+				//Scalar VFP on purpose: NEON timed slower on the A9 here.
+				verify(fpu_temps_avail);
 
-				eReg rdp=r1;
-				SUB(r2,r8,op->rs2.reg_aofs());
-				SUB(r1,r8,op->rs1.reg_aofs());
-				if (op->rs1.reg_aofs() != op->rd.reg_aofs())
+				bool load_mtx=!xmtrx_resident;
+				if (load_mtx)
 				{
-					rdp=r0;
-					SUB(r0,r8,op->rd.reg_aofs());
+					SUB(r2,r8,op->rs2.reg_aofs());
+					VLDM(d0,r2,2,1);	//column 0
 				}
-	
-#if 1
-				//f0,f1,f2,f3	  : vin
-				//f4,f5,f6,f7     : out
-				//f8,f9,f10,f11   : mtx temp
-				//f12,f13,f14,f15 : mtx temp
-				//(This is actually faster than using neon)
+				xmtrx_resident=true;
 
-				VLDM(d4,r2,2,1);
-				VLDM(d0,r1,2);
+				//in-place transform: the outputs alias the inputs
+				verify(op->rd._reg==op->rs1._reg);
 
-				VMUL_VFP(f4,f8,f0);
-				VMUL_VFP(f5,f9,f0);
-				VMUL_VFP(f6,f10,f0);
-				VMUL_VFP(f7,f11,f0);
-				
-				VLDM(d6,r2,2,1);
+				eFSReg v[4];
+				for (int i=0;i<4;i++)
+					v[i]=reg.mapfv(op->rs1,i);
 
-				VMLA_VFP(f4,f12,f1);
-				VMLA_VFP(f5,f13,f1);
-				VMLA_VFP(f6,f14,f1);
-				VMLA_VFP(f7,f15,f1);
+				bool w0=(op->flags & FTRV_W_ZERO)!=0;
+				bool w1=(op->flags & FTRV_W_ONE)!=0;
 
-				VLDM(d4,r2,2,1);
+				//accumulate straight into the mapped outputs; the chains then
+				//END in their destination registers, with no result movs on
+				//the tail. Stage 0 overwrites the input registers, so v1..v3
+				//are copied aside first (head copies, hidden under the column
+				//load); v0 is fully consumed by stage 0 itself when its own
+				//register is written last, and a flagged w never reads v3.
+				eFSReg mul[4];
+				mul[0]=v[0];
+				for (int j=1;j<4;j++)
+				{
+					if (j==3 && (w0 || w1))
+						break;
+					mul[j]=(eFSReg)(f28+j);
+					VMOV(mul[j],v[j]);
+				}
 
-				VMLA_VFP(f4,f8,f2);
-				VMLA_VFP(f5,f9,f2);
-				VMLA_VFP(f6,f10,f2);
-				VMLA_VFP(f7,f11,f2);
+				//(all four columns still load when the matrix isn't resident,
+				//so xmtrx_resident stays truthful for the next ftrv)
+				for (int j=0;j<4;j++)
+				{
+					//prefetch the next column: the load retires in the LS
+					//pipe underneath this stage's MACs
+					if (load_mtx && j<3)
+						VLDM((eFDReg)(d0+2*(j+1)),r2,2,j<2?1:0);
 
-				VLDM(d6,r2,2);
+					//known w=0: the fourth column contributes nothing
+					if (j==3 && w0)
+						continue;
 
-				VMLA_VFP(f4,f12,f3);
-				VMLA_VFP(f5,f13,f3);
-				VMLA_VFP(f6,f14,f3);
-				VMLA_VFP(f7,f15,f3);
-
-				VSTM(d2,rdp,2);
-#else
-				//this fits really nicely to NEON !
-				VLDM(d16,r2,8);
-				VLDM(d0,r1,2);
-
-				VMUL_F32(q2,q8,d0,0);
-				VMLA_F32(q2,q9,d0,1);
-				VMLA_F32(q2,q10,d1,0);
-				VMLA_F32(q2,q11,d1,1);
-				VSTM(d4,rdp,2);
-
-
-				/*
-					Alternative mtrx
-
-					0 1 4 5
-					2 3 6 7
-					8 9 c d
-					a b e f
-
-					* ABCD
-
-					v0= A*0 + B*4 + C*8 + D*c
-					v1= A*1 + B*5 + C*9 + D*d
-					v3= A*2 + B*6 + C*a + D*e
-					v4= A*3 + B*7 + C*b + D*f
-					D0      D1
-					f0   f1     f2   f3
-					0145 * AABB + 89cd*CCDD = A0+C8|A1+C9|B4+Dc|B5+Dd -> 
-					
-					v01=D0+D1 =  { A0+B4+C8+Dc, A1+B5+C9+Dd }
-
-						AB, CD -> AABB CCDD
-
-
-					//in-shuffle
-					//4 mul
-					//4 mla
-					//1 add
-				*/
-#endif
+					if (j==0)
+					{
+						//all chains read v0; its own register goes last
+						VMUL_VFP(v[1],(eFSReg)(f0+1),mul[0]);
+						VMUL_VFP(v[2],(eFSReg)(f0+2),mul[0]);
+						VMUL_VFP(v[3],(eFSReg)(f0+3),mul[0]);
+						VMUL_VFP(v[0],(eFSReg)(f0+0),mul[0]);
+					}
+					else if (j==3 && w1)
+					{
+						//known w=1: plain add, and vadd retires ~4 cycles
+						//sooner than a dependent vmla at the chain tail
+						for (int i=0;i<4;i++)
+							VADD_VFP(v[i],v[i],(eFSReg)(f0+12+i));
+					}
+					else
+					{
+						for (int i=0;i<4;i++)
+							VMLA_VFP(v[i],(eFSReg)(f0+4*j+i),mul[j]);
+					}
+				}
 			}
 			break;
 
@@ -1778,23 +1787,21 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 			
 			case shop_cvt_f2i_t:
-				
-				//printf("f2i: r%d f%d\n",reg.mapg(op->rd),reg.mapf(op->rs1));
-				//BKPT();
-				VCVT_to_S32_VFP(f0,reg.mapf(op->rs1));
-				VMOV(reg.mapg(op->rd),f0);
-				//shil_chf[op->op](op);
+			{
+				eFSReg t=fpu_temps_avail?f28:f0;
+				VCVT_to_S32_VFP(t,reg.mapf(op->rs1));
+				VMOV(reg.mapg(op->rd),t);
 				break;
-			
+			}
+
 			case shop_cvt_i2f_n:	// may be some difference should be made ?
 			case shop_cvt_i2f_z:
-			
-				//printf("i2f: f%d r%d\n",reg.mapf(op->rd),reg.mapg(op->rs1));
-				//BKPT();
-				VMOV(f0, reg.mapg(op->rs1));
-				VCVT_from_S32_VFP(reg.mapfs(op->rd),f0);
-				//shil_chf[op->op](op);
+			{
+				eFSReg t=fpu_temps_avail?f28:f0;
+				VMOV(t, reg.mapg(op->rs1));
+				VCVT_from_S32_VFP(reg.mapfs(op->rd),t);
 				break;
+			}
 #endif
 
 		default:
@@ -1807,6 +1814,68 @@ __default:
 			verify(false);
 			break;
 		}
+}
+
+//Does compiling this opcode invalidate the xmtrx cached in s0-s15?
+//Whitelist: opcodes whose emitters neither call out nor touch s0-s15.
+//Any memory access that could ever fault must kill: ngen_Rewrite may turn
+//its fastpath into a handler call at any time, and handlers clobber the
+//caller-saved vfp bank.
+static bool op_kills_xmtrx(shil_opcode* op)
+{
+	//a write into the back bank changes the matrix itself
+	const shil_param* wr[2]={&op->rd,&op->rd2};
+	for (int i=0;i<2;i++)
+	{
+		if (wr[i]->is_reg() &&
+		    wr[i]->_reg<=reg_xf_15 &&
+		    wr[i]->_reg+wr[i]->count()-1>=reg_xf_0)
+			return true;
+	}
+
+	switch(op->op)
+	{
+	case shop_mov32: case shop_mov64:
+	case shop_jdyn: case shop_jcond:
+	case shop_add: case shop_sub: case shop_and: case shop_or: case shop_xor:
+	case shop_not: case shop_neg: case shop_shl: case shop_shr: case shop_sar:
+	case shop_ror: case shop_rocl: case shop_rocr: case shop_adc: case shop_sbc:
+	case shop_shld: case shop_shad: case shop_ext_s8: case shop_ext_s16:
+	case shop_mul_u16: case shop_mul_s16: case shop_mul_i32:
+	case shop_mul_u64: case shop_mul_s64:
+	case shop_div32p2:
+	case shop_test: case shop_seteq: case shop_setge: case shop_setgt:
+	case shop_setae: case shop_setab: case shop_setpeq:
+	case shop_fadd: case shop_fsub: case shop_fmul: case shop_fdiv:
+	case shop_fabs: case shop_fneg: case shop_fsqrt: case shop_fmac:
+	case shop_fseteq: case shop_fsetgt:
+	case shop_fsrra: case shop_cvt_f2i_t: case shop_cvt_i2f_n: case shop_cvt_i2f_z:
+	case shop_fsca:		//table lookup via the d14 scratch, no call
+	case shop_fipr:		//accumulates in the f28+ temps
+	case shop_ftrv:		//keeps the matrix resident
+		return false;
+
+	case shop_readm:
+		//imm reads from ram are plain host loads and can never fault;
+		//imm mmio reads call the handler, reg-address reads may be
+		//rewritten into one later
+		if (op->rs1.is_imm())
+		{
+			bool isram=false;
+			_vmem_read_const(op->rs1._imm,isram,memop_bytes(memop_type(op)));
+			return !isram;
+		}
+		return true;
+
+	case shop_writem:
+		//sq-marked stores hit the context inline and can never fault
+		return op->flags2!=0x1337;
+
+	default:
+		//pref/ifb/sync_sr/sync_fpscr/frswap/fsca/canonical fallbacks:
+		//they call out or clobber the caller-saved vfp bank
+		return true;
+	}
 }
 
 struct Arm32NGenBackend: NGenBackend
@@ -1837,27 +1906,13 @@ struct Arm32NGenBackend: NGenBackend
 					continue;
 
 				unat v;
-				if (read)
-				{
-					if (i==0)
-						v=(unat)fn;
-					else
-					{
-						v=(unat)EMIT_GET_PTR();
-						MOV(r0,(eReg)(i));
-						JUMP((u32)fn);
-					}
-				}
+				if (i==0)
+					v=(unat)fn;
 				else
 				{
-					if (i==0)
-						v=(unat)fn;
-					else
-					{
-						v=(unat)EMIT_GET_PTR();
-						MOV(r0,(eReg)(i));
-						JUMP((u32)fn);
-					}
+					v=(unat)EMIT_GET_PTR();
+					MOV(r0,(eReg)(i));
+					JUMP((u32)fn);
 				}
 
 				_mem_hndl[read][s%3][i]=v;
@@ -1943,8 +1998,21 @@ struct Arm32NGenBackend: NGenBackend
 			STR(r0,r1);
 		}
 
+		//blocks with vector fpu ops reserve f28-f31 as backend scratch and
+		//may keep the xmtrx cached in s0-s15 across opcodes
+		fpu_temps_avail=false;
+		for (size_t i=0;i<block->oplist.size();i++)
+		{
+			if (block->oplist[i].op==shop_ftrv || block->oplist[i].op==shop_fipr)
+			{
+				fpu_temps_avail=true;
+				break;
+			}
+		}
+		xmtrx_resident=false;
+
 		//reg alloc
-		reg.DoAlloc(block,alloc_regs,alloc_fpu);
+		reg.DoAlloc(block,alloc_regs,fpu_temps_avail?alloc_fpu_temps:alloc_fpu);
 
 		u8* blk_start=(u8*)EMIT_GET_PTR();
 
@@ -1956,7 +2024,9 @@ struct Arm32NGenBackend: NGenBackend
 			STR(r1,r0);
 		}
 		//pre-load the first reg alloc operations, for better efficiency ..
+		block->host_preload0=(u8*)EMIT_GET_PTR()-blk_start;
 		reg.OpBegin(&block->oplist[0],0);
+		block->host_preload0_end=(u8*)EMIT_GET_PTR()-blk_start;
 
 		//scheduler
 		switch (smc_checks) {
@@ -2029,12 +2099,35 @@ struct Arm32NGenBackend: NGenBackend
 			cyc&=~3;
 		}
 
+		//only provably-backward static branches poll for interrupts (subs +
+		//blle intc_sched); everything else -- forward statics AND dynamic
+		//ends -- just pays the decrement with a plain sub.  Constprop-promoted
+		//static ends have a known target and are judged like any other static.
+		bool cycle_check=true;
+		if (settings.dynarec.opt_cyclecheck_backwards_only)
+		{
+			switch(block->BlockType)
+			{
+			case BET_StaticJump:
+			case BET_StaticCall:
+			case BET_Cond_0:
+			case BET_Cond_1:	//NextBlock is always forward
+				cycle_check = block->BranchBlock<=block->addr;
+				break;
+
+			default:
+				cycle_check = false;	//dynamic ends: skip the poll
+				break;
+			}
+		}
+
 	#if HOST_OS == OS_DARWIN
-		SUB(r11,r11,cyc,true,CC_AL);
+		SUB(r11,r11,cyc,cycle_check,CC_AL);
 	#else
-		SUB(rfp_r9,rfp_r9,cyc,true,CC_AL);
+		SUB(rfp_r9,rfp_r9,cyc,cycle_check,CC_AL);
 	#endif
-		CALL((u32)intc_sched, CC_LE);
+		if (cycle_check)
+			CALL((u32)intc_sched, CC_LE);
 
 		//compile the block's opcodes
 		shil_opcode* op;
@@ -2047,7 +2140,14 @@ struct Arm32NGenBackend: NGenBackend
 			if (i!=0)
 				reg.OpBegin(op,i);
 
+			op->host_body=(u8*)EMIT_GET_PTR()-blk_start;
+
 			ngen_compile_opcode(block,op,staging,optimise);
+
+			op->host_body_end=(u8*)EMIT_GET_PTR()-blk_start;
+
+			if (xmtrx_resident && op_kills_xmtrx(op))
+				xmtrx_resident=false;
 
 			reg.OpEnd(op);
 		}
@@ -2162,6 +2262,8 @@ struct Arm32NGenBackend: NGenBackend
 		else
 		{
 			printf("fail raddr %08X {@%08X}:(\n",ptr[0].full,regs[1]);
+			//if this hits with a VLDR.32 whose imm is 1, a paired f32 readm
+			//(fuse_readm_pairs) faulted -- mmio pairs can't be rewritten
 			die("Invalid opcode: vmem fixup\n");
 		}
 		//from mem op
@@ -2204,7 +2306,7 @@ struct Arm32NGenBackend: NGenBackend
 			verify((fault_offs==0) || fault_offs==(0x1FFFFFFF&sh4_addr));
 		#endif
 
-		if (settings.dynarec.unstable_opt && is_sq) //THPS2 uses cross area SZ_32F so this is disabled for now
+		if (settings.dynarec.opt_sqw_rewrite && is_sq) //THPS2 uses cross area SZ_32F so this is disabled for now
 		{
 			//SQ !
 			s32 sq_offs=sq_both-sh4_ctr;
@@ -2248,10 +2350,7 @@ struct Arm32NGenBackend: NGenBackend
 				else if (optp==SZ_64F) VMOV(r2,r3,fd);
 			}
 
-			if (fd!=d0 && optp==SZ_64F)
-			{
-				die("BLAH");
-			}
+			verify(optp!=SZ_64F || fd==d0 || fd==d14);
 
 			u32 funct=0;
 

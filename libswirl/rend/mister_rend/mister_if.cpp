@@ -28,8 +28,9 @@ static inline uint64_t now_ns(void) {
 }
 
 void SetREP(u32 render_end_pending_cycles);
-
+static u8* vram;
 void rend_init_renderer(u8* vram) {
+    ::vram = vram;
     // initialize renderer
     printf("rend_init_renderer\n");
 	
@@ -54,8 +55,10 @@ void rend_vblank() {
 // 500ms watchdog + AutoReset the blocking wait in rend_end_render has
 static uint64_t poll_deadline_ns;
 
+static std::atomic<bool> polly_gone;
+
 bool rend_render_done() {
-    if (polly2_done()) {
+    if (polly_gone && polly2_done()) {
         poll_deadline_ns = 0;
         return true;
     }
@@ -76,14 +79,31 @@ bool rend_render_done() {
     return false;
 }
 
+void do_vram_dump(u8* vram, u8* pvr_regs);
+
+void startpolly() {
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    do_vram_dump(vram, pvr_regs);
+
+    polly_gone = true;
+    polly2_go();
+}
+
 void rend_start_render(u8* vram) {
     if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
-        ta_ring_publish();
-        auto goal = ta_contexts[CORE_CURRENT_CTX];
+        // ta_ring_publish();
+        // auto goal = ta_contexts[CORE_CURRENT_CTX];
 
-        while (goal > ta_eol_interrupt_mark) {
-            ;
-        }
+        // while (goal > ta_eol_interrupt_mark) {
+        //     ;
+        // }
+        polly_gone = false;
+        DECL_ALIGN(64) u32 ring_op[TA_RING_BLOCK/4];
+        (u64&)ring_op = TA_RING_DECOUPLED_MAGIC;
+        ring_op[2] = TA_RING_DECOUPLED_OP_STARTPOLLY;
+        ta_ring_push(ring_op);
+        ta_ring_publish();
     }
 
     // freerunning: REP polls for real completion; FPSTarget pacing only
@@ -95,9 +115,9 @@ void rend_start_render(u8* vram) {
         SetREP(200000000/settings.pvr.FPSTarget);
     }
 	
-	__asm__ volatile("dsb sy" ::: "memory");
-
-    polly2_go();
+    if (settings.pvr.MultithreadedTA != TA_MTTA_DECOUPLED) {
+        startpolly();
+    }
 
 	DelayTime = RenderTime;
 	RenderTime = now_ns();
@@ -110,7 +130,7 @@ void rend_end_render() {
     int timeout = 0;
     while (true)
     {
-        if (polly2_done()) {
+        if (polly_gone && polly2_done()) {
             break;
         }
 
@@ -127,6 +147,10 @@ void rend_end_render() {
                 printf("polly2: Auto resetting!\n");
                 polly2_reset();
                 polly2_set_vram_base(0x32000000);
+                for (unsigned reg = 0 ; reg < pvr_RegSize; reg+=4)
+                {
+                    polly2_reg_write(reg, (u32&)pvr_regs[reg]);
+                }
                 polly2_go();
             }
         }

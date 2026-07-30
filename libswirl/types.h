@@ -467,40 +467,20 @@ struct settings_t
 		string ElfFile;
 	} reios;
 
-	struct {
-		bool isShown;
-	} savepopup;
-
-	struct
-	{
-		bool UseMipmaps;
-		bool WideScreen;
-		bool ShowFPS;
-		bool RenderToTextureBuffer;
-		int RenderToTextureUpscale;
-		bool TranslucentPolygonDepthMask;
-		bool ModifierVolumes;
-		bool Clipping;
-		int TextureUpscale;
-		int MaxFilteredTextureSize;
-		f32 ExtraDepthScale;
-		bool CustomTextures;
-		bool DumpTextures;
-		int ScreenScaling;		// in percent. 50 means half the native resolution
-		int ScreenStretching;	// in percent. 150 means stretch from 4/3 to 6/3
-		bool Fog;
-		bool FloatVMUs;
-		bool Rotate90;			// Rotate the screen 90 deg CC
-		int ScreenOrientation;		//Force Screen Orientation value here: 1=Force Portrait, 2=Force Landscape, 3=AutoRotate
-	} rend;
-
 	struct
 	{
 		bool Enable;
 		bool idleskip;
-		bool unstable_opt;
-		bool safemode;
 		bool disable_nvmem;
+		
+		bool opt_cyclecheck_backwards_only;	// only poll for interrupts on blocks that can backwards
+		bool opt_div1_som;		// match div1 for div32u/s
+		bool opt_sqw_on_pref;	// on write before pref, assume SQW
+		bool opt_sqw_rewrite;	// On rewrite to SQW, always assume SQW
+		int opt_constprop;		// 0 = 0ff, 1 = safe, 2 = include page constant
+		bool opt_readm_pairs; 	// fuse +0 and +4 addresses on same base reg
+		bool opt_fipr_w;		// simplify fipr if w is provably 0 or 1
+
 		SmcCheckEnum SmcCheckLevel;
 		int ScpuEnable;
 		int DspEnable;
@@ -524,11 +504,7 @@ struct settings_t
 
 	struct
 	{
-		u32 HW_mixing;		//(0) -> SW , 1 -> HW , 2 -> Auto
-		u32 BufferSize;		//In samples ,*4 for bytes (1024)
 		bool LimitFPS;		// defaults to true
-		u32 GlobalFocus;	//0 -> only hwnd , (1) -> Global
-		u32 BufferCount;	//BufferCount+2 buffers used , max 60 , default 0
 		u32 CDDAMute;
 		u32 GlobalMute;
 		u32 DSPEnabled;		//0 -> no, 1 -> yes
@@ -536,31 +512,6 @@ struct settings_t
 		bool NoBatch;
 		bool NoSound;
 	} aica;
-
-	struct{
-		std::string backend;
-
-		// slug<<key, value>>
-		std::map<std::string, std::map<std::string, std::string>> options;
-	} audio;
-
-
-#if USE_OMX
-	struct
-	{
-		u32 Audio_Latency;
-		bool Audio_HDMI;
-	} omx;
-#endif
-
-#if SUPPORT_DISPMANX
-	struct
-	{
-		u32 Width;
-		u32 Height;
-		bool Keep_Aspect;
-	} dispmanx;
-#endif
 
 	struct
 	{
@@ -572,13 +523,6 @@ struct settings_t
 
 	struct
 	{
-		u32 ta_skip;
-		string backend;
-
-		u32 MaxThreads;
-		bool SynchronousRender;
-		bool ForceGLES2;
-
 		int MultithreadedTA;
 		u32 FPSTarget;
 	} pvr;
@@ -600,10 +544,6 @@ struct settings_t
 	} debug;
 
 	struct {
-		bool OpenGlChecks;
-	} validate;
-
-	struct {
 		u32 MouseSensitivity;
 		u32 JammaSetup;			// 0: standard, 1: 4-players, 2: rotary encoders, 3: Sega Marine Fishing,
 								// 4: dual I/O boards (4P), 5: Namco JYU board (Ninja Assault)
@@ -611,17 +551,6 @@ struct settings_t
 		int maple_expansion_devices[4][2];
 		int VirtualGamepadVibration;
 	} input;
-
-
-	struct {
-		bool HideCallToAction;
-	} social;
-
-	struct {
-		bool HideHomebrew;
-		bool ShowArchiveOrg;
-	} cloudroms;
-
 };
 
 extern settings_t settings;

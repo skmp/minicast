@@ -42,3 +42,31 @@ add_test(NAME regalloc_fuzz COMMAND regalloc_fuzz 1 5000)
 # the allocator intentionally keeps the last block's spans until the next
 # DoAlloc; that reads as a leak at process exit
 set_tests_properties(regalloc_fuzz PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+
+# constprop()/rw_related() are extracted verbatim from shil.cpp and compiled
+# against the mocks in constprop_mocks.h
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/constprop_under_test.h
+    COMMAND ${CMAKE_COMMAND}
+        -DIN=${dyna}/shil.cpp
+        -DOUT=${CMAKE_CURRENT_BINARY_DIR}/constprop_under_test.h
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/extract_constprop.cmake
+    DEPENDS ${dyna}/shil.cpp ${CMAKE_CURRENT_SOURCE_DIR}/extract_constprop.cmake
+            ${CMAKE_CURRENT_SOURCE_DIR}/constprop_mocks.h
+    COMMENT "Generating constprop_under_test.h from shil.cpp"
+)
+
+add_executable(constprop_test
+    constprop_test.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/constprop_under_test.h
+)
+set_property(TARGET constprop_test PROPERTY CXX_STANDARD 17)
+target_include_directories(constprop_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+
+if(NOT CMAKE_CROSSCOMPILING)
+    target_compile_options(constprop_test PRIVATE -O1 -g -fsanitize=address,undefined)
+    target_link_options(constprop_test PRIVATE -fsanitize=address,undefined)
+endif()
+
+# args: <base seed> <fuzz iterations>
+add_test(NAME constprop_test COMMAND constprop_test 1 3000)

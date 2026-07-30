@@ -23,6 +23,7 @@
 #include "blockmanager.h"
 #include "ngen.h"
 #include "decoder.h"
+#include "perf_map.h"
 
 #define bm_printf(...)
 
@@ -213,6 +214,7 @@ void RuntimeBlockInfo::Setup(u32 rpc,fpscr_t rfpu_cfg)
 	pBranchBlock=pNextBlock=0;
 	code=0;
 	has_jcond=false;
+	static_from_constprop=false;
 	BranchBlock=NextBlock=csc_RetCache=0xFFFFFFFF;
 	BlockType=BET_SCL_Intr;
 	
@@ -262,6 +264,10 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 		rdv_ngen->Compile(rbi,DoCheck(rbi->addr, rbi->sh4_code_size),(pc&0xFFFFFF)==0x08300 || (pc&0xFFFFFF)==0x10000,false,do_opts);
 
 		verify(rbi->code!=0);
+
+		// perf samples the rx mapping, rbi->code is rw
+		perf_map_AddBlock((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi->addr);
+		perf_map_AddShops((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi);
 
 		bool doLock = !bm_RamPageHasData(rbi->addr, rbi->sh4_code_size); // && maybe some setting?
 
@@ -472,12 +478,6 @@ struct recSH4 : SuperH4Backend {
         sh4_dyna_rcb = (u8*)& Sh4cntx + sizeof(Sh4cntx);
         printf("cntx // fpcb offset: %td // pc offset: %td // pc %08X\n", (u8*)& sh4rcb.fpcb - sh4_dyna_rcb, (u8*)& sh4rcb.cntx.pc - sh4_dyna_rcb, sh4rcb.cntx.pc);
 
-        if (!settings.dynarec.safemode)
-            printf("Warning: Dynarec safe mode is off\n");
-
-        if (settings.dynarec.unstable_opt)
-            printf("Warning: Unstable optimizations is on\n");
-
         if (settings.dynarec.SmcCheckLevel != FullCheck)
             printf("Warning: SMC check mode is %d\n", settings.dynarec.SmcCheckLevel);
 
@@ -490,7 +490,9 @@ struct recSH4 : SuperH4Backend {
     bool Init()
     {
         printf("recSh4 Init\n");
-        
+
+        perf_map_Init();
+
         bm_Init();
         bm_Reset();
 
@@ -526,6 +528,7 @@ struct recSH4 : SuperH4Backend {
     {
         printf("recSh4 Term\n");
         bm_Term();
+        perf_map_Term();
     }
 };
 

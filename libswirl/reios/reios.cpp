@@ -608,6 +608,7 @@ void reios_boot() {
 	}
 	else {
 		if (DC_PLATFORM == DC_PLATFORM_DREAMCAST) {
+			reios_locate_bootfile();
 			if (!bootfile_inited)
 				msgboxf("Failed to locate bootfile", MBX_ICONERROR);
 			reios_setup_state(0xac008300);

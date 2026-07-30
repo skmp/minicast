@@ -1054,7 +1054,8 @@ private:
 
 		u32 size = op.flags & 0x7f;
 		bool isram = false;
-		void* ptr = _vmem_read_const(op.rs1._imm, isram, size);
+		void* handler_ctx = nullptr;
+		void* ptr = _vmem_read_const(op.rs1._imm, isram, size, &handler_ctx);
 
 		if (isram)
 		{
@@ -1079,8 +1080,9 @@ private:
 		}
 		else
 		{
-			// Not RAM
-			Mov(x0, (uintptr_t)sh4_cpu);
+			// Not RAM: call the region handler with the context it was
+			// registered with (mmr, vram, ...), NOT sh4_cpu
+			Mov(x0, (uintptr_t)handler_ctx);
 			Mov(w1, op.rs1._imm);
 
 			switch(size)
