@@ -262,6 +262,8 @@ void InitSettings()
     settings.dreamcast.broadcast = 4;	// default
     settings.dreamcast.language = 6;	// default
     settings.dreamcast.FullMMU = false;
+    settings.dreamcast.VmuPath = "";
+    settings.dreamcast.VmuName = "vmu_save_{port}.bin";
     settings.aica.LimitFPS = true;
     settings.aica.NoBatch = false;	// This also controls the DSP. Disabled by default
     settings.aica.NoSound = false;
@@ -332,6 +334,8 @@ void LoadSettings(bool game_specific)
     settings.dreamcast.broadcast = cfgLoadInt(config_section, "Dreamcast.Broadcast", settings.dreamcast.broadcast);
     settings.dreamcast.language = cfgLoadInt(config_section, "Dreamcast.Language", settings.dreamcast.language);
     settings.dreamcast.FullMMU = cfgLoadBool(config_section, "Dreamcast.FullMMU", settings.dreamcast.FullMMU);
+    settings.dreamcast.VmuPath = cfgLoadStr(config_section, "Dreamcast.VmuPath", settings.dreamcast.VmuPath.c_str());
+    settings.dreamcast.VmuName = cfgLoadStr(config_section, "Dreamcast.VmuName", settings.dreamcast.VmuName.c_str());
     settings.aica.LimitFPS = cfgLoadBool(config_section, "aica.LimitFPS", settings.aica.LimitFPS);
     settings.aica.NoBatch = cfgLoadBool(config_section, "aica.NoBatch", settings.aica.NoBatch);
     settings.aica.NoSound = cfgLoadBool(config_section, "aica.NoSound", settings.aica.NoSound);
@@ -769,6 +773,9 @@ struct Dreamcast_impl : VirtualDreamcast {
         mcfg_CreateNAOMIJamma();
 #elif DC_PLATFORM == DC_PLATFORM_ATOMISWAVE
         mcfg_CreateAtomisWaveControllers();
+#elif DC_PLATFORM == DC_PLATFORM_DREAMCAST
+        // after LoadCustom, so VMU file names can use the disc's game id
+        mcfg_CreateDevices();
 #endif
 
         Reset();
@@ -866,10 +873,6 @@ struct Dreamcast_impl : VirtualDreamcast {
         sh4_cpu->SetA0Handler(A0H_SPG, spg);
         sh4_cpu->SetA0Handler(A0H_SCPU, soundCPU);
         sh4_cpu->SetA0Handler(A0H_DSP, dsp);
-        
-#if DC_PLATFORM == DC_PLATFORM_DREAMCAST
-        mcfg_CreateDevices();
-#endif
 
         aica_schid = sh4_sched_register(this, 0, STATIC_FORWARD(Dreamcast_impl, AicaUpdate));
         sh4_sched_request(aica_schid, AICA_TICK);
