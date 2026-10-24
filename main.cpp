@@ -66,6 +66,29 @@ int main(int argc, char* argv[])
 	add_system_config_dir(".");
 	add_system_data_dir(".");
 
+	// -cfg-file <path> replaces the default emu.cfg. It must be the first option.
+	if (argc >= 2 && stricmp(argv[1], "-cfg-file") == 0)
+	{
+		if (argc < 3)
+		{
+			printf("-cfg-file: missing path\n");
+			return 1;
+		}
+		cfgSetPath(argv[2]);
+		// Drop the two arguments; the rest is handled as before.
+		argv[2] = argv[0];
+		argv += 2;
+		argc -= 2;
+	}
+	for (int i = 1; i < argc; i++)
+	{
+		if (stricmp(argv[i], "-cfg-file") == 0)
+		{
+			printf("-cfg-file must be the first option\n");
+			return 1;
+		}
+	}
+
 	ParseCommandLine(argc, argv);
 	cfgOpen();
 
