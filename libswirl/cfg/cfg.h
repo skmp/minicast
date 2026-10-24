@@ -13,6 +13,8 @@
 **	} ** Strings passed to LoadStr should be MAX_PATH in size ! **
 */
 
+// Use path instead of the default emu.cfg. Call before cfgOpen.
+void cfgSetPath(const char* path);
 bool cfgOpen();
 s32   cfgLoadInt(const wchar * lpSection, const wchar * lpKey,s32 Default);
 void  cfgSaveInt(const wchar * lpSection, const wchar * lpKey, s32 Int);

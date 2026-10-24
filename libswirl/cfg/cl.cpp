@@ -110,6 +110,10 @@ int showhelp(wchar** argv,int cl)
     
 	printf("Available commands:\n");
 
+    printf("  -cfg-file path\n");
+    printf("      Use path as the config file instead of the default emu.cfg.\n");
+    printf("      Must be the first option.\n");
+
     printf("  -config section:key=value [, ..]\n");
     printf("      Add a virtual config value unless a different value is written to em\n");
     printf("      Note: You can specify many settings in the xx:yy=zz , gg:hh=jj , ... format.\n");
