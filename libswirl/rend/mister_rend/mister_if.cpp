@@ -29,16 +29,25 @@ static inline uint64_t now_ns(void) {
 
 void SetREP(u32 render_end_pending_cycles);
 static u8* vram;
+// The core clears its PVR registers on every reset (polly2_reset() and a
+// clock change), so push the whole emulated register file again afterwards.
+static void polly2_upload_regs() {
+    for (unsigned reg = 0; reg < pvr_RegSize; reg += 4)
+        polly2_reg_write(reg, (u32&)pvr_regs[reg]);
+}
+
 void rend_init_renderer(u8* vram) {
     ::vram = vram;
     // initialize renderer
     printf("rend_init_renderer\n");
-	
+
 	polly2_mmio_init();
     polly2_reset();
     polly2_set_vram_base(0x32000000);
     printf("polly2: ClockSel set to %u\n", (unsigned)settings.polly2.ClockSel);
     polly2_set_clock(settings.polly2.ClockSel);
+    // the reset and the clock switch cleared what PVRDevice::Init flushed
+    polly2_upload_regs();
 }
 
 void rend_term_renderer() {
@@ -92,10 +101,7 @@ bool rend_render_done(u32 GuestRenderCycles) {
                 printf("polly2: Auto resetting!\n");
                 polly2_reset();
                 polly2_set_vram_base(0x32000000);
-                for (unsigned reg = 0; reg < pvr_RegSize; reg+=4)
-                {
-                    polly2_reg_write(reg, (u32&)pvr_regs[reg]);
-                }
+                polly2_upload_regs();
                 polly2_go();
             }
         }
@@ -173,10 +179,7 @@ void rend_end_render() {
                 printf("polly2: Auto resetting!\n");
                 polly2_reset();
                 polly2_set_vram_base(0x32000000);
-                for (unsigned reg = 0 ; reg < pvr_RegSize; reg+=4)
-                {
-                    polly2_reg_write(reg, (u32&)pvr_regs[reg]);
-                }
+                polly2_upload_regs();
                 polly2_go();
             }
         }
