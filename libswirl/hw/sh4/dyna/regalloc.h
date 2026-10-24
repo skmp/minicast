@@ -11,6 +11,7 @@
 
 #include <set>
 #include <deque>
+#include <algorithm>
 
 static inline bool operator < (const shil_param &lhs, const shil_param &rhs)
 {
@@ -135,6 +136,22 @@ struct RegAlloc
 			return -1;
 		}
 
+		//the next access the op body needs this register for: a flush reads
+		//the operand from the context, so it doesn't count
+		int nacc_use(int pos)
+		{
+			if (!contains(pos))
+				return -1;
+
+			for (size_t i=0;i<accesses.size();i++)
+			{
+				if (accesses[i].pos>(u32)pos && accesses[i].am!=AM_FLUSH)
+					return accesses[i].pos;
+			}
+
+			return -1;
+		}
+
 		int nacc_w(int pos)
 		{
 			if (!contains(pos))
@@ -229,7 +246,25 @@ struct RegAlloc
 	bool opt_alias_mov=false;   //coalesce reg-reg movs: alias the dst span onto the src host reg
 	bool opt_reuse_dead=false;  //spans starting at an op may take a host reg that dies at that op
 
+	//Elements of an exploded fpu operand do best in consecutive, in-order host
+	//registers, for a backend that can move a register pair in one instruction
+	//(on arm32 s2k/s2k+1 are the halves of dk): the two context accesses at the
+	//span ends fold into one, and the operand itself can be loaded or stored as
+	//a pair. Best effort -- elements fall back to one-at-a-time allocation when
+	//no aligned run is free.
+	bool opt_pair_fpu_spans=false;
+
+	//The block branches back to its own start. On that path the backend skips
+	//the end writebacks and the entry preloads, so values stay in host regs
+	//across the back edge; spans are stretched over the whole block to make
+	//that worth something. The backend must gate this on a block that never
+	//moves the register file through the context behind a span's back (no
+	//interpreter fallbacks, no vector operand at op 0) and must commit the
+	//spans CarriedNeedsFlush() names before it branches back.
+	bool block_loops=false;
+
 	u32 current_opid;
+	u32 block_last;		//index of the block's last op
 	u32 preload_fpu,preload_gpr;
 	u32 writeback_fpu,writeback_gpr;
 
@@ -411,9 +446,10 @@ struct RegAlloc
 		return is_fpr && (op->rd.count()>=2 || op->rd2.count()>=2 || op->rs1.count()>=2 ||  op->rs2.count()>=2 || op->rs3.count()>=2 );
 	}
 
-	//opt-in per-op explode of 4-wide fpu vectors into individually allocatable
-	//f32 spans. The backend must then access the elements via mapfv() in that
-	//op's emitter -- see ExplodeVec() overrides.
+	//opt-in per-op explode of multi-reg fpu operands (f64 pairs, 4-wide
+	//vectors) into individually allocatable f32 spans. The backend must then
+	//access the elements via mapfv() in that op's emitter -- see the
+	//ExplodeVec() overrides.
 	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
 	{
 		return false;
@@ -423,7 +459,7 @@ struct RegAlloc
 	{
 		bool explode;
 		if (regs.count()==2)
-			explode = explode_spans;
+			explode = explode_spans || (regs.is_reg() && ExplodeVec(op,regs));
 		else if (regs.count()==4)
 			explode = regs.is_reg() && ExplodeVec(op,regs);
 		else
@@ -457,6 +493,12 @@ struct RegAlloc
 	//this op may be read, or written back at OpEnd, from the shared reg.
 	bool CanFreeEarly(RegSpan* spn, int opid)
 	{
+		//a whole-block span in a looping block holds its value in that register
+		//across the back edge (and its preload sits in the skipped preamble),
+		//so it is not free to hand it over at the last op
+		if (block_loops && spn->start==0 && spn->end==block_last)
+			return false;
+
 		if (!(spn->ending(opid) && !spn->begining(opid) && !spn->aliased
 			&& !spn->writeback && spn->cacc_am(opid)==AM_READ))
 			return false;
@@ -465,6 +507,349 @@ struct RegAlloc
 			return SpanNRegfIntr(opid,spn->nregf)==1;
 		else
 			return SpanNRegIntr(opid,spn->nreg)==1;
+	}
+
+	//takes n consecutive host fpu regs, base aligned to 2, out of the free list.
+	//Regs in `avoid` are off limits: they were handed back by a span dying at
+	//this very op, and a preload (which runs at OpBegin, before the op body)
+	//would clobber a value that body still has to read.
+	bool TakeFpuRun(deque<nregf_t>& regsf,const vector<nregf_t>& avoid,u32 n,nregf_t* out)
+	{
+		for (size_t i=0;i<regsf.size();i++)
+		{
+			u32 base=(u32)regsf[i];
+
+			if ((base&1)!=0)
+				continue;
+
+			u32 have=0;
+
+			for (u32 k=0;k<n;k++)
+			{
+				nregf_t want=(nregf_t)(base+k);
+
+				if (std::find(avoid.begin(),avoid.end(),want)!=avoid.end())
+					break;
+
+				if (std::find(regsf.begin(),regsf.end(),want)==regsf.end())
+					break;
+
+				have++;
+			}
+
+			if (have!=n)
+				continue;
+
+			for (u32 k=0;k<n;k++)
+			{
+				out[k]=(nregf_t)(base+k);
+				regsf.erase(std::find(regsf.begin(),regsf.end(),out[k]));
+			}
+
+			return true;
+		}
+
+		return false;
+	}
+
+	//Gives the elements of this op's exploded fpu operands consecutive, in-order
+	//host registers when a free run is available -- see opt_pair_fpu_spans. Only
+	//operands whose elements all start here can be placed; anything already live
+	//keeps the registers it has, and a failed placement just falls through to
+	//the plain one-at-a-time allocation.
+	void AllocFpuRuns(shil_opcode* op,u32 opid,deque<nregf_t>& regsf,const vector<nregf_t>& freed_now)
+	{
+		const shil_param* prms[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+		for (int i=0;i<5;i++)
+		{
+			const shil_param& prm=*prms[i];
+
+			if (!prm.is_reg() || prm.count()<2 || prm.count()>4 || !ExplodeVec(op,prm))
+				continue;
+
+			RegSpan* el[4];
+			bool placeable=true;
+			bool preload=false;
+
+			for (u32 e=0;e<prm.count();e++)
+			{
+				el[e]=FindSpan((Sh4RegType)(prm._reg+e),opid);
+
+				if (!el[e]->begining((int)opid) || el[e]->nregf!=(nregf_t)-1)
+					placeable=false;
+				else
+					preload|=el[e]->preload;
+			}
+
+			if (!placeable)
+				continue;
+
+			static const vector<nregf_t> none;
+			nregf_t nr[4];
+
+			if (!TakeFpuRun(regsf,preload?freed_now:none,prm.count(),nr))
+				continue;
+
+			for (u32 e=0;e<prm.count();e++)
+				el[e]->nregf=nr[e];
+		}
+	}
+
+	//does any op name this register at a point none of its spans covers? A
+	//vector operand or an interpreter fallback moves the value through the
+	//context there, so the register cannot be held across it
+	bool RegTouchedOutsideSpans(RuntimeBlockInfo* block, u32 reg)
+	{
+		for (size_t opid=0;opid<block->oplist.size();opid++)
+		{
+			bool covered=false;
+
+			for (u32 sid=0;sid<all_spans.size();sid++)
+			{
+				if (all_spans[sid]->regstart==reg && all_spans[sid]->contains((int)opid))
+					covered=true;
+			}
+
+			if (covered)
+				continue;
+
+			shil_opcode* op=&block->oplist[opid];
+			const shil_param* p[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+			for (int i=0;i<5;i++)
+			{
+				if (p[i]->is_reg() && reg>=(u32)p[i]->_reg &&
+					reg<(u32)p[i]->_reg+p[i]->count())
+					return true;
+			}
+		}
+
+		return false;
+	}
+
+	//most spans of one class alive at any single op
+	u32 PeakLive(RuntimeBlockInfo* block, bool fpr)
+	{
+		u32 peak=0;
+
+		for (size_t opid=0;opid<block->oplist.size();opid++)
+		{
+			u32 cc=0;
+
+			for (u32 sid=0;sid<all_spans.size();sid++)
+			{
+				if (all_spans[sid]->fpr==fpr && all_spans[sid]->contains((int)opid))
+					cc++;
+			}
+
+			if (cc>peak)
+				peak=cc;
+		}
+
+		return peak;
+	}
+
+	//peak liveness of one class, counting `reg` as live at every op
+	u32 PeakLiveHeld(RuntimeBlockInfo* block, bool fpr, u32 reg)
+	{
+		u32 peak=0;
+
+		for (size_t opid=0;opid<block->oplist.size();opid++)
+		{
+			u32 cc=1;	//the register we want to hold all the way through
+
+			for (u32 sid=0;sid<all_spans.size();sid++)
+			{
+				RegSpan* spn=all_spans[sid];
+
+				if (spn->fpr==fpr && spn->regstart!=reg && spn->contains((int)opid))
+					cc++;
+			}
+
+			if (cc>peak)
+				peak=cc;
+		}
+
+		return peak;
+	}
+
+	//A looping block wants its values to live in host registers for the whole
+	//block, so the back edge has nothing to write back and nothing to reload.
+	//Every register whose value never goes through the context behind a span's
+	//back gets one span over the whole block -- including registers that have
+	//several spans today, which is what a loop's rotating value looks like: read
+	//near the top, written near the bottom, and handed between the two through
+	//memory. Joining those is the whole point.
+	//
+	//What limits it is the host register file: a held register is live at every
+	//op, and one that had to be split again would be no use here (a span cannot
+	//be cut at op 0, so overshooting is not recoverable either). Registers are
+	//taken most-context-traffic-first so the ones that save the most win the
+	//space.
+	void ExtendLoopSpans(RuntimeBlockInfo* block, u32 max_g, u32 max_f)
+	{
+		for (size_t opid=0;opid<block->oplist.size();opid++)
+		{
+			//these move the whole register file through the context
+			if (IsFlushOp(block,(int)opid))
+				return;
+		}
+
+		u32 last=(u32)block->oplist.size()-1;
+
+		//one candidate per register, worth the context accesses it would save
+		vector<u32> regs,saving;
+
+		for (u32 sid=0;sid<all_spans.size();sid++)
+		{
+			RegSpan* spn=all_spans[sid];
+			size_t at=0;
+
+			while (at<regs.size() && regs[at]!=spn->regstart)
+				at++;
+
+			if (at==regs.size())
+			{
+				regs.push_back(spn->regstart);
+				saving.push_back(0);
+			}
+
+			saving[at]+=spn->preload+spn->writeback;
+		}
+
+		vector<u32> order;
+
+		for (u32 i=0;i<regs.size();i++)
+			order.push_back(i);
+
+		std::stable_sort(order.begin(),order.end(),[&saving](u32 a,u32 b)
+		{
+			return saving[a]>saving[b];
+		});
+
+		for (u32 oi=0;oi<order.size();oi++)
+		{
+			u32 reg=regs[order[oi]];
+
+			vector<RegSpan*> grp;
+
+			for (u32 sid=0;sid<all_spans.size();sid++)
+			{
+				if (all_spans[sid]->regstart==reg)
+					grp.push_back(all_spans[sid]);
+			}
+
+			if (grp.empty())
+				continue;
+
+			if (grp.size()==1 && grp[0]->start==0 && grp[0]->end==last)
+				continue;
+
+			if (RegTouchedOutsideSpans(block,reg))
+				continue;
+
+			if (PeakLiveHeld(block,grp[0]->fpr,reg)>(grp[0]->fpr?max_f:max_g))
+				continue;
+
+			//join them: the accesses of all of them, over the whole block
+			std::stable_sort(grp.begin(),grp.end(),[](RegSpan* a,RegSpan* b)
+			{
+				return a->start<b->start;
+			});
+
+			RegSpan* keep=grp[0];
+
+			for (u32 i=1;i<grp.size();i++)
+			{
+				keep->accesses.insert(keep->accesses.end(),
+					grp[i]->accesses.begin(),grp[i]->accesses.end());
+
+				for (u32 sid=0;sid<all_spans.size();sid++)
+				{
+					if (all_spans[sid]==grp[i])
+					{
+						all_spans.erase(all_spans.begin()+sid);
+						break;
+					}
+				}
+
+				delete grp[i];
+			}
+
+			std::stable_sort(keep->accesses.begin(),keep->accesses.end(),
+				[](const RegAccess& a,const RegAccess& b){ return a.pos<b.pos; });
+
+			keep->start=0;
+			keep->end=last;
+			keep->aliased=false;
+			keep->preload=keep->NeedsPL();
+			keep->writeback=keep->NeedsWB();
+		}
+	}
+
+	//Only a span that owns its register for the whole block can ride the back
+	//edge in it. Anything shorter either hands the register to another span
+	//before the loop comes round, or has its value read back out of the context
+	//inside the block (another span's preload, an operand that goes through
+	//memory) -- and its own preload, if it has one, sits below the loop header
+	//and would reload a context this path never wrote. A whole-block span has
+	//none of that: nothing else can hold its register, and an operand reading
+	//it from the context lands on the span as a flush, which a looping block
+	//commits unconditionally.
+	bool CarriedNeedsFlush(RegSpan* spn)
+	{
+		return spn->writeback && !(spn->start==0 && spn->end==block_last);
+	}
+
+	//Commits the values ending here that a back edge cannot carry in registers
+	void FlushCarried(int opid)
+	{
+		for (u32 sid=0;sid<all_spans.size();sid++)
+		{
+			RegSpan* spn=all_spans[sid];
+
+			if (!spn->ending(opid) || !CarriedNeedsFlush(spn))
+				continue;
+
+			if (spn->fpr)
+			{
+				writeback_fpu++;
+				Writeback_FPU(spn->regstart,spn->nregf);
+			}
+			else
+			{
+				writeback_gpr++;
+				Writeback(spn->regstart,spn->nreg);
+			}
+		}
+	}
+
+	//Commits every value that is live here, whether or not this pass has seen
+	//it written: on a back edge the registers carry the previous iteration's
+	//writes. Used where the block can be abandoned with values still in host
+	//registers -- the interrupt path takes the block's start pc and re-enters,
+	//so the context has to be whole.
+	void FlushLive(int opid)
+	{
+		for (u32 sid=0;sid<all_spans.size();sid++)
+		{
+			RegSpan* spn=all_spans[sid];
+
+			if (!spn->contains(opid) || !spn->writeback)
+				continue;
+
+			if (spn->fpr)
+			{
+				writeback_fpu++;
+				Writeback_FPU(spn->regstart,spn->nregf);
+			}
+			else
+			{
+				writeback_gpr++;
+				Writeback(spn->regstart,spn->nreg);
+			}
+		}
 	}
 
 	RegSpan* FindSpan(Sh4RegType reg, u32 opid)
@@ -491,6 +876,7 @@ struct RegAlloc
 	void DoAlloc(RuntimeBlockInfo* block,const nreg_t* nregs_avail,const nregf_t* nregsf_avail)
 	{
 		Cleanup();
+		block_last=(u32)block->oplist.size()-1;
 		shil_opcode* op;
 		for (size_t opid=0;opid<block->oplist.size();opid++)
 		{
@@ -752,7 +1138,9 @@ struct RegAlloc
 
 		u32 reg_cc_max_f=(u32)regsf.size();
 
-		
+		if (block_loops)
+			ExtendLoopSpans(block,reg_cc_max_g,reg_cc_max_f);
+
 		//Trim span count to max reg count
 		for (size_t opid=0;opid<block->oplist.size();opid++)
 		{
@@ -802,19 +1190,24 @@ struct RegAlloc
 				RegSpan* x=FindSpan(block->oplist[opid].rs1._reg,(u32)opid);
 				RegSpan* d=FindSpan(block->oplist[opid].rd._reg,(u32)opid);
 
-				//src must never be written again (the shared reg holds both
-				//values until one dies), and dst must not be written again
-				//until strictly after src's end: src's writeback runs at OpEnd
-				//of its last op, after that op's body has already stored dst
-				//into the shared reg.
-				if (x!=d && !x->aliased && x->nacc_w((int)opid)==-1)
+				//The shared reg holds both values until one of them dies, so
+				//neither may be written while the other is still live: src not
+				//before dst's end (dst's writeback runs at OpEnd of that op,
+				//and would store src's new value), and dst not until strictly
+				//after src's end (src's writeback runs at OpEnd of its last op,
+				//after that op's body has already stored dst into the reg).
+				int swa=x->nacc_w((int)opid);
+
+				//a dst stretched over a whole looping block does not begin here
+				//any more, and the value it carries predates the mov
+				if (x!=d && !x->aliased && (swa==-1 || swa>(int)d->end) &&
+					d->begining((int)opid) && !d->preload)
 				{
 					int nwa=d->nacc_w((int)opid);
 
 					if (nwa==-1 || nwa>(int)x->end)
 					{
 						verify(d->fpr==x->fpr);
-						verify(d->begining((int)opid) && !d->preload);
 
 						//exactly one of the pair returns the shared reg to the pool
 						if (d->end>=x->end)
@@ -828,6 +1221,8 @@ struct RegAlloc
 					}
 				}
 			}
+
+			vector<nregf_t> freed_now;
 
 			if (opt_reuse_dead)
 			{
@@ -843,16 +1238,26 @@ struct RegAlloc
 						spn->freed_early=true;
 
 						if (spn->fpr)
+						{
 							regsf.push_back(spn->nregf);
+							freed_now.push_back(spn->nregf);
+						}
 						else
 							regs.push_back(spn->nreg);
 					}
 				}
 			}
 
+			if (opt_pair_fpu_spans)
+				AllocFpuRuns(&block->oplist[opid],(u32)opid,regsf,freed_now);
+
 			for (u32 sid=0;sid<all_spans.size();sid++)
 			{
 				RegSpan* spn=all_spans[sid];
+
+				//AllocFpuRuns may have served this one already
+				if (spn->fpr && spn->nregf!=(nregf_t)-1)
+					continue;
 
 				if (spn->begining((int)opid) && spn!=alias_dst)
 				{
@@ -1068,6 +1473,18 @@ struct RegAlloc
 	}
 
 
+	//A span can be cut at an op that doesn't use its host register: one it
+	//doesn't access at all, or a flush -- there the operand is read from the
+	//context, so ending the span at its previous access (which writes back any
+	//dirty value) and re-loading it at the next one is transparent. Cutting
+	//needs a previous access to end on.
+	bool CanSplit(RegSpan* spn, u32 opid)
+	{
+		AccessMode am=spn->cacc_am(opid);
+
+		return (am==AM_NONE || am==AM_FLUSH) && spn->pacc(opid)!=-1;
+	}
+
 	void SplitSpans(u32 cc,u32 reg_cc_max ,bool fpr,u32 opid)
 	{
 		bool was_large=false;	//this control prints
@@ -1086,9 +1503,12 @@ struct RegAlloc
 
 				if (spn->contains(opid) && fpr==spn->fpr)
 				{
-					if (!spn->cacc(opid))
+					if (CanSplit(spn,opid))
 					{
-						if (!last_nacc || spn->nacc(opid)>last_nacc->nacc(opid))
+						//a span with no further use is the cheapest to cut: it
+						//just ends early, no reload
+						if (!last_nacc || spn->nacc_use(opid)==-1 ||
+							(last_nacc->nacc_use(opid)!=-1 && spn->nacc_use(opid)>last_nacc->nacc_use(opid)))
 							last_nacc=spn;
 
 						if (!last_pacc || spn->pacc(opid)<last_pacc->pacc(opid))
@@ -1099,24 +1519,41 @@ struct RegAlloc
 				}
 			}
 
+			//nothing left to cut: this op alone needs more registers than the
+			//host has
+			verify(last_nacc!=0);
+
 			//printf("Last pacc: %d, vlen %d | reg r%d\n",last_pacc->nacc(opid)-opid,last_pacc->nacc(opid)-last_pacc->pacc(opid),last_pacc->regstart);
 			//printf("Last nacc: %d, vlen %d | reg r%d\n",last_nacc->nacc(opid)-opid,last_nacc->nacc(opid)-last_nacc->pacc(opid),last_nacc->regstart);
 
-			RegSpan* spn= new RegSpan(*last_nacc);
-			spn->start=last_nacc->nacc(opid);
+			//the tail picks up at the next access that needs a register; any
+			//flush in between is served from the context
+			int tail=last_nacc->nacc_use(opid);
+
+			//the tail becomes a span of its own, re-loaded at its first access
+			//(the context is current: the head writes back at its own end)
+			if (tail!=-1)
+			{
+				RegSpan* spn= new RegSpan(*last_nacc);
+				spn->start=tail;
+
+				spn->trim_access();
+
+				spn->preload=spn->NeedsPL();
+				spn->writeback=spn->NeedsWB();
+
+				//add it to the span list !
+				all_spans.push_back(spn);
+				spills++;
+			}
+
 			last_nacc->end=last_nacc->pacc(opid);
 
 			//trim the access arrays as required ..
-			spn->trim_access();
 			last_nacc->trim_access();
 
-			spn->preload=spn->NeedsPL();
-			spn->writeback=spn->NeedsWB();
 			last_nacc->writeback=last_nacc->NeedsWB();
 
-			//add it to the span list !
-			all_spans.push_back(spn);
-			spills++;
 			cc--;
 		}
 	}
@@ -1189,11 +1626,39 @@ struct RegAlloc
 
 	void OpBegin(shil_opcode* op,int opid)
 	{
+		OpBeginImpl(op,opid,0);
+	}
+
+	//A looping block splits op 0's preloads in two. The ones whose span lasts
+	//the whole block go in the preamble, above the loop header: the back edge
+	//keeps those values in their registers. The rest die inside the block, so
+	//their register is handed to someone else before the back edge and they
+	//have to be loaded again every iteration -- those go below the header.
+	void OpBeginCarried(shil_opcode* op,int opid)
+	{
+		OpBeginImpl(op,opid,1);
+	}
+
+	void OpBeginTransient(shil_opcode* op,int opid)
+	{
+		OpBeginImpl(op,opid,2);
+	}
+
+	void OpBeginImpl(shil_opcode* op,int opid,int part)
+	{
 		current_opid=opid;
 
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
 			RegSpan* spn=all_spans[sid];
+
+			if (part!=0)
+			{
+				bool carried=spn->end==block_last;
+
+				if ((part==1)!=carried)
+					continue;
+			}
 
 			if (spn->begining(current_opid) && spn->preload)
 			{
@@ -1210,7 +1675,10 @@ struct RegAlloc
 					Preload(spn->regstart,spn->nreg);
 				}
 			}
-			else if (spn->cacc_am(current_opid)==AM_FLUSH && spn->dirty)
+			//in a looping block the register may carry a write from a previous
+			//iteration, which this pass has not seen yet: commit unconditionally
+			else if (spn->cacc_am(current_opid)==AM_FLUSH &&
+				(spn->dirty || (block_loops && spn->NeedsWB())))
 			{
 				//a vector operand reads this reg from the context in the op
 				//body: commit the dirty value now, span stays live
@@ -1231,6 +1699,20 @@ struct RegAlloc
 
 	void OpEnd(shil_opcode* op)
 	{
+		OpEndImpl(op,false);
+	}
+
+	//The loop-path variant, for the last op of a block that branches back to
+	//its own start: the ending spans keep their values in registers instead of
+	//writing them back, except the ones the next iteration would re-read from
+	//the context.
+	void OpEndLoop(shil_opcode* op)
+	{
+		OpEndImpl(op,true);
+	}
+
+	void OpEndImpl(shil_opcode* op, bool loop)
+	{
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
 			RegSpan* spn=all_spans[sid];
@@ -1239,9 +1721,17 @@ struct RegAlloc
 			if (spn->cacc_am(current_opid)&AM_WRITE)
 				spn->dirty=true;
 
+			bool wb=spn->ending(current_opid) && spn->writeback && spn->dirty;
+
+			//a carried value may have been written on an earlier iteration, so
+			//dirty says nothing here; what matters is whether it has to be in
+			//the context for the next one
+			if (loop && spn->ending(current_opid))
+				wb=CarriedNeedsFlush(spn);
+
 			//skip the end writeback when an AM_FLUSH already committed the
 			//final value (dirty==false); Kill() still suppresses via writeback
-			if (spn->ending(current_opid) && spn->writeback && spn->dirty)
+			if (wb)
 			{
 				if (spn->fpr)
 				{

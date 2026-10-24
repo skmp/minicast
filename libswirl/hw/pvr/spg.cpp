@@ -51,10 +51,12 @@ u32 fskip = 0;
 extern u32 PVR_VTXC;
 
 static bool hasrep;
+static u32 GuestRenderCycles;
 void SetREP(u32 render_end_pending_cycles)
 {
     verify(hasrep == false);
     hasrep = true;
+    GuestRenderCycles = 0;
     sh4_sched_request(render_end_schid, render_end_pending_cycles);
 }
 
@@ -65,6 +67,8 @@ void CancelREP() {
         hasrep = false;
     }
 }
+
+extern u32 rdv_compiles;
 
 struct SPG_impl final : SPG {
     ASIC* asic;
@@ -126,8 +130,9 @@ struct SPG_impl final : SPG {
     //called from sh4 context , should update pvr/ta state and everything else
     int spg_line_sched(int tag, int cycl, int jit)
     {
-        clc_pvr_scanline += cycl;
+        clc_pvr_scanline += cycl + jit;
 
+        // printf("Line_Cycles: %d, %d\n", Line_Cycles, cycl);
         while (clc_pvr_scanline >= Line_Cycles)//60 ~hertz = 200 mhz / 60=3333333.333 cycles per screen refresh
         {
             //ok .. here , after much effort , we did one line
@@ -136,11 +141,19 @@ struct SPG_impl final : SPG {
             clc_pvr_scanline -= Line_Cycles;
             //Check for scanline interrupts -- really need to test the scanline values
 
-            if (SPG_VBLANK_INT.vblank_in_interrupt_line_number == prv_cur_scanline)
+            if (SPG_VBLANK_INT.vblank_in_interrupt_line_number == prv_cur_scanline) {
                 asic->RaiseInterrupt(holly_SCANINT1);
+                // static u32 lastt;
+                // printf("holly_SCANINT1: %.3f\n", (sh4_sched_now() - lastt) / 200.0 / 1000.0 / 1000.0 * 1000);
+                // lastt = sh4_sched_now();
+            }
 
-            if (SPG_VBLANK_INT.vblank_out_interrupt_line_number == prv_cur_scanline)
+            if (SPG_VBLANK_INT.vblank_out_interrupt_line_number == prv_cur_scanline) {
                 asic->RaiseInterrupt(holly_SCANINT2);
+                // static u32 lastt;
+                // printf("holly_SCANINT2: %.3f\n", (sh4_sched_now() - lastt) / 200.0 / 1000.0 / 1000.0 * 1000);
+                // lastt = sh4_sched_now();
+            }
 
             if (SPG_VBLANK.vstart == prv_cur_scanline)
                 in_vblank = 1;
@@ -265,12 +278,13 @@ struct SPG_impl final : SPG {
                     full_rps = (spd_fps + fskip / ts);
 
                     char temp[2048];
-                    snprintf(temp, 2048, "%s/%c - %4.2f - %4.2f - V: %4.2f (%.2f, %s%s%4.2f) R: %4.2f+%4.2f VTX: %4.2f%c, MIPS: %.2f",
+                    snprintf(temp, 2048, "%s/%c - %4.2f - %4.2f - V: %4.2f (%.2f, %s%s%4.2f) R: %4.2f+%4.2f Compiles: %u",
                         VER_SHORTNAME, 'n', mspdf, spd_cpu * 100 / 200, spd_vbs,
                         spd_vbs / full_rps, mode, res, fullvbs,
-                        spd_fps, fskip / ts
-                        , mv, mv_c, mips_counter / 1024.0 / 1024.0);
+                        spd_fps, fskip / ts,
+                        rdv_compiles);
                     mips_counter = 0;
+                    rdv_compiles = 0;
 
                     os_SetWindowText(temp);
 
@@ -316,7 +330,7 @@ struct SPG_impl final : SPG {
 
         min_active = max(min_active, min_scanline);
 
-        return (min_active - prv_cur_scanline) * Line_Cycles;
+        return (min_active - prv_cur_scanline) * Line_Cycles - clc_pvr_scanline + jit;
     }
 
     void read_lightgun_position(int x, int y)
@@ -334,8 +348,15 @@ struct SPG_impl final : SPG {
 
     int rend_end_sch(int tag, int cycl, int jitt)
     {
-        if (settings.freerunning && !rend_render_done())
+        GuestRenderCycles += REND_DONE_POLL_CYCLES;
+        
+        if (settings.freerunning && !rend_render_done(GuestRenderCycles)) {
             return REND_DONE_POLL_CYCLES;
+        }
+        
+        if (settings.pvr.FPSTarget == 0 && !rend_render_done(GuestRenderCycles)) {
+            return REND_DONE_POLL_CYCLES;
+        }
 
         hasrep = false;
         asic->RaiseInterrupt(holly_RENDER_DONE);

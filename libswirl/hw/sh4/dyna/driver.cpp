@@ -227,6 +227,10 @@ void RuntimeBlockInfo::Setup(u32 rpc,fpscr_t rfpu_cfg)
 	AnalyseBlock(this);
 }
 
+void UpdateSystem_StartBlockCompile();
+void UpdateSystem_EndBlockCompile();
+u32 rdv_compiles;
+
 DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 {
 	u32 pc=next_pc;
@@ -249,6 +253,8 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 		return nullptr;
 	}
 
+	UpdateSystem_StartBlockCompile();
+	rdv_compiles++;
 	RuntimeBlockInfo* rv=0;
 	do
 	{
@@ -266,7 +272,7 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 		verify(rbi->code!=0);
 
 		// perf samples the rx mapping, rbi->code is rw
-		perf_map_AddBlock((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi->addr);
+		perf_map_AddBlock((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi->addr, rbi->sh4_code_size);
 		perf_map_AddShops((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi);
 
 		bool doLock = !bm_RamPageHasData(rbi->addr, rbi->sh4_code_size); // && maybe some setting?
@@ -287,6 +293,8 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
     #endif
 
 	bm_printf("rdv_CompilePC: end %08X\n", next_pc);
+
+	UpdateSystem_EndBlockCompile();
 
 	return rv->code;
 }

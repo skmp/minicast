@@ -8,9 +8,13 @@
 #include "pvr_regs.h"
 #include "hw/holly/holly_intc.h"
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 //YUV converter code :)
 //inits the YUV converter
-u32 YUV_tempdata[512 / 4];//512 bytes
+alignas(32) u32 YUV_tempdata[512 / 4];//512 bytes; aligned so the NEON path's hinted loads hold for the reassembly case too
 
 u32 YUV_dest = 0;
 
@@ -115,6 +119,48 @@ void YUV_Block8x8(u8* inuv, u8* iny, u8* out)
 
 INLINE void YUV_Block384(u8* in, u8* out)
 {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+	//in: 64 bytes U (8x8), 64 bytes V (8x8), 4x64 bytes Y (8x8 blocks: TL TR BL BR)
+	//out: 16 lines of 16 UYVY pixels (32 bytes), line stride YUV_x_size*2
+	//a line is vzip(vzip(u_row,v_row), y_row): u0 y0 v0 y1 u1 y2 v1 y3 ...
+	//in is >=8-byte aligned (SH4 DMA source is 32-byte aligned, YUV_tempdata is alignas(32));
+	//out and the stride are 32-byte multiples (x_size is a multiple of 16) - the
+	//assume_aligned's below turn the vld1/vst1 into hinted [:64]/[:128] forms
+	u8* u_row = in;
+	u8* v_row = in + 64;
+	u32 stride = YUV_x_size * 2;
+
+	for (int half = 0; half < 2; half++)
+	{
+		const u8* yl = in + 128 + half * 128;	//left 8x8 Y block of this half
+		const u8* yr = yl + 64;					//right 8x8 Y block
+
+		for (int r = 0; r < 4; r++)				//4 UV rows per half, 2 lines each
+		{
+			u_row = (u8*)__builtin_assume_aligned(u_row, 8);
+			v_row = (u8*)__builtin_assume_aligned(v_row, 8);
+			uint8x8x2_t uvz = vzip_u8(vld1_u8(u_row), vld1_u8(v_row));
+			uint8x16_t uv = vcombine_u8(uvz.val[0], uvz.val[1]);
+			u_row += 8;
+			v_row += 8;
+
+			for (int l = 0; l < 2; l++)
+			{
+				yl = (const u8*)__builtin_assume_aligned(yl, 8);
+				yr = (const u8*)__builtin_assume_aligned(yr, 8);
+				uint8x16_t y = vcombine_u8(vld1_u8(yl), vld1_u8(yr));
+				yl += 8;
+				yr += 8;
+
+				uint8x16x2_t o = vzipq_u8(uv, y);
+				out = (u8*)__builtin_assume_aligned(out, 32);
+				vst1q_u8(out, o.val[0]);
+				vst1q_u8(out + 16, o.val[1]);
+				out += stride;
+			}
+		}
+	}
+#else
 	u8* inuv = in;
 	u8* iny = in + 128;
 	u8* p_out = out;
@@ -123,6 +169,7 @@ INLINE void YUV_Block384(u8* in, u8* out)
 	YUV_Block8x8(inuv + 4, iny + 64, p_out + 8 * 2);                 //(8,0)
 	YUV_Block8x8(inuv + 32, iny + 128, p_out + YUV_x_size * 8 * 2);     //(0,8)
 	YUV_Block8x8(inuv + 36, iny + 192, p_out + YUV_x_size * 8 * 2 + 8 * 2); //(8,8)
+#endif
 }
 
 INLINE void YUV_ConvertMacroBlock(u8* vram, u8* datap)

@@ -107,11 +107,19 @@ static void check_arm32_forms(const vector<shil_opcode>& ops)
 			verify(size == 2 || size == 4);
 		}
 
-		// paired f32 loads: only the nvmem reg-base 32F form supports rd2
+		// paired float loads: only the nvmem reg-base 32F/64F forms support rd2
 		if (o.op == shop_readm && !o.rd2.is_null())
 		{
-			verify(o.rd.is_r32f() && o.rd2.is_r32f());
-			verify((o.flags & 0x7F) == 4);
+			u32 size = o.flags & 0x7F;
+
+			if (size == 8)
+				verify(o.rd.is_r64f() && o.rd2.is_r64f() && o.rd._reg != o.rd2._reg);
+			else
+			{
+				verify(o.rd.is_r32f() && o.rd2.is_r32f());
+				verify(size == 4);
+			}
+
 			verify(o.rs1.is_r32i());
 			verify(o.rs3.is_null());
 		}
@@ -1150,6 +1158,123 @@ static void t_readm_pair_fusion()
 	check_arm32_forms(b3.oplist);
 	for (auto& o : b3.oplist)
 		verify(!(o.op == shop_readm) || o.rd2.is_null());
+
+	// fmov.d @Rn+ x2 (a matrix/vertex fetch) fuses the same way, on +8
+	mock_reset();
+	RuntimeBlockInfo b4 = mkblk();
+	static const Sh4RegType drs[] = {reg_fr_0, reg_fr_2, reg_fr_4};
+	for (auto dr : drs)
+	{
+		b4.oplist.push_back(OP(shop_readm, D(dr), R(reg_r8), P(), 8));
+		b4.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(8)));
+	}
+	fuse_readm_pairs(&b4);
+	check_arm32_forms(b4.oplist);
+
+	verify(count_op(b4.oplist, shop_readm) == 2);
+	verify(b4.oplist[0].rd._reg == reg_fr_0 && b4.oplist[0].rd2._reg == reg_fr_2);
+	verify(b4.oplist[1].op == shop_add && b4.oplist[1].rs2._imm == 16);
+	verify(b4.oplist[2].op == shop_readm && b4.oplist[2].rd2.is_null());
+
+	// guards: a +4 between doubles, and a pair of different sizes
+	mock_reset();
+	RuntimeBlockInfo b5 = mkblk();
+	b5.oplist.push_back(OP(shop_readm, D(reg_fr_0), R(reg_r8), P(), 8));
+	b5.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(4)));   // not +8
+	b5.oplist.push_back(OP(shop_readm, D(reg_fr_2), R(reg_r8), P(), 8));
+	b5.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(8)));
+	b5.oplist.push_back(OP(shop_readm, F(reg_fr_4), R(reg_r8), P(), 4)); // size mismatch
+	fuse_readm_pairs(&b5);
+	check_arm32_forms(b5.oplist);
+	for (auto& o : b5.oplist)
+		verify(!(o.op == shop_readm) || o.rd2.is_null());
+
+	// the same double twice is left alone
+	mock_reset();
+	RuntimeBlockInfo b6 = mkblk();
+	b6.oplist.push_back(OP(shop_readm, D(reg_fr_0), R(reg_r8), P(), 8));
+	b6.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(8)));
+	b6.oplist.push_back(OP(shop_readm, D(reg_fr_0), R(reg_r8), P(), 8));
+	fuse_readm_pairs(&b6);
+	check_arm32_forms(b6.oplist);
+	verify(count_op(b6.oplist, shop_readm) == 2);
+}
+
+// writes 4 bytes at a time through `base`, then prefs it -- the store queue shape
+static void mk_sq_writes(RuntimeBlockInfo* b, Sh4RegType base, int n)
+{
+	for (int i = 0; i < n; i++)
+		b->oplist.push_back(OP(shop_writem, P(), R(base), R(reg_r1), 4));
+}
+
+static int sq_marked_writes(const RuntimeBlockInfo& b)
+{
+	int n = 0;
+	for (auto& o : b.oplist)
+		if (o.op == shop_writem && o.flags2 == 0x1337)
+			n++;
+	return n;
+}
+
+static void t_sq_pref()
+{
+	// the store queue shape: 32 bytes through r4, then pref @r4. (The scan
+	// stops before op 0, so the block starts with the address setup anyway.)
+	mock_reset();
+	RuntimeBlockInfo b = mkblk();
+	b.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b, reg_r4, 8);
+	b.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b);
+	verify(b.oplist.back().flags == 0x1337);
+	verify(sq_marked_writes(b) == 8);
+
+	// the same, but something loads through r4: the store queue is write only,
+	// so this is ordinary memory and the writes must stay ordinary writes
+	mock_reset();
+	RuntimeBlockInfo b2 = mkblk();
+	b2.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b2, reg_r4, 8);
+	b2.oplist.push_back(OP(shop_readm, R(reg_r2), R(reg_r4), P(), 4));
+	b2.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b2);
+	verify(b2.oplist.back().flags != 0x1337);
+	verify(sq_marked_writes(b2) == 0);
+
+	// a read of any size counts, and one before the writes counts too
+	for (u32 sz = 1; sz <= 8; sz *= 2)
+	{
+		mock_reset();
+		RuntimeBlockInfo b3 = mkblk();
+		b3.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+		b3.oplist.push_back(OP(shop_readm, R(reg_r2), R(reg_r4), P(), sz));
+		mk_sq_writes(&b3, reg_r4, 8);
+		b3.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+		sq_pref(&b3);
+		verify(b3.oplist.back().flags != 0x1337);
+		verify(sq_marked_writes(b3) == 0);
+	}
+
+	// a read through some other register leaves the match alone
+	mock_reset();
+	RuntimeBlockInfo b4 = mkblk();
+	b4.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b4, reg_r4, 8);
+	b4.oplist.push_back(OP(shop_readm, R(reg_r2), R(reg_r5), P(), 4));
+	b4.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b4);
+	verify(b4.oplist.back().flags == 0x1337);
+	verify(sq_marked_writes(b4) == 8);
+
+	// too little written to look like a store queue fill
+	mock_reset();
+	RuntimeBlockInfo b5 = mkblk();
+	b5.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b5, reg_r4, 1);
+	b5.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b5);
+	verify(b5.oplist.back().flags != 0x1337);
+	verify(sq_marked_writes(b5) == 0);
 }
 
 static void t_imm_literal_bake()
@@ -1474,6 +1599,7 @@ int main(int argc, char** argv)
 	t_dse();
 	t_ftrv_known_w();
 	t_readm_pair_fusion();
+	t_sq_pref();
 	t_imm_literal_bake();
 	t_rom_bake();
 	t_baking_disabled();

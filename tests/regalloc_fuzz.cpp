@@ -20,6 +20,7 @@ struct TestAlloc : RegAlloc<int, int, false>
 		memset(Rg, 0, sizeof(Rg));
 		memset(Rf, 0, sizeof(Rf));
 		spills = 0;
+		opt_pair_fpu_spans = true;
 	}
 
 	virtual void Preload(u32 reg, int nreg) { Rg[nreg] = ctx[reg]; }
@@ -28,10 +29,16 @@ struct TestAlloc : RegAlloc<int, int, false>
 	virtual void Writeback_FPU(u32 reg, int nreg) { ctx[reg] = Rf[nreg]; }
 
 	// mirror the arm32 backend: ftrv/fipr fv operands become 4 allocatable
-	// f32 spans; every other multi-reg param stays a memory operand
+	// f32 spans, and the f64 pair of a mov64/readm/writem/fsca becomes 2;
+	// every other multi-reg param stays a memory operand
 	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
 	{
-		return (op->op == shop_ftrv || op->op == shop_fipr) && prm.count() == 4;
+		if ((op->op == shop_ftrv || op->op == shop_fipr) && prm.count() == 4)
+			return true;
+
+		return prm.is_r64f() &&
+			(op->op == shop_mov64 || op->op == shop_readm ||
+			 op->op == shop_writem || op->op == shop_fsca);
 	}
 };
 
@@ -73,6 +80,21 @@ static shil_param mkvec(Sh4RegType r, u32 fmt)
 	return p;
 }
 
+// ops also reach into the xf bank now and then: those spans are what the
+// non-exploded xmtrx operand of an ftrv flushes (AM_FLUSH)
+static Sh4RegType rnd_fpr()
+{
+	u32 i = rnd_below(16);
+	return (Sh4RegType)((rnd_below(4) == 0 ? reg_xf_0 : reg_fr_0) + i);
+}
+
+// even-aligned base of a dr/xd pair
+static Sh4RegType rnd_fpr_pair()
+{
+	u32 i = rnd_below(8) * 2;
+	return (Sh4RegType)((rnd_below(4) == 0 ? reg_xf_0 : reg_fr_0) + i);
+}
+
 // pick `n` distinct regs from a pool (params of one op must fit in the host pool)
 static void pick_distinct(const Sh4RegType* pool, u32 pool_sz, u32 n, Sh4RegType* out)
 {
@@ -99,7 +121,7 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 	{
 		shil_opcode op;
 		Sh4RegType r[5];
-		u32 kind = rnd_below(14);
+		u32 kind = rnd_below(17);
 
 		if (kind == 10 && nfpr >= 4) // exploded vector op, like ftrv
 		{
@@ -123,19 +145,57 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 			blk->oplist.push_back(op);
 			continue;
 		}
-		if (kind == 12 && nfpr >= 2) // non-exploded vector: fpu spans must flush/die
+		if (kind == 12 && nfpr >= 4) // exploded f64 pair copy: up to 4 live halves
 		{
 			op.op = shop_mov64;
-			op.rd = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
-			op.rs1 = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
+			op.rd = mkvec(rnd_fpr_pair(), FMT_F64);
+			op.rs1 = mkvec(rnd_fpr_pair(), FMT_F64);
 			blk->oplist.push_back(op);
 			continue;
 		}
-		if (kind == 13 && nfpr >= 2) // fsca-like: F64 pair write from a gpr source
+		if (kind == 13 && nfpr >= 2) // fsca: exploded F64 pair write from a gpr source
 		{
 			op.op = shop_fsca;
-			op.rd = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
+			op.rd = mkvec(rnd_fpr_pair(), FMT_F64);
 			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind == 14 && nfpr >= 2) // 64 bit fpu read: exploded pair dest, gpr address
+		{
+			op.op = shop_readm;
+			op.rd = mkvec(rnd_fpr_pair(), FMT_F64);
+			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
+
+			// fused form (fuse_readm_pairs): a second double off the same address
+			if (nfpr >= 4 && rnd_below(2) == 0)
+			{
+				Sh4RegType d2 = rnd_fpr_pair();
+
+				if (d2 != op.rd._reg)
+					op.rd2 = mkvec(d2, FMT_F64);
+			}
+
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind == 15 && nfpr >= 2) // 64 bit fpu write: exploded pair source, gpr address
+		{
+			op.op = shop_writem;
+			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
+			op.rs2 = mkvec(rnd_fpr_pair(), FMT_F64);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		// frswap swaps both banks wholesale: every fpu span has to flush and
+		// die there. Kept rare -- it wipes the fpu state the other ops build up
+		if (kind == 16 && rnd_below(4) == 0)
+		{
+			op.op = shop_frswap;
+			op.rd = mkvec(reg_xf_0, FMT_V16);
+			op.rd2 = mkvec(reg_fr_0, FMT_V16);
+			op.rs1 = mkvec(reg_fr_0, FMT_V16);
+			op.rs2 = mkvec(reg_xf_0, FMT_V16);
 			blk->oplist.push_back(op);
 			continue;
 		}
@@ -148,8 +208,8 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 			bool df = cls & 1, sf = cls & 2;
 			if ((df || sf) && nfpr < 1) { df = sf = false; }
 			op.op = shop_mov32;
-			Sh4RegType dr = df ? fpr_pool[rnd_below(16)] : gpr_pool[rnd_below(8)];
-			Sh4RegType sr = sf ? fpr_pool[rnd_below(16)] : gpr_pool[rnd_below(8)];
+			Sh4RegType dr = df ? rnd_fpr() : gpr_pool[rnd_below(8)];
+			Sh4RegType sr = sf ? rnd_fpr() : gpr_pool[rnd_below(8)];
 			op.rd = mkreg(dr, df);
 			op.rs1 = mkreg(sr, sf);
 		}
@@ -214,7 +274,8 @@ static void dump_block(RuntimeBlockInfo* blk)
 	}
 }
 
-static u64 g_elided, g_movs, g_spills, g_fail_ctx;
+static u64 g_elided, g_movs, g_spills, g_fail_ctx, g_vecops, g_vecruns;
+static u64 g_loops, g_carried_wb, g_carried_pl;
 static RuntimeBlockInfo* g_cur_blk;
 static u64 g_cur_seed;
 static TestAlloc* g_cur_alloc;
@@ -238,6 +299,47 @@ static void dump_spans(TestAlloc* a)
 	dump_spans(g_cur_alloc); \
 	exit(1); } } while (0)
 
+// mirrors the arm32 gate (block_self_loops): the preamble is skipped on the
+// back edge, so nothing may hand a register over through the context there
+static bool can_loop(RuntimeBlockInfo* blk, TestAlloc* alloc)
+{
+	if (blk->oplist.empty())
+		return false;
+
+	shil_opcode* op = &blk->oplist[0];
+	shil_param* rd[3] = { &op->rs1, &op->rs2, &op->rs3 };
+	shil_param* all[5] = { &op->rd, &op->rd2, &op->rs1, &op->rs2, &op->rs3 };
+
+	// a vector operand at op 0 only rules the block out if one of its registers
+	// can also hold a span there -- see block_self_loops
+	for (int p = 0; p < 3; p++)
+	{
+		if (!rd[p]->is_reg() || rd[p]->count() <= 1 || alloc->ExplodeVec(op, *rd[p]))
+			continue;
+
+		for (u32 e = 0; e < rd[p]->count(); e++)
+		{
+			u32 r = (u32)rd[p]->_reg + e;
+
+			for (int q = 0; q < 5; q++)
+			{
+				shil_param* o = all[q];
+
+				if (o == rd[p] || !o->is_reg())
+					continue;
+
+				if (o->count() != 1 && !alloc->ExplodeVec(op, *o))
+					continue;
+
+				if (r >= (u32)o->_reg && r < (u32)o->_reg + o->count())
+					return false;
+			}
+		}
+	}
+
+	return true;
+}
+
 static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 {
 	int gprs[17], fprs[17];
@@ -247,20 +349,87 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 	fprs[nfpr] = -1;
 
 	g_cur_alloc = alloc;
+
+	// a block that branches back to its own start: run it several times with
+	// the loop path in between (no end writebacks, no entry preloads)
+	bool loops = can_loop(blk, alloc) && rnd_below(3) == 0;
+	u32 iters = loops ? 2 + rnd_below(3) : 1;
+
+	alloc->block_loops = loops;
 	alloc->DoAlloc(blk, gprs, fprs);
+
+	// context traffic the back edge skips, per iteration
+	if (loops)
+	{
+		g_loops++;
+		for (size_t s = 0; s < alloc->all_spans.size(); s++)
+		{
+			TestAlloc::RegSpan* spn = alloc->all_spans[s];
+
+			if (alloc->CarriedNeedsFlush(spn))
+				continue;
+
+			if (spn->writeback && spn->end + 1 == blk->oplist.size())
+				g_carried_wb++;
+			if (spn->preload && spn->start == 0)
+				g_carried_pl++;
+		}
+	}
 	g_spills += alloc->spills;
 	alloc->spills = 0;
+
+	// how often an exploded operand ended up in consecutive, in-order host regs
+	// (an even base): that's what lets the backend fold its context accesses
+	for (size_t opid = 0; opid < blk->oplist.size(); opid++)
+	{
+		shil_opcode* op = &blk->oplist[opid];
+		shil_param* ps[] = { &op->rd, &op->rd2, &op->rs1, &op->rs2, &op->rs3 };
+
+		for (int j = 0; j < 5; j++)
+		{
+			if (!ps[j]->is_reg() || ps[j]->count() < 2 || !alloc->ExplodeVec(op, *ps[j]))
+				continue;
+
+			alloc->current_opid = (u32)opid;
+
+			int base = alloc->mapf((Sh4RegType)ps[j]->_reg);
+			bool run = (base & 1) == 0;
+
+			for (u32 e = 1; e < ps[j]->count(); e++)
+				run &= alloc->mapf((Sh4RegType)(ps[j]->_reg + e)) == base + (int)e;
+
+			g_vecops++;
+			if (run)
+				g_vecruns++;
+		}
+	}
 
 	u64 arch[sh4_reg_count];
 	u64 next_val = 0x1000000;
 	for (int i = 0; i < sh4_reg_count; i++)
 		arch[i] = alloc->ctx[i] = next_val++;
 
+	for (u32 iter = 0; iter < iters; iter++)
+	{
+	// the hardware runs one emitted copy of the block, so every iteration has
+	// to see the state this pass had at the top of the first one
+	for (size_t s = 0; s < alloc->all_spans.size(); s++)
+		alloc->all_spans[s]->dirty = false;
+
 	for (size_t opid = 0; opid < blk->oplist.size(); opid++)
 	{
 		shil_opcode* op = &blk->oplist[opid];
 
-		alloc->OpBegin(op, (int)opid);
+		// only the carried half of op 0's preloads sits above the loop header
+		if (opid == 0 && loops)
+		{
+			if (iter == 0)
+				alloc->OpBeginCarried(op, 0);
+
+			alloc->OpBeginTransient(op, 0);
+		}
+		else
+			alloc->OpBegin(op, (int)opid);
 
 		// read all mapped sources first (the backend contract)
 		shil_param* srcs[] = { &op->rs1, &op->rs2, &op->rs3 };
@@ -365,7 +534,13 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 			}
 		}
 
-		alloc->OpEnd(op);
+		// on the back edge the values stay in their registers, except the ones
+		// the next iteration would read back out of the context
+		if (opid + 1 == blk->oplist.size() && iter + 1 < iters)
+			alloc->OpEndLoop(op);
+		else
+			alloc->OpEnd(op);
+	}
 	}
 
 	for (int i = 0; i < sh4_reg_count; i++)
@@ -385,7 +560,8 @@ int main(int argc, char** argv)
 	for (int alias = 0; alias <= 1; alias++)
 	for (int reuse = 0; reuse <= 1; reuse++)
 	{
-		g_elided = g_movs = g_spills = 0;
+		g_elided = g_movs = g_spills = g_vecops = g_vecruns = 0;
+		g_loops = g_carried_wb = g_carried_pl = 0;
 		for (u32 pi = 0; pi < npools; pi++)
 		{
 			TestAlloc alloc;
@@ -404,9 +580,13 @@ int main(int argc, char** argv)
 				run_block(&alloc, &blk, pools[pi].ngpr, pools[pi].nfpr);
 			}
 		}
-		printf("alias=%d reuse=%d: OK  (movs %llu, elided %llu, spills %llu)\n",
+		printf("alias=%d reuse=%d: OK  (movs %llu, elided %llu, spills %llu, vec operands %llu, in one run %llu)\n",
 			alias, reuse, (unsigned long long)g_movs, (unsigned long long)g_elided,
-			(unsigned long long)g_spills);
+			(unsigned long long)g_spills, (unsigned long long)g_vecops,
+			(unsigned long long)g_vecruns);
+		printf("            %llu looping blocks: %llu writebacks + %llu preloads carried per iteration\n",
+			(unsigned long long)g_loops, (unsigned long long)g_carried_wb,
+			(unsigned long long)g_carried_pl);
 	}
 
 	printf("all passed\n");

@@ -84,9 +84,26 @@ void PromoteConstAddress(RuntimeBlockInfo* blk)
 	}
 }
 
-void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
+//The store queue is write only: whatever the writes before the pref look like,
+//a register that anything in the block loads through is not pointing at one,
+//and marking its writes would send them to the sq buffer instead of memory.
+bool sq_reg_is_read(RuntimeBlockInfo* blk, Sh4RegType rt)
+{
+	for (size_t i=0;i<blk->oplist.size();i++)
+	{
+		shil_opcode* op=&blk->oplist[i];
+
+		if (op->op==shop_readm && op->rs1.is_reg() && op->rs1._reg==rt)
+			return true;
+	}
+
+	return false;
+}
+
+bool sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 {
 	u32 data=0;
+	u32 unit=0;
 	for (int c=i-1;c>0;c--)
 	{
 		if (blk->oplist[c].op==shop_writem && blk->oplist[c].rs1._reg==rt)
@@ -94,6 +111,7 @@ void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 			if (blk->oplist[c].rs2.is_r32i() ||  blk->oplist[c].rs2.is_r32f() || blk->oplist[c].rs2.is_r64f() || blk->oplist[c].rs2.is_r32fv())
 			{
 				data+=blk->oplist[c].flags;
+				unit=blk->oplist[c].flags;
 				if (mark)
 					blk->oplist[c].flags2=0x1337;
 			}
@@ -101,7 +119,14 @@ void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 				break;
 		}
 
-		if (blk->oplist[c].op==shop_pref || (blk->oplist[c].rd.is_reg() && blk->oplist[c].rd._reg==rt && blk->oplist[c].op!= shop_sub))
+		//add rt <= rt, imm with imm == the store size is the post-increment between
+		//SQ stores (fmov @Rn; add #sz,Rn idiom) - base stays in the line, keep scanning
+		if (blk->oplist[c].op==shop_add && blk->oplist[c].rd.is_reg() && blk->oplist[c].rd._reg==rt &&
+			blk->oplist[c].rs1.is_reg() && blk->oplist[c].rs1._reg==rt &&
+			blk->oplist[c].rs2.is_imm() && unit!=0 && blk->oplist[c].rs2._imm==unit)
+		{
+		}
+		else if (blk->oplist[c].op==shop_pref || (blk->oplist[c].rd.is_reg() && blk->oplist[c].rd._reg==rt && blk->oplist[c].op!= shop_sub))
 		{
 			break;
 		}
@@ -110,27 +135,48 @@ void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 			break;
 	}
 
-	if (mark) return;
+	if (mark) return true;
 
 	if (data>=8)
 	{
 		blk->oplist[i].flags =0x1337;
 		sq_pref(blk,i,rt,true);
 		printf("SQW-WM match %d !\n",data);
+		return true;
 	}
 	else if (data)
 	{
 		printf("SQW-WM FAIL %d !\n",data);
+		return false;
 	}
+	return false;
 }
 
 void sq_pref(RuntimeBlockInfo* blk)
 {
+	bool optimized = false;
 	for (int i=0;i<blk->oplist.size();i++)
 	{
 		blk->oplist[i].flags2=0;
-		if (blk->oplist[i].op==shop_pref)
-			sq_pref(blk,i,blk->oplist[i].rs1._reg,false);
+		if (blk->oplist[i].op==shop_pref && !sq_reg_is_read(blk,blk->oplist[i].rs1._reg)) {
+			if (sq_pref(blk,i,blk->oplist[i].rs1._reg,false)) {
+				optimized = true;
+			}
+		}
+	}
+
+	if (optimized) {
+		// auto f = stdout;
+		// fprintf(f,"block: %p\n",blk);
+		// fprintf(f,"addr: %08X\n",blk->addr);
+		// fprintf(f,"il_opcodes: %zd\n",blk->oplist.size());
+
+
+		// for (u32 j=0;j<blk->oplist.size();j++)
+		// {
+		// 	shil_opcode* op=&blk->oplist[j];
+		// 	fprintf(f,"//il:%d:%d:%s\n",op->guest_offs,op->host_offs,op->dissasm().c_str());
+		// }
 	}
 }
 
@@ -1021,18 +1067,19 @@ void constprop(RuntimeBlockInfo* blk, bool allow_memory_baking=true)
 }
 
 //-----------------------------------------------------------------------------
-// fmov.s @Rn+ pair fusion
+// fmov.s / fmov.d @Rn+ pair fusion
 //
 // The decoder spells a two-float fetch as
 //     readm frA, [rn] (f32);  add rn, rn, #4;  readm frB, [rn] (f32)
 // Fuse it into one readm with rd2 set -- the backend reads [addr] into rd and
-// [addr+4] into rd2 off a single address computation -- followed by the add.
-// When the second load had its own +4 the two adds become adjacent and are
-// combined.
+// [addr+size] into rd2 off a single address computation -- followed by the add.
+// When the second load had its own increment the two adds become adjacent and
+// are combined. Doubles (fmov.d, +8) fuse the same way.
 //
-// Only the nvmem fastpath emits the paired form, and a paired load that
-// faults (mmio) cannot be rewritten into handler calls, so this never runs
-// without nvmem; fmov.s from mmio does not happen in practice.
+// Only the nvmem fastpath emits the paired form, so this never runs without
+// nvmem. A paired load that faults is still rewritable: the backend keeps the
+// two loads adjacent, and ngen_Rewrite moves the second one out to a fixup,
+// because the handler call it installs clobbers the base they share.
 //-----------------------------------------------------------------------------
 void fuse_readm_pairs(RuntimeBlockInfo* blk)
 {
@@ -1047,23 +1094,43 @@ void fuse_readm_pairs(RuntimeBlockInfo* blk)
 
 		if (r1.op!=shop_readm || ad.op!=shop_add || r2.op!=shop_readm)
 			continue;
-		if ((r1.flags&0x7F)!=4 || (r2.flags&0x7F)!=4)
+
+		u32 sz=r1.flags&0x7F;
+
+		if ((sz!=4 && sz!=8) || (r2.flags&0x7F)!=sz)
 			continue;
-		if (!r1.rd.is_r32f() || !r1.rd2.is_null() || !r2.rd.is_r32f() || !r2.rd2.is_null())
+
+		bool f64=sz==8;
+
+		if (f64)
+		{
+			if (!r1.rd.is_r64f() || !r2.rd.is_r64f())
+				continue;
+			//a pair that loads the same regs twice is not worth the bother
+			if (r1.rd._reg==r2.rd._reg)
+				continue;
+		}
+		else
+		{
+			if (!r1.rd.is_r32f() || !r2.rd.is_r32f())
+				continue;
+		}
+
+		if (!r1.rd2.is_null() || !r2.rd2.is_null())
 			continue;
 		if (!r1.rs1.is_r32i() || !r1.rs3.is_null() || !r2.rs3.is_null())
 			continue;
 		if (!r2.rs1.is_r32i() || r2.rs1._reg!=r1.rs1._reg)
 			continue;
-		//the middle op must be exactly rn += 4
+		//the middle op must be exactly rn += size
 		if (!(ad.rd.is_r32i() && ad.rd._reg==r1.rs1._reg &&
 		      ad.rs1.is_r32i() && ad.rs1._reg==r1.rs1._reg &&
-		      ad.rs2.is_imm() && ad.rs2._imm==4))
+		      ad.rs2.is_imm() && ad.rs2._imm==sz))
 			continue;
 
 		if (constprop_verbose)
-			printf("fusem %08X+%X: readm pair f%d,f%d @ r%d\n",blk->addr,r1.guest_offs,
-				r1.rd._reg-reg_fr_0,r2.rd._reg-reg_fr_0,r1.rs1._reg);
+			printf("fusem %08X+%X: readm %s pair f%d,f%d @ r%d\n",blk->addr,r1.guest_offs,
+				f64?"f64":"f32",r1.rd._reg-reg_fr_0,r2.rd._reg-reg_fr_0,r1.rs1._reg);
 
 		r1.rd2=r2.rd;
 		blk->oplist.erase(blk->oplist.begin()+i+2);
