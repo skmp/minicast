@@ -16,6 +16,9 @@
 #include "hw/sh4/sh4_mem.h"
 #include "blockmanager.h"
 
+
+#define printf_sqwm(...) 
+
 u32 RegisterWrite[sh4_reg_count];
 u32 RegisterRead[sh4_reg_count];
 
@@ -141,18 +144,18 @@ bool sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 	{
 		blk->oplist[i].flags =0x1337;
 		sq_pref(blk,i,rt,true);
-		printf("SQW-WM match %d !\n",data);
+		printf_sqwm("SQW-WM match %d !\n",data);
 		return true;
 	}
 	else if (data)
 	{
-		printf("SQW-WM FAIL %d !\n",data);
+		printf_sqwm("SQW-WM FAIL %d !\n",data);
 		return false;
 	}
 	return false;
 }
 
-void sq_pref(RuntimeBlockInfo* blk)
+bool sq_pref(RuntimeBlockInfo* blk)
 {
 	bool optimized = false;
 	for (int i=0;i<blk->oplist.size();i++)
@@ -177,7 +180,20 @@ void sq_pref(RuntimeBlockInfo* blk)
 		// 	shil_opcode* op=&blk->oplist[j];
 		// 	fprintf(f,"//il:%d:%d:%s\n",op->guest_offs,op->host_offs,op->dissasm().c_str());
 		// }
+		return true;
 	}
+	return false;
+}
+
+bool has_ftrv(RuntimeBlockInfo* blk)
+{
+	for (int i=0;i<blk->oplist.size();i++)
+	{
+		if (blk->oplist[i].op==shop_ftrv) {
+			return true;
+		}
+	}
+	return false;
 }
 
 //Read Groups
@@ -1635,6 +1651,310 @@ void srt_waw(RuntimeBlockInfo* blk)
 
 }
 
+/*
+	The statically-knowable successors of a block: BET_Cond_0/1 have both a
+	branch and a fallthrough target, BET_StaticJump only a branch target.
+	Anything else (dynamic jumps, rets, calls, intr) ends the walk on that
+	path - its successors are not knowable here.
+
+	The p-pointers are filled lazily at link time and severed on invalidation,
+	so an unlinked edge is resolved through bm_GetBlock() by address. Returns
+	false when a static successor exists but has no compiled block yet - the
+	graph is incomplete there and the caller should retry later.
+*/
+static bool anchor_succs(RuntimeBlockInfo* rbi, RuntimeBlockInfo* succ[2])
+{
+	succ[0] = succ[1] = nullptr;
+
+	if (rbi->BlockType != BET_Cond_0 && rbi->BlockType != BET_Cond_1 && rbi->BlockType != BET_StaticJump)
+		return true;
+
+	bool complete = true;
+
+	if (rbi->BranchBlock != 0xFFFFFFFF)
+	{
+		succ[0] = rbi->pBranchBlock ? rbi->pBranchBlock : bm_GetBlock(rbi->BranchBlock);
+		if (!succ[0])
+			complete = false;
+	}
+
+	if (rbi->BlockType != BET_StaticJump && rbi->NextBlock != 0xFFFFFFFF)
+	{
+		succ[1] = rbi->pNextBlock ? rbi->pNextBlock : bm_GetBlock(rbi->NextBlock);
+		if (!succ[1])
+			complete = false;
+	}
+
+	return complete;
+}
+
+/*
+	Multiblock-aware SQ store/pref marking, run over a detected loop's member
+	set before CompileLoop. The per-block matcher (sq_pref above) needs the
+	stores and the pref in one block and counts bytes; real loops split them
+	across members (the pref rides a branch delay slot in the successor
+	block) and overwrite bytes (pointer-as-PCW tricks make the naive byte sum
+	36 != 32), so it misses. Region-level the confidence test is stronger and
+	simpler, per base register used by a pref:
+	  - write-only within the region: nothing reads through the base (a
+	    store queue cannot be read back)
+	  - the base is only ever redefined by add/sub immediate (address
+	    arithmetic walking the SQ lines)
+	  - only plain 32/64-bit stores through it (the sq_both fast path exists
+	    only for those)
+	Every writem through such a base and every pref of it get marked; the
+	region emission then uses the inline sq_both forms - no runtime checks,
+	no per-block slowpath calls, no first-touch fault rewrites.
+
+	Same trust model as the per-block matcher, so the same gate:
+	opt_sqw_on_pref ("on write before pref, assume SQW"). Marks live in the
+	member oplists but only the region emission consumes them - the
+	fragments' code is already emitted, and a fragment recompile rebuilds
+	its oplist from scratch.
+*/
+void sq_pref_multiblock(std::map<u32, RuntimeBlockInfo*>& blocks)
+{
+	if (!settings.dynarec.opt_sqw_on_pref)
+		return;
+
+	//candidate bases: registers pref'd anywhere in the region
+	std::set<u32> cand;
+	for (auto& kv : blocks)
+		for (auto& op : kv.second->oplist)
+			if (op.op==shop_pref && op.rs1.is_r32i())
+				cand.insert((u32)op.rs1._reg);
+
+	for (auto rt : cand)
+	{
+		bool ok=true;
+		u32 stores=0;
+
+		for (auto& kv : blocks)
+		{
+			for (auto& op : kv.second->oplist)
+			{
+				if (op.op==shop_readm && op.rs1.is_reg() && (u32)op.rs1._reg==rt)
+				{
+					ok=false;	//read through the base: not a store queue
+					break;
+				}
+
+				if (op.op==shop_writem && op.rs1.is_reg() && (u32)op.rs1._reg==rt)
+				{
+					u32 sz=op.flags&0x7F;
+					bool grouped=(op.flags&0x80)!=0;
+					bool val_ok=op.rs2.is_r32i()||op.rs2.is_r32f()||op.rs2.is_r64f()||op.rs2.is_r32fv();
+
+					if (grouped || (sz!=4 && sz!=8) || !val_ok)
+					{
+						ok=false;	//no sq_both fast path for this store form
+						break;
+					}
+					stores++;
+					continue;
+				}
+
+				//any other redefinition of the base makes it unknowable
+				const shil_param* wr[2]={&op.rd,&op.rd2};
+				for (int w=0;w<2 && ok;w++)
+				{
+					if (!wr[w]->is_reg())
+						continue;
+					if (rt<(u32)wr[w]->_reg || rt>=(u32)wr[w]->_reg+wr[w]->count())
+						continue;
+
+					bool arith=(op.op==shop_add || op.op==shop_sub) &&
+						op.rs1.is_reg() && (u32)op.rs1._reg==rt && op.rs2.is_imm();
+					if (!arith)
+						ok=false;
+				}
+				if (!ok)
+					break;
+			}
+			if (!ok)
+				break;
+		}
+
+		if (!ok || !stores)
+			continue;
+
+		u32 marked=0;
+		for (auto& kv : blocks)
+		{
+			for (auto& op : kv.second->oplist)
+			{
+				if (op.op==shop_writem && op.rs1.is_reg() && (u32)op.rs1._reg==rt)
+				{
+					op.flags2=0x1337;
+					marked++;
+				}
+				if (op.op==shop_pref && op.rs1.is_r32i() && (u32)op.rs1._reg==rt)
+					op.flags=0x1337;
+			}
+		}
+
+		printf_sqwm("sq_pref_multiblock: base guest#%u, %u stores marked SQ\n", rt, marked);
+	}
+}
+
+/*
+	Region-growth probe: does any static path from 'start' lead to an edge
+	targeting 'header'? An installed region's exit target that can reach the
+	header again is a loop path that only got compiled after the region was
+	built (games routinely leave loop arms unexecuted until much later) - the
+	region should be discarded and regrown to include it.
+
+	Tests edge ADDRESSES against the header rather than blocks: the block at
+	the header is the opaque region itself, so the walk can never pass through
+	it - an edge pointing at it is what closes the cycle.
+*/
+bool anchor_reaches_header(u32 start, u32 header)
+{
+	RuntimeBlockInfo* first=bm_GetBlock(start);
+	if (!first)
+		return false;
+
+	std::set<RuntimeBlockInfo*> seen;
+	std::set<RuntimeBlockInfo*> todo;
+	todo.insert(first);
+
+	for (int i=0;i<32 && todo.size();i++)
+	{
+		auto rbi=*todo.begin();
+		todo.erase(todo.begin());
+		seen.insert(rbi);
+
+		if (rbi->BlockType==BET_Cond_0 || rbi->BlockType==BET_Cond_1 || rbi->BlockType==BET_StaticJump)
+		{
+			if (rbi->BranchBlock==header)
+				return true;
+			if (rbi->BlockType!=BET_StaticJump && rbi->NextBlock==header)
+				return true;
+		}
+
+		RuntimeBlockInfo* succ[2];
+		anchor_succs(rbi,succ);
+
+		for (auto s : succ)
+			if (s && !seen.count(s))
+				todo.insert(s);
+	}
+
+	return false;
+}
+
+bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInfo*>* loop_out) {
+	// find loop
+
+	std::set<RuntimeBlockInfo*> loop_rbis;
+	std::set<RuntimeBlockInfo*> todo_rbis;
+
+	todo_rbis.insert(anchor_rbi);
+
+	bool partial = false;
+
+	for (int i = 0; i < 32 && todo_rbis.size(); i++) {
+		auto rbi = *todo_rbis.begin();
+		todo_rbis.erase(todo_rbis.begin());
+		loop_rbis.insert(rbi);
+
+		RuntimeBlockInfo* succ[2];
+		if (!anchor_succs(rbi, succ))
+			partial = true;		//edge to a not-yet-compiled block
+
+		for (auto s : succ)
+			if (s && !loop_rbis.count(s))
+				todo_rbis.insert(s);
+	}
+
+	if (!todo_rbis.empty())
+		partial = true;			//32-block budget ran out before the walk settled
+
+	// Find if looping here (anchor block -> via branches can loop back to anchor block)
+	// The anchor is on a loop iff it reaches itself via >=1 static edge.
+	// Everything explored is reachable FROM the anchor; compute which blocks
+	// reach it BACK (reverse fixpoint over the small explored set) - that
+	// intersection is exactly the cycle.
+	std::set<RuntimeBlockInfo*> reaches_anchor;
+
+	for (bool changed = true; changed; )
+	{
+		changed = false;
+		for (auto rbi : loop_rbis)
+		{
+			if (reaches_anchor.count(rbi))
+				continue;
+
+			RuntimeBlockInfo* succ[2];
+			anchor_succs(rbi, succ);
+
+			for (auto s : succ)
+			{
+				if (s && (s == anchor_rbi || reaches_anchor.count(s)))
+				{
+					reaches_anchor.insert(rbi);
+					changed = true;
+					break;
+				}
+			}
+		}
+	}
+
+	if (reaches_anchor.count(anchor_rbi))
+	{
+		// if looping, find loop header: loops are laid out contiguously, so
+		// the header (entry) is the lowest guest address on the cycle
+		u32 header = 0xFFFFFFFF;
+		u32 members = 0;
+
+		for (auto rbi : loop_rbis)
+		{
+			if (rbi != anchor_rbi && !reaches_anchor.count(rbi))
+				continue;		//explored but off-cycle (side path / exit)
+
+			if (rbi->addr < header)
+				header = rbi->addr;
+			members++;
+
+			if (loop_out)
+				(*loop_out)[rbi->addr] = rbi;
+		}
+
+		// printf("FOUND loop: anchor %08X header %08X, %u cycle blocks / %zu explored%s\n",
+		// 	anchor_rbi->addr, header, members, loop_rbis.size(),
+		// 	partial ? " (graph partial)" : "");
+
+		// std::map<u32, RuntimeBlockInfo*> loop_print;
+		// for (auto rbi : loop_rbis) {
+		// 	loop_print.emplace(rbi->addr, rbi);
+		// }
+
+		// for (auto addr_rbi: loop_print) {
+		// 	auto blk = addr_rbi.second;
+		// 	auto f = stdout;
+		// 	fprintf(f,"addr: %08X\n",blk->addr);
+		// 	for (u32 j=0;j<blk->oplist.size();j++)
+		// 	{
+		// 		shil_opcode* op=&blk->oplist[j];
+		// 		fprintf(f," %s (%x)\n",op->dissasm().c_str(), op->flags2);
+		// 	}
+
+		// 	fprintf(f,"branch addr: %08X\n",blk->BranchBlock);
+		// 	fprintf(f,"next addr: %08X\n",blk->NextBlock);
+		// }
+		return true;
+	}
+
+	// if not looping, if partial return false (the loop may just not be
+	// compiled/linked yet - retry later), else return true to not further
+	// optimize the block
+	return !partial;
+}
+
+typedef set<RuntimeBlockInfo*> bm_List;
+
+extern bm_List anchor_blocks;
+
 //Simplistic Write after Write without read pass to remove (a few) dead opcodes
 //Seems to be working
 void AnalyseBlock(RuntimeBlockInfo* blk)
@@ -1708,9 +2028,12 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 	}
 #endif
 
+	bool anchor = false;
 	if (settings.dynarec.opt_sqw_on_pref) {
-		sq_pref(blk);
+		anchor |= sq_pref(blk);
 	}
+
+	anchor |= has_ftrv(blk);
 	
 	bool last_op_sets_flags=!blk->has_jcond && blk->oplist.size() > 0 && 
 		blk->oplist[blk->oplist.size()-1].rd._reg==reg_sr_T;
@@ -1732,6 +2055,9 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 	//read_v4m3z1(blk);
 	//rw_related(blk);
 
+	if (anchor && settings.dynarec.opt_anchored_loops) {
+		anchor_blocks.insert(blk);
+	}
 	return;	//disbled to be on the safe side ..
     /*
 	memset(RegisterWrite,-1,sizeof(RegisterWrite));

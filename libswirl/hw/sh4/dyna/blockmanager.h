@@ -124,6 +124,22 @@ void bm_Periodical_1s();
 void bm_Periodical_14k();
 void bm_Sort();
 
+//Loop-idiom detection (shil.cpp): walk static edges from the anchor and look
+//for a cycle back through it. true = settled (loop found and reported, or
+//provably no loop); false = graph incomplete, retry once more code compiled.
+//On a find, loop_out (if given) receives the cycle members keyed by guest
+//address - the lowest address is the header - ready for ngen->CompileLoop().
+bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInfo*>* loop_out = nullptr);
+
+//Region-growth probe (shil.cpp): true when a static path from 'start' reaches
+//an edge targeting 'header' - i.e. a later-compiled loop arm closed the cycle
+//and the region at 'header' should be regrown.
+bool anchor_reaches_header(u32 start, u32 header);
+
+//Multiblock SQ store/pref marking over a loop's member set (shil.cpp); call
+//before ngen->CompileLoop(). Gated on opt_sqw_on_pref.
+void sq_pref_multiblock(std::map<u32, RuntimeBlockInfo*>& blocks);
+
 void bm_Init();
 void bm_Term();
 

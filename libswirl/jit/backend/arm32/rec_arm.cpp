@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include "types.h"
 
+#define printf_loop(...) // printf(__VA_ARGS__)
+
 #if FEAT_SHREC == DYNAREC_JIT
 #include "hw/sh4/sh4_opcode_list.h"
 
@@ -16,6 +18,7 @@
 #include "hw/sh4/sh4_interrupts.h"
 #include "hw/sh4/sh4_core.h"
 #include "hw/sh4/dyna/ngen.h"
+#include "hw/sh4/dyna/perf_map.h"
 #include "hw/sh4/sh4_mem.h"
 
 #include "ngen_arm.h"
@@ -494,6 +497,53 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 
 arm_reg_alloc reg;
 
+//--- loop overlay state (CompileLoop): the cross-block resident registers and
+//their hosts, mirrored from reg's overlay tables for emission. loop_emitting
+//gates the spill/restore brackets that the CC (canonical op) hooks emit.
+static vector<std::pair<u32,eReg> > loop_ov_gpr;
+static vector<std::pair<u32,eFSReg> > loop_ov_fpu;
+static bool loop_emitting=false;
+
+static bool op_writes_greg(shil_opcode* op, u32 greg)
+{
+	const shil_param* wr[2]={&op->rd,&op->rd2};
+
+	for (int i=0;i<2;i++)
+		if (wr[i]->is_reg() && greg>=wr[i]->_reg && greg<wr[i]->_reg+wr[i]->count())
+			return true;
+
+	return false;
+}
+
+//commit the overlaid set to the context (before anything that reads guest
+//state through the context: canonical ptr args, ifb, the exit epilogue)
+static void emit_overlay_spill()
+{
+	for (size_t i=0;i<loop_ov_gpr.size();i++)
+		reg.Writeback(loop_ov_gpr[i].first,loop_ov_gpr[i].second);
+	for (size_t i=0;i<loop_ov_fpu.size();i++)
+		reg.Writeback_FPU(loop_ov_fpu[i].first,loop_ov_fpu[i].second);
+}
+
+//reload the overlaid set from the context. op!=null: a canonical op just ran
+//and its dests hold fresh results in their mapped (overlay) hosts - skip them
+//so the reload does not clobber them with the stale context copies. op==null:
+//the context is authoritative (region preamble, or an ifb-class op ran).
+static void emit_overlay_fill(shil_opcode* op)
+{
+	for (size_t i=0;i<loop_ov_gpr.size();i++)
+	{
+		if (op && op_writes_greg(op,loop_ov_gpr[i].first))
+			continue;
+		reg.Preload(loop_ov_gpr[i].first,loop_ov_gpr[i].second);
+	}
+	for (size_t i=0;i<loop_ov_fpu.size();i++)
+	{
+		if (op && op_writes_greg(op,loop_ov_fpu[i].first))
+			continue;
+		reg.Preload_FPU(loop_ov_fpu[i].first,loop_ov_fpu[i].second);
+	}
+}
 
 u32 blockno=0;
 
@@ -2773,6 +2823,555 @@ struct Arm32NGenBackend: NGenBackend
 	//	emit_WriteCodeCache();
 	}
 
+	//--- loop (multi-block region) compilation -------------------------------
+	//
+	//v1: each member keeps its own per-block register allocation, so the
+	//context is fully coherent at every member boundary - that is what makes
+	//plain internal branches sound with the linear span model. Cross-member
+	//carrying is the next layer and slots in at exactly these boundaries.
+
+	struct loop_edge_fixup
+	{
+		u32* slot;          //placeholder branch instruction to patch
+		u32 target;         //guest address of the (forward) member target
+		ConditionCode cc;
+	};
+
+	//FPCA-indexed dispatch on r4: same convention as the dynamic block ends.
+	//The region's exits all funnel through one shared epilogue (overlay
+	//writebacks + this jump); each exit records its branch slot here and gets
+	//patched once the epilogue's address is known.
+	std::vector<u32*> loop_exit_jumps;
+
+	void emit_fpca_jump()
+	{
+		SUB(r2, r8, -FPCB_OFFSET);
+#if RAM_SIZE_MAX == 33554432
+		UBFX(r1, r4, 1, 24);
+#else
+		UBFX(r1, r4, 1, 23);
+#endif
+		LDR(r15,r2,r1,Offset,true,S_LSL,2);
+	}
+
+	//one control edge out of a member: direct branch when the target is a
+	//member (fixup when not yet emitted), FPCA dispatch stub when it leaves
+	//the region. fallthrough_addr is the member emitted right after.
+	void emit_loop_edge(u32 target, ConditionCode cc,
+		std::map<u32, RuntimeBlockInfo*>& blocks, std::map<u32, u32>& mpos,
+		std::vector<loop_edge_fixup>& fixups, u32 fallthrough_addr)
+	{
+		if (blocks.count(target))
+		{
+			if (cc==CC_AL && target==fallthrough_addr)
+				return;
+
+			auto it=mpos.find(target);
+			if (it!=mpos.end())
+			{
+				JUMP(it->second,cc);
+			}
+			else
+			{
+				fixups.push_back({(u32*)EMIT_GET_PTR(),target,cc});
+				NOP();
+			}
+			return;
+		}
+
+		//exit: set the target pc and funnel through the shared epilogue; for a
+		//conditional edge, branch around the stub on the inverse condition
+		u32* skip=0;
+		if (cc!=CC_AL)
+		{
+			skip=(u32*)EMIT_GET_PTR();
+			NOP();
+		}
+
+		MOV32(r4,target);
+		loop_exit_jumps.push_back((u32*)EMIT_GET_PTR());
+		NOP();	//patched to jump to the epilogue
+
+		if (skip)
+		{
+			u32 after=(u32)EMIT_GET_PTR();
+			verify(emit_ptr==0);
+			emit_ptr=skip;
+			JUMP(after,(ConditionCode)(cc^1));
+			verify(emit_ptr==skip+1);
+			emit_ptr=0;
+		}
+	}
+
+	//member terminal: mirrors DynaRBI::Relink's condition selection, in the
+	//same post-writeback state (str/vstr/movw do not touch the flags)
+	void emit_loop_terminal(RuntimeBlockInfo* m,
+		std::map<u32, RuntimeBlockInfo*>& blocks, std::map<u32, u32>& mpos,
+		std::vector<loop_edge_fixup>& fixups, u32 fallthrough_addr)
+	{
+		if (m->BlockType==BET_StaticJump)
+		{
+			emit_loop_edge(m->BranchBlock,CC_AL,blocks,mpos,fixups,fallthrough_addr);
+			return;
+		}
+
+		verify(m->BlockType==BET_Cond_0 || m->BlockType==BET_Cond_1);
+
+		shil_opcode* last = m->oplist.size() ? &m->oplist[m->oplist.size()-1] : 0;
+		bool flags = !m->has_jcond && last && last->rd._reg==reg_sr_T && ccmap.count(last->op);
+
+		ConditionCode CC;
+		if (flags)
+		{
+			CC = (m->BlockType&1)==1 ? ccmap[last->op] : ccnmap[last->op];
+		}
+		else
+		{
+			eReg tr=r4;
+
+			if (m->has_jcond)
+				;	//the jcond op staged the condition in r4
+			else if (reg.IsOverlaidg(reg_sr_T))
+				tr=reg.mapg(reg_sr_T);
+			else
+				LoadSh4Reg_mem(r4,reg_sr_T);
+
+			CMP(tr,(m->BlockType&1));
+			CC = CC_EQ;
+		}
+
+		emit_loop_edge(m->BranchBlock,CC,blocks,mpos,fixups,fallthrough_addr);
+		emit_loop_edge(m->NextBlock,CC_AL,blocks,mpos,fixups,fallthrough_addr);
+	}
+
+	void CompileLoop(std::map<u32, RuntimeBlockInfo*>& blocks)
+	{
+		verify(blocks.size());
+
+		//space check: a member compiles to roughly its fragment size; skip
+		//quietly when the cache is tight rather than risking the tail
+		if (emit_FreeSpace()<128*1024)
+			return;
+
+		RuntimeBlockInfo* head=blocks.begin()->second;
+
+		u32 span_end=0;
+		u32 guest_ops=0;
+		u32 guest_cyc=0;
+		for (auto& kv : blocks)
+		{
+			RuntimeBlockInfo* m=kv.second;
+			verify(kv.first==m->addr);
+			//the detector only walks static edges, so members can only end
+			//in these; anything else here is a caller bug
+			verify(m->BlockType==BET_Cond_0 || m->BlockType==BET_Cond_1 || m->BlockType==BET_StaticJump);
+			if (m->addr+m->sh4_code_size>span_end)
+				span_end=m->addr+m->sh4_code_size;
+			guest_ops+=m->guest_opcodes;
+			guest_cyc+=m->guest_cycles;
+		}
+
+		DynaRBI* loop=(DynaRBI*)AllocateBlock();
+
+		//no Setup(): that would re-decode. Fill what the blockmanager and the
+		//discard/lookup paths read.
+		loop->addr=head->addr;
+		loop->lookups=0;
+		loop->host_code_size=0;
+		loop->sh4_code_size=span_end-head->addr;
+		loop->runs=0;
+		loop->staging_runs=0;
+		loop->fpu_cfg=head->fpu_cfg;
+		loop->guest_cycles=guest_cyc;
+		loop->guest_opcodes=guest_ops;
+		loop->host_opcodes=0;
+		//opaque end: no static links out (exits dispatch via FPCA), and the
+		//loop detector will not chase through it
+		loop->BlockType=BET_DynamicJump;
+		loop->BranchBlock=0xFFFFFFFF;
+		loop->NextBlock=0xFFFFFFFF;
+		loop->pBranchBlock=0;
+		loop->pNextBlock=0;
+		loop->relink_data=0;
+		loop->csc_RetCache=0;
+		loop->has_jcond=false;
+		loop->static_from_constprop=false;
+		loop->host_preload0=0;
+		loop->host_preload0_end=0;
+		loop->memops=0;
+		loop->linkedmemops=0;
+
+		//--- overlay selection: which guest registers live in fixed host
+		//registers across the whole region -------------------------------
+		//
+		//census: per-register access counts. Elements of multi-reg params the
+		//allocator does NOT explode are context-accessed by their emitters
+		//(reg_aofs paths) and must never be overlaid.
+		u32 gcnt[sh4_reg_count];
+		u32 fcnt[16];
+		bool fforbid[16];
+		memset(gcnt,0,sizeof(gcnt));
+		memset(fcnt,0,sizeof(fcnt));
+		memset(fforbid,0,sizeof(fforbid));
+
+		for (auto& kv : blocks)
+		{
+			RuntimeBlockInfo* m=kv.second;
+			for (size_t i=0;i<m->oplist.size();i++)
+			{
+				shil_opcode* op=&m->oplist[i];
+				const shil_param* prms[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+				for (int pi=0;pi<5;pi++)
+				{
+					const shil_param& p=*prms[pi];
+					if (!p.is_reg())
+						continue;
+
+					if (p.count()==1)
+					{
+						if (p.is_r32i())
+						{
+							if (p._reg<sh4_reg_count)
+								gcnt[p._reg]++;
+						}
+						else if (p._reg>=reg_fr_0 && p._reg<=reg_fr_15)
+							fcnt[p._reg-reg_fr_0]++;
+					}
+					else
+					{
+						//mirror arm_reg_alloc::ExplodeVec
+						bool explode=false;
+						if (p.count()==4 && (op->op==shop_ftrv || op->op==shop_fipr))
+							explode=true;
+						if (p.is_r64f() &&
+							(op->op==shop_mov64 || op->op==shop_readm || op->op==shop_writem || op->op==shop_fsca))
+							explode=true;
+
+						for (u32 e=0;e<p.count();e++)
+						{
+							u32 fr_elem=p._reg+e;
+							if (fr_elem>=reg_fr_0 && fr_elem<=reg_fr_15)
+							{
+								if (explode)
+									fcnt[fr_elem-reg_fr_0]++;
+								else
+									fforbid[fr_elem-reg_fr_0]=true;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		//candidates: plain gprs + sr.T. Other i32 regs (fpul etc) stay off
+		//until their emitter paths are audited for direct context writes.
+		struct ov_cand { u32 key; u32 score; };
+		std::vector<ov_cand> gcand;
+		for (int i=0;i<16;i++)
+			if (gcnt[reg_r0+i])
+				gcand.push_back({(u32)(reg_r0+i),gcnt[reg_r0+i]});
+		if (gcnt[reg_sr_T])
+			gcand.push_back({(u32)reg_sr_T,gcnt[reg_sr_T]});
+
+		//fpu: pair-aligned (even guest pair -> even host pair) so 64-bit
+		//moves keep a valid d-reg view of overlaid halves
+		std::vector<ov_cand> fcand;
+		for (u32 i=0;i<16;i+=2)
+			if ((fcnt[i]+fcnt[i+1]) && !fforbid[i] && !fforbid[i+1])
+				fcand.push_back({i,fcnt[i]+fcnt[i+1]});
+
+		auto by_score=[](const ov_cand& a,const ov_cand& b){ return a.score>b.score; };
+		std::sort(gcand.begin(),gcand.end(),by_score);
+		std::sort(fcand.begin(),fcand.end(),by_score);
+
+		//iterative fit: every op must still find span-pool room for all its
+		//non-overlaid operands (the emitters have no memory fallback)
+		u32 n_ov_g=(u32)std::min<size_t>(3,gcand.size());
+		u32 n_ov_f=(u32)std::min<size_t>(4,fcand.size());	//pairs
+
+		auto is_ov_g=[&](u32 greg)->bool
+		{
+			for (u32 i=0;i<n_ov_g;i++)
+				if (gcand[i].key==greg) return true;
+			return false;
+		};
+		auto is_ov_f=[&](u32 fidx)->bool
+		{
+			for (u32 i=0;i<n_ov_f;i++)
+				if (fidx==fcand[i].key || fidx==fcand[i].key+1) return true;
+			return false;
+		};
+
+		for (bool retry=true; retry; )
+		{
+			retry=false;
+
+			for (auto& kv : blocks)
+			{
+				RuntimeBlockInfo* m=kv.second;
+
+				bool m_vec=false;
+				for (size_t i=0;i<m->oplist.size();i++)
+					if (m->oplist[i].op==shop_ftrv || m->oplist[i].op==shop_fipr)
+						{ m_vec=true; break; }
+
+				u32 gpool=5-n_ov_g;
+				u32 fpool=(m_vec?12:16)-n_ov_f*2;
+
+				for (size_t i=0;i<m->oplist.size() && !retry;i++)
+				{
+					shil_opcode* op=&m->oplist[i];
+					const shil_param* prms[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+					u32 gdem=0,fdem=0;
+					u32 gseen[8],fseen[16];
+
+					for (int pi=0;pi<5;pi++)
+					{
+						const shil_param& p=*prms[pi];
+						if (!p.is_reg())
+							continue;
+
+						if (p.count()==1 && p.is_r32i())
+						{
+							if (is_ov_g(p._reg)) continue;
+							bool dup=false;
+							for (u32 si=0;si<gdem;si++) if (gseen[si]==(u32)p._reg) dup=true;
+							if (!dup && gdem<8) gseen[gdem++]=p._reg;
+						}
+						else
+						{
+							bool explode = (p.count()==1) ||
+								(p.count()==4 && (op->op==shop_ftrv || op->op==shop_fipr)) ||
+								(p.is_r64f() && (op->op==shop_mov64 || op->op==shop_readm || op->op==shop_writem || op->op==shop_fsca));
+							if (!explode)
+								continue;	//context-accessed, no pool use
+
+							for (u32 e=0;e<p.count();e++)
+							{
+								u32 fr_elem=p._reg+e;
+								if (fr_elem<reg_fr_0 || fr_elem>reg_fr_15) continue;
+								if (is_ov_f(fr_elem-reg_fr_0)) continue;
+								bool dup=false;
+								for (u32 si=0;si<fdem;si++) if (fseen[si]==fr_elem) dup=true;
+								if (!dup && fdem<16) fseen[fdem++]=fr_elem;
+							}
+						}
+					}
+
+					if (gdem>gpool && n_ov_g>0) { n_ov_g--; retry=true; }
+					if (fdem>fpool && n_ov_f>0) { n_ov_f--; retry=true; }
+				}
+
+				if (retry) break;
+			}
+		}
+
+		//apply the selection: gpr hosts from the tail of the pool (spans keep
+		//the head), fpu host pairs from the head (spans keep a contiguous,
+		//pair-aligned tail)
+		reg.OverlayClear();
+		loop_ov_gpr.clear();
+		loop_ov_fpu.clear();
+
+		static const eReg g_hosts[3]={r11,r10,r7};
+		for (u32 i=0;i<n_ov_g;i++)
+		{
+			reg.OverlaySetg((Sh4RegType)gcand[i].key,g_hosts[i]);
+			loop_ov_gpr.push_back(std::make_pair(gcand[i].key,g_hosts[i]));
+		}
+
+		for (u32 i=0;i<n_ov_f;i++)
+		{
+			eFSReg lo=(eFSReg)(f16+i*2);
+			reg.OverlaySetf((Sh4RegType)(reg_fr_0+fcand[i].key),lo);
+			reg.OverlaySetf((Sh4RegType)(reg_fr_0+fcand[i].key+1),(eFSReg)(lo+1));
+			loop_ov_fpu.push_back(std::make_pair((u32)(reg_fr_0+fcand[i].key),lo));
+			loop_ov_fpu.push_back(std::make_pair((u32)(reg_fr_0+fcand[i].key+1),(eFSReg)(lo+1)));
+		}
+
+		//reduced pools for the per-member span allocation
+		eReg loop_regs[6];
+		{
+			u32 n=0;
+			for (const eReg* p=alloc_regs;*p!=(eReg)-1;p++)
+			{
+				bool used=false;
+				for (u32 i=0;i<n_ov_g;i++)
+					if (g_hosts[i]==*p) used=true;
+				if (!used)
+					loop_regs[n++]=*p;
+			}
+			loop_regs[n]=(eReg)-1;
+		}
+
+		eFSReg loop_fpu[17];
+		eFSReg loop_fpu_temps[13];
+		{
+			u32 n=0;
+			for (const eFSReg* p=alloc_fpu;*p!=(eFSReg)-1;p++)
+				if (*p>=(eFSReg)(f16+n_ov_f*2))
+					loop_fpu[n++]=*p;
+			loop_fpu[n]=(eFSReg)-1;
+
+			n=0;
+			for (const eFSReg* p=alloc_fpu_temps;*p!=(eFSReg)-1;p++)
+				if (*p>=(eFSReg)(f16+n_ov_f*2))
+					loop_fpu_temps[n++]=*p;
+			loop_fpu_temps[n]=(eFSReg)-1;
+		}
+
+		loop_exit_jumps.clear();
+		loop_emitting=true;
+
+		loop->code=(DynarecCodeEntryPtr)EMIT_GET_PTR();
+		u8* blk_start=(u8*)EMIT_GET_PTR();
+
+		//preamble: bring the overlaid set into its hosts. Entry is only ever
+		//through the head (FPCA); the back edge re-enters below this point.
+		emit_overlay_fill(nullptr);
+
+		std::map<u32, u32> mpos;                //member addr -> emitted host addr
+		std::vector<loop_edge_fixup> fixups;    //forward branches to patch
+
+		for (auto it=blocks.begin(); it!=blocks.end(); it++)
+		{
+			RuntimeBlockInfo* m=it->second;
+
+			auto next_it=std::next(it);
+			u32 fallthrough_addr = next_it!=blocks.end() ? next_it->first : 1;
+
+			mpos[m->addr]=(u32)EMIT_GET_PTR();
+
+			//count cycles, never poll (design: these loops are not spin
+			//loops; the debt settles at the first normal block after exit)
+			u32 cyc=m->guest_cycles;
+			if (!is_i8r4(cyc))
+				cyc&=~3;
+			if (cyc)
+			{
+#if HOST_OS == OS_DARWIN
+				SUB(r11,r11,cyc,false,CC_AL);
+#else
+				SUB(rfp_r9,rfp_r9,cyc,false,CC_AL);
+#endif
+			}
+
+			if (m->oplist.size())
+			{
+				fpu_temps_avail=false;
+				for (size_t i=0;i<m->oplist.size();i++)
+				{
+					if (m->oplist[i].op==shop_ftrv || m->oplist[i].op==shop_fipr)
+					{
+						fpu_temps_avail=true;
+						break;
+					}
+				}
+				xmtrx_resident=false;
+
+				reg.block_loops=false;
+				reg.DoAlloc(m,loop_regs,fpu_temps_avail?loop_fpu_temps:loop_fpu);
+				reg.OpBegin(&m->oplist[0],0);
+
+				for (size_t i=0;i<m->oplist.size();i++)
+				{
+					shil_opcode* op=&m->oplist[i];
+
+					if (i!=0)
+						reg.OpBegin(op,i);
+
+					//ifb-class ops run guest state through the context; the
+					//overlaid set spills before and refreshes after (canonical
+					//ops get the same bracket via the CC_Start/CC_Finish hooks)
+					bool sync_op = op->op==shop_ifb || op->op==shop_sync_sr || op->op==shop_sync_fpscr;
+					if (sync_op)
+						emit_overlay_spill();
+
+					ngen_compile_opcode(m,op,false,true);
+
+					if (sync_op)
+						emit_overlay_fill(nullptr);
+
+					if (xmtrx_resident && op_kills_xmtrx(op))
+						xmtrx_resident=false;
+
+					reg.OpEnd(op);
+				}
+			}
+
+			emit_loop_terminal(m,blocks,mpos,fixups,fallthrough_addr);
+		}
+
+		//patch the forward internal branches
+		for (auto& f : fixups)
+		{
+			auto it=mpos.find(f.target);
+			verify(it!=mpos.end());
+
+			verify(emit_ptr==0);
+			emit_ptr=f.slot;
+			JUMP(it->second,f.cc);
+			verify(emit_ptr==f.slot+1);
+			emit_ptr=0;
+		}
+
+		//shared exit epilogue: commit the overlaid set, then dispatch on r4
+		u32 epi=(u32)EMIT_GET_PTR();
+		emit_overlay_spill();
+		emit_fpca_jump();
+
+		for (auto slot : loop_exit_jumps)
+		{
+			verify(emit_ptr==0);
+			emit_ptr=slot;
+			JUMP(epi);
+			verify(emit_ptr==slot+1);
+			emit_ptr=0;
+		}
+		loop_exit_jumps.clear();
+
+		//point the never-used relink area at a pad inside the block, so a
+		//stray Relink() cannot write over the next block in the cache
+		loop->relink_offset=(u8*)EMIT_GET_PTR()-(u8*)loop->code;
+		for (int i=0;i<8;i++)
+			NOP();
+
+		u8* pEnd=(u8*)EMIT_GET_PTR();
+		CacheFlush((void*)loop->code,pEnd);
+
+		loop->host_opcodes=(pEnd-blk_start)/4;
+		loop->host_code_size=pEnd-(u8*)loop->code;
+
+		//install: retire the head fragment first (severs its incoming links;
+		//they re-link through the dispatcher and land on the loop), then
+		//claim the head address. Members other than the head stay alive for
+		//side entries.
+		bm_DiscardBlock(head);
+
+		perf_map_AddBlock((void*)CC_RW2RX(loop->code), loop->host_code_size, loop->addr, loop->sh4_code_size);
+
+		bool doLock = !bm_RamPageHasData(loop->addr, loop->sh4_code_size);
+		bm_AddBlock(loop, doLock);
+
+		printf_loop("CompileLoop: %08X..%08X, %zu members, %d bytes host code, overlay %u gpr + %u fpu\n",
+			loop->addr, span_end, blocks.size(), loop->host_code_size,
+			n_ov_g, n_ov_f*2);
+		for (u32 i=0;i<n_ov_g;i++)
+			printf_loop("  ov gpr guest#%d (%u uses) -> host r%d\n", gcand[i].key, gcand[i].score, (int)g_hosts[i]);
+		for (u32 i=0;i<n_ov_f;i++)
+			printf_loop("  ov fpu fr%d/fr%d (%u uses) -> host s%d/s%d\n",
+				fcand[i].key, fcand[i].key+1, fcand[i].score, (int)(f16+i*2), (int)(f16+i*2+1));
+
+		//the overlay only applies inside this region; normal Compile() must
+		//never see it
+		loop_emitting=false;
+		reg.OverlayClear();
+		loop_ov_gpr.clear();
+		loop_ov_fpu.clear();
+	}
+
 	void OnResetBlocks()
 	{
 		printf("@@\tngen_ResetBlocks()\n");
@@ -3042,9 +3641,14 @@ struct Arm32NGenBackend: NGenBackend
 		return true;
 	}
 
-	void CC_Start(shil_opcode* op) 
-	{ 
+	void CC_Start(shil_opcode* op)
+	{
 		CC_pars.clear();
+
+		//in a loop region, a canonical op may reach guest registers through
+		//the context (ptr args); commit the overlaid set first
+		if (loop_emitting)
+			emit_overlay_spill();
 	}
 	void CC_Param(shil_opcode* op,shil_param* par,CanonicalParamType tp) 
 	{ 
@@ -3165,9 +3769,15 @@ struct Arm32NGenBackend: NGenBackend
 		CALL((u32)function);
 	}
 
-	void CC_Finish(shil_opcode* op) 
-	{ 
-		CC_pars.clear(); 
+	void CC_Finish(shil_opcode* op)
+	{
+		CC_pars.clear();
+
+		//the op may have written guest registers through the context; refresh
+		//the overlaid set (minus the op's own dests, which are freshest in
+		//their mapped hosts)
+		if (loop_emitting)
+			emit_overlay_fill(op);
 	}
 };
 
