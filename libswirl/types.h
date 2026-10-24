@@ -539,6 +539,7 @@ struct settings_t
 		u32 ClockSel;
 		bool AutoReset;
 		bool DumpOnLockup;
+		bool ShowStats;     // stats bar in the top border band
 	} polly2;
 
 	struct {

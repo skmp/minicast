@@ -18,6 +18,9 @@
 	Drawn with a built-in 8x8 font (5x7 glyphs); the 2x band doubling makes
 	it 16x16 on screen. This TU maps its own polly2 MMIO view (polly2_mmio
 	is per-TU static, same pattern as AudioStream_Mister).
+
+	polly2.ShowStats = no hides the bar: the band is switched off and
+	nothing is drawn (screenshots get a black top band).
 */
 #include "types.h"
 #include "mister_support.h"
@@ -238,7 +241,7 @@ void ReportRendererStats(double wait_ms, u32 cycles)
 //     640x30 RGB565 band fb (same clear + draw_text as UpdateStatsOSD, from
 //     the current stats window - nothing is read back from DDR), then
 //     MSB-replicated 565->888, 1:1. Always present, even when the on-screen
-//     band is disabled.
+//     band is disabled; black when polly2.ShowStats is off.
 //   * game window (lines  30..509): the 640x480 FB_R_SOF1 framebuffer
 //     through the split-VRAM layout (FB 32-bit word W -> DDR byte
 //     W*8 + SOF1[22]*4), all four FB_R_CTRL fb_depth formats with
@@ -347,12 +350,14 @@ static void spg_screenshot(const u8* vram)
 	 * they are always part of the screenshot even with the on-screen band
 	 * disabled. Top = the stats OSD (same clear + draw_text as
 	 * UpdateStatsOSD, from the current stats window - which is NOT reset
-	 * here); bottom = black for now, its renderer lands soon. */
+	 * here), black with polly2.ShowStats off; bottom = black for now, its
+	 * renderer lands soon. */
 	static u16 top_band[POLLY2_BAND_W * POLLY2_BAND_H];
 	static u16 bot_band[POLLY2_BAND_W * POLLY2_BAND_H];
 	memset(top_band, 0, sizeof top_band);
 	memset(bot_band, 0, sizeof bot_band);
-	if (polly2_mmio || polly2_mmio_init() == 0) {   /* clock_hz needs MMIO */
+	if (settings.polly2.ShowStats &&
+	    (polly2_mmio || polly2_mmio_init() == 0)) {   /* clock_hz needs MMIO */
 		char line[POLLY2_BAND_W / 8 + 1];
 		format_stats_line(line, sizeof line);
 		draw_text(top_band, 2, 11, line, 0xFFFF);
@@ -415,8 +420,23 @@ void ScreenshotVBlank(const u8* vram)
 		spg_screenshot(vram);
 }
 
+/* polly2.ShowStats = no: turn the band off once (FB_TOP may still point at
+ * the band FB from an earlier run on the same bitstream) and draw nothing */
+static void osd_hide()
+{
+	static bool done;
+	if (done) return;
+	done = true;
+	if ((polly2_mmio || polly2_mmio_init() == 0) && polly2_has_bands())
+		polly2_set_fb_top(0);
+}
+
 void UpdateStatsOSD()
 {
+	if (!settings.polly2.ShowStats) {
+		osd_hide();
+		return;
+	}
 	if (!osd_init())
 		return;
 

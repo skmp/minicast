@@ -22,7 +22,8 @@ void ReportRendererStats(double wait_ms, u32 cycles);
 /* Redraws the OSD band from the latest reported stats; call right after
  * os_SetWindowText. Lazily maps the band FB and enables FB_TOP on first
  * use; a no-op when polly2 isn't reachable or the bitstream predates
- * border bands (REVISION < 2). */
+ * border bands (REVISION < 2). With polly2.ShowStats off it switches the
+ * band off instead and draws nothing. */
 void UpdateStatsOSD();
 
 /* Screenshot: QueueScreenshot() arms a one-shot request (Print Screen in
