@@ -18,6 +18,8 @@
 
 #include "deps/zlib/zlib.h"
 #include "deps/xxhash/xxhash.h"
+#include "reios/reios.h"
+#include <ctype.h>
 
 #if _ANDROID
 #include <android/log.h>
@@ -376,6 +378,45 @@ u8 vmu_default[] = {
 	0x77,0x19,0x06,0xef,
 };
 
+static void replace_all(string& s, const string& from, const string& to)
+{
+	for (size_t pos = 0; (pos = s.find(from, pos)) != string::npos; pos += to.size())
+		s.replace(pos, from.size(), to);
+}
+
+// The disc's IP.bin product number, made safe for a file name: surrounding
+// spaces dropped, anything but letters, digits, '-' and '_' turned into '_'.
+// "unknown" when the disc has none.
+static string vmu_game_id()
+{
+	string id = reios_product_number;
+	size_t first = id.find_first_not_of(' ');
+	if (first == string::npos)
+		return "unknown";
+	id = id.substr(first, id.find_last_not_of(' ') - first + 1);
+	for (char& c : id)
+	{
+		if (!isalnum((unsigned char)c) && c != '-' && c != '_')
+			c = '_';
+	}
+	return id;
+}
+
+// VmuPath/VmuName with {port} and {game_id} filled in
+static string vmu_save_path(const char* port)
+{
+	string name = settings.dreamcast.VmuName;
+	if (name.empty())
+		name = "vmu_save_{port}.bin";
+	replace_all(name, "{port}", port);
+	if (name.find("{game_id}") != string::npos)
+		replace_all(name, "{game_id}", vmu_game_id());
+
+	if (settings.dreamcast.VmuPath.empty())
+		return get_writable_data_path("/" + name);
+	return settings.dreamcast.VmuPath + "/" + name;
+}
+
 struct maple_sega_vmu: maple_base
 {
 	FILE* file;
@@ -420,9 +461,8 @@ struct maple_sega_vmu: maple_base
 	{
 		memset(flash_data, 0, sizeof(flash_data));
 		memset(lcd_data, 0, sizeof(lcd_data));
-		wchar tempy[512];
-		sprintf(tempy, "/vmu_save_%s.bin", logical_port);
-		string apath = get_writable_data_path(tempy);
+		string apath = vmu_save_path(logical_port);
+		printf("VMU %s: %s\n", logical_port, apath.c_str());
 
 		file = fopen(apath.c_str(), "rb+");
 		if (!file)

@@ -502,6 +502,11 @@ struct settings_t
 		u32 language;		// 0 -> JP, 1 -> EN, 2 -> DE, 3 -> FR, 4 -> SP, 5 -> IT, 6 -> default
 		std::vector<std::string> ContentPath;
 		bool FullMMU;
+		// VMU save files are VmuPath/VmuName. VmuName may contain {port}
+		// (A1, A2, ...) and {game_id} (product number from the disc's IP.bin).
+		// An empty VmuPath means the user data dir.
+		std::string VmuPath;
+		std::string VmuName;
 	} dreamcast;
 
 	struct
