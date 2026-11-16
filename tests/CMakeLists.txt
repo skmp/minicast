@@ -70,3 +70,16 @@ endif()
 
 # args: <base seed> <fuzz iterations>
 add_test(NAME constprop_test COMMAND constprop_test 1 3000)
+
+add_executable(disc_list_test
+    disc_list_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../disc_list.cpp
+)
+set_property(TARGET disc_list_test PROPERTY CXX_STANDARD 17)
+
+if(NOT CMAKE_CROSSCOMPILING)
+    target_compile_options(disc_list_test PRIVATE -O1 -g -fsanitize=address,undefined)
+    target_link_options(disc_list_test PRIVATE -fsanitize=address,undefined)
+endif()
+
+add_test(NAME disc_list_test COMMAND disc_list_test)

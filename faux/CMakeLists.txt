@@ -10,6 +10,7 @@ add_link_options("-Wl,--build-id=sha1")
 
 set(_sources
     ${CMAKE_SOURCE_DIR}/../main.cpp
+    ${CMAKE_SOURCE_DIR}/../disc_list.cpp
 )
 
 set(swrl ${CMAKE_SOURCE_DIR}/../libswirl)
@@ -150,11 +151,6 @@ list(APPEND _sources
     ${swrl}/deps/crypto/sha256.cpp
     ${swrl}/deps/crypto/sha1.cpp
     ${swrl}/deps/crypto/md5.cpp
-    ${swrl}/deps/chdr/huffman.c
-    ${swrl}/deps/chdr/flac.c
-    ${swrl}/deps/chdr/chd.c
-    ${swrl}/deps/chdr/cdrom.c
-    ${swrl}/deps/chdr/bitstream.c
     # ${swrl}/deps/khronos/GL3/gl3w.c
     # ${swrl}/deps/libpng/pngset.c
     # ${swrl}/deps/libpng/pngrutil.c
@@ -300,6 +296,19 @@ add_executable(${APP_NAME}.elf ${_sources})
 set_property(TARGET ${APP_NAME}.elf PROPERTY CXX_STANDARD 17)
 target_compile_definitions(${APP_NAME}.elf PRIVATE  TARGET_NO_NIXPROF TARGET_NO_COREIO_HTTP HOST_NO_THREADS FAUX96 FEAT_HAS_SERIAL_TTY=0)
 target_include_directories(${APP_NAME}.elf PRIVATE ${swrl} ${swrl}/deps ${swrl}/deps/vixl)
+
+# libchdr (CHD images), built -O2 without the app's -ffast-math / LTO
+set(CHDR_WANT_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${swrl}/deps/libchdr ${CMAKE_BINARY_DIR}/libchdr EXCLUDE_FROM_ALL)
+foreach(_chdr_target chdr-static chdr-lzma miniz zstd)
+    target_compile_options(${_chdr_target} PRIVATE -O2)
+    if(${CMAKE_SYSTEM_NAME} MATCHES "MiSTeroo")
+        target_compile_options(${_chdr_target} PRIVATE
+            -marm -march=armv7-a -mfpu=neon -mfloat-abi=hard)
+    endif()
+endforeach()
+target_link_libraries(${APP_NAME}.elf PRIVATE chdr-static)
 target_link_libraries(${APP_NAME}.elf PRIVATE stdc++ rt pthread)
 add_subdirectory(${CMAKE_SOURCE_DIR}/../tests ${CMAKE_BINARY_DIR}/tests)
 

@@ -17,6 +17,8 @@
 
 #include "hw/pvr/pvr_regs.h"
 #include "rend/mister_rend/mister_support.h"
+#include "disc_list.h"
+#include <string>
 
 std::atomic<bool> vram_dump_pending;
 static unsigned vram_dump_number;
@@ -87,6 +89,22 @@ int main(int argc, char* argv[])
 			printf("-cfg-file must be the first option\n");
 			return 1;
 		}
+	}
+
+	// .m3u playlist: boot its first entry (no runtime disc swap yet)
+	static std::string m3u_boot_image;
+	if (argc > 1 && disc_list_is_m3u(argv[1]))
+	{
+		DiscList discs = disc_list_build(argv[1]);
+		if (discs.discs.empty())
+		{
+			printf("m3u: '%s' is unreadable or lists no images\n", argv[1]);
+			return 1;
+		}
+		for (size_t i = 0; i < discs.discs.size(); i++)
+			printf("m3u: disc %zu/%zu %s\n", i + 1, discs.discs.size(), discs.discs[i].c_str());
+		m3u_boot_image = discs.discs[0];
+		argv[1] = (char*)m3u_boot_image.c_str();
 	}
 
 	ParseCommandLine(argc, argv);

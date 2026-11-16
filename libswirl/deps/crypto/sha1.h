@@ -26,7 +26,10 @@
 #ifndef NETTLE_SHA1_H_INCLUDED
 #define NETTLE_SHA1_H_INCLUDED
 
-#include "../chdr/coretypes.h"
+#include <stdint.h>
+
+typedef uint32_t UINT32;
+typedef uint8_t UINT8;
 
 
 
